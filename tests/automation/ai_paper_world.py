@@ -32,7 +32,7 @@ from trader.automation.ai_paper_decision import (
     command_id_for,
 )
 from trader.automation.ai_paper_evidence import AiPaperEvidence, ai_entry_gate
-from trader.automation.ai_paper_experiment import ExperimentView
+from trader.automation.ai_paper_experiment import ExperimentView, experiment_send_gate_in_tx
 from trader.automation.ai_paper_filter import AiEntryFilter, MtimeCachedFilterLoader
 from trader.automation.ai_risk_policy import AiRiskPolicyService, apply_ai_risk_policy_migration
 from trader.automation.calendar_policy import XNYSCalendarPolicy
@@ -263,6 +263,8 @@ class World:
                                            now=self.activity_clock)
         self.version_digest = self.seal_version("jdg-world-1")
         self._withdrawal_gate = deployment_withdrawal_gate_in_tx(versions=self.versions)
+        self.experiment_store = None
+        self._experiment_gate = None
         self.policy_publish(PAPER_LIMITS)
         self.evidence = FailingEvidence(AiPaperEvidence(
             broker=self.broker, quotes=self.quotes, margin=self.margin,
@@ -322,7 +324,25 @@ class World:
     def _send_gate_in_tx(self, conn, request):
         if self._intent_hook is not None:
             self._intent_hook(conn, request)
-        return self._withdrawal_gate(conn, request)
+        return self._withdrawal_gate(conn, request) or (
+            None if self._experiment_gate is None else self._experiment_gate(conn, request))
+
+    def arm_experiment(self, *, process_started_at=None):
+        """A real ARMED experiment row, read by the saga's send gate on its SUBMITTING transaction."""
+        from tests.automation.experiment_fixtures import armed_record
+        from trader.automation.experiments import ExperimentStore, apply_experiment_migration
+        apply_experiment_migration(SchemaMigrator(self.db))
+        self.experiment_store = ExperimentStore(self.db, ACCOUNT, self.clock, process_started_at,
+                                                journal=self.journal)
+        self.experiment_store.insert_armed(armed_record(ACCOUNT, started_at=self.clock()), principal="cli", reason="go")
+        self._experiment_gate = experiment_send_gate_in_tx(store=self.experiment_store)
+        return self.experiment_store
+
+    def pause_experiment(self, reason="operator pause"):
+        record = self.experiment_store.latest()
+        return self.experiment_store.transition(
+            record.experiment_id, expected=frozenset({"ARMED"}), to="PAUSED", principal="cli",
+            command_id="pause-1", reason=reason)
 
     def on_intent_check(self, callback):
         """``callback(conn, request)`` runs on the saga's SUBMITTING transaction, before the withdrawal read."""

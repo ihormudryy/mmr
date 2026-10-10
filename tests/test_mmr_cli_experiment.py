@@ -26,6 +26,7 @@ class FakeSdk:
         self.kill_line = {"active": {"pct": 20.0, "basis": "start"}, "configured": {"pct": 20.0, "basis": "start"},
                           "pending_restart": False, "detection": DETECTION}
         self.entry_block = None
+        self.pause_receipt = {"state": "PAUSED"}
         self.calls = []
 
     def experiment_status(self):
@@ -41,7 +42,9 @@ class FakeSdk:
         return self._ok("start", reason)
 
     def experiment_pause(self, reason, experiment_id=None):
-        return self._ok("pause", reason, experiment_id=experiment_id)
+        from trader.common.reactivex import SuccessFail
+        self.calls.append(("pause", (reason,), {"experiment_id": experiment_id}))
+        return SuccessFail.success(obj=self.pause_receipt)
 
     def experiment_resume(self, reason, experiment_id=None):
         return self._ok("resume", reason, experiment_id=experiment_id)
@@ -112,6 +115,26 @@ def test_json_output_shape(cli, sdk):
     assert set(data) == {"data", "title"} and data["data"]["experiment"]["state"] == "ARMED"
     data = json.loads(cli("experiment pause --reason p", json_mode=True))
     assert data == {"data": {"state": "PAUSED"}, "title": "Experiment pause"}
+
+
+def test_pause_names_the_entries_already_being_sent(cli, sdk):                       # issue #124
+    sdk.pause_receipt = {"state": "PAUSED", "entries_in_flight": ["aip-dec-00000001", "aip-dec-00000002"]}
+    out = " ".join(cli("experiment pause --reason p").split())
+    assert ("2 entries were already being sent and may still reach the broker: "
+            "aip-dec-00000001, aip-dec-00000002. Check mmr orders / mmr portfolio.") in out
+    sdk.pause_receipt = {"state": "PAUSED", "entries_in_flight": ["aip-dec-00000001"]}
+    assert "1 entry was already being sent" in " ".join(cli("experiment pause --reason p").split())
+
+
+def test_pause_with_no_entry_in_flight_prints_no_warning(cli, sdk):
+    sdk.pause_receipt = {"state": "PAUSED", "entries_in_flight": []}
+    assert "already being sent" not in cli("experiment pause --reason p")
+
+
+def test_json_pause_keeps_stdout_pure_and_carries_the_list(cli, sdk):
+    sdk.pause_receipt = {"state": "PAUSED", "entries_in_flight": ["aip-dec-00000001"]}
+    data = json.loads(cli("experiment pause --reason p", json_mode=True))
+    assert data["data"]["entries_in_flight"] == ["aip-dec-00000001"]
 
 
 def test_sdk_resolves_the_active_experiment_id(monkeypatch):

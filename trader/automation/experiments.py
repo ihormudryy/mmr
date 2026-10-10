@@ -266,10 +266,17 @@ class CommittedTransition:
 class ExperimentStore:
     """Every write is one transaction under the journal's per-database lock."""
 
-    def __init__(self, db: Any, account_id: str, now: Callable[[], dt.datetime]):
+    def __init__(self, db: Any, account_id: str, now: Callable[[], dt.datetime],
+                 process_started_at: Optional[dt.datetime] = None, journal: Any = None):
+        """``journal`` is the trader's DomainJournal. With it every write runs under the journal's write lock,
+        the same lock as the saga's SUBMITTING row, so a pause and that row are ordered (issue #124). Without
+        it a write takes only the database's own lock: for tests and tools that have no saga."""
         self._db = db
+        self._journal = journal
         self._account_id = account_id
         self._now = now
+        # A send of an earlier process can never return or be sent again: its SUBMITTING row is not in flight.
+        self._process_started_at = _as_utc(process_started_at if process_started_at is not None else now())
 
     @property
     def account_id(self) -> str:
@@ -277,6 +284,14 @@ class ExperimentStore:
 
     def _now_utc(self) -> dt.datetime:
         return _as_utc(self._now())
+
+    def _write(self, tx: Callable[[Any], Any]) -> Any:
+        """One write transaction. DuckDB snapshots would let a pause and a saga's SUBMITTING row (different
+        tables) both commit having missed each other; the journal's write lock lets only one run at a time.
+        ``tx`` must not call back into the journal or the database."""
+        if self._journal is None:
+            return self._db.transaction(tx)
+        return self._journal.mutate_batch_work(self._journal.connect(), lambda conn, _append: tx(conn))
 
     # -- reads ---------------------------------------------------------------
 
@@ -288,12 +303,13 @@ class ExperimentStore:
     def get(self, experiment_id: str) -> Optional[ExperimentRecord]:
         return self._db.transaction(lambda conn: self._get_in_tx(conn, experiment_id))
 
+    def latest_in_tx(self, conn) -> Optional[ExperimentRecord]:
+        row = conn.execute(f"{_SELECT} WHERE account_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                           [self._account_id]).fetchone()
+        return None if row is None else _record_from_row(row)
+
     def latest(self) -> Optional[ExperimentRecord]:
-        def read(conn):
-            row = conn.execute(f"{_SELECT} WHERE account_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1",
-                               [self._account_id]).fetchone()
-            return None if row is None else _record_from_row(row)
-        return self._db.transaction(read)
+        return self._db.transaction(self.latest_in_tx)
 
     def active(self) -> Optional[ExperimentRecord]:
         def read(conn):
@@ -332,6 +348,35 @@ class ExperimentStore:
                                        to_state=to_state)
         return self._db.transaction(read)
 
+    def entries_in_flight_at_pause(self, experiment_id: str, revision: int) -> list[str]:
+        """The entries a pause (the transition that wrote ``revision``) found still being sent."""
+        row = self._db.execute(
+            "SELECT detail_json FROM experiment_transitions WHERE experiment_id = ? AND revision = ?",
+            [experiment_id, revision], fetch="one")
+        return [] if row is None else list(json.loads(row[0]).get("entries_in_flight", []))
+
+    def _entries_being_sent_in_tx(self, conn) -> list[str]:
+        """Command ids of this account's AI entries whose broker send has not returned.
+
+        Runs inside the pause's write transaction, which holds the journal's write lock like the saga's SUBMITTING
+        write: the pause sees every SUBMITTING row committed before it, and any entry after it finds PAUSED. The
+        saga row is SUBMITTING from its send gate until ``send_returned_at`` is written. ``submit_bracket`` is
+        called once, right after that commit in the same process, and no restart sends again: a row older than this
+        process is not in flight. A pause committing after that row cannot stop the send; it can only name it."""
+        tables = {row[0] for row in conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_name IN ('automated_order_sagas', 'ai_paper_decisions')").fetchall()}
+        if tables != {"automated_order_sagas", "ai_paper_decisions"}:
+            return []
+        rows = conn.execute(
+            "SELECT s.command_id FROM automated_order_sagas s "
+            "JOIN ai_paper_decisions d ON d.command_id = s.command_id "
+            "WHERE s.account_id = ? AND d.action = 'ENTER' AND s.state = 'SUBMITTING' "
+            "AND json_extract_string(s.payload, '$.send_returned_at') IS NULL AND s.updated_at >= ? "
+            "ORDER BY s.command_id",
+            [self._account_id, self._process_started_at]).fetchall()
+        return [row[0] for row in rows]
+
     # -- writes --------------------------------------------------------------
 
     def insert_armed(self, record: ExperimentRecord, *, principal: str, reason: str) -> ExperimentRecord:
@@ -353,7 +398,7 @@ class ExperimentStore:
                                record.start_command_id, reason, {}, now)
             return self._get_in_tx(conn, record.experiment_id)
         try:
-            return self._db.transaction(tx)
+            return self._write(tx)
         except ExperimentRefused:
             raise
         except Exception as exc:
@@ -380,10 +425,13 @@ class ExperimentStore:
             self._write_in_tx(conn, updated, now, expect_state=current.state, expect_revision=current.revision)
             if to == "STOPPED":
                 conn.execute("DELETE FROM experiment_active WHERE experiment_id = ?", [experiment_id])
+            detail = dict(changes)
+            if to == "PAUSED":
+                detail["entries_in_flight"] = self._entries_being_sent_in_tx(conn)
             self._append_in_tx(conn, experiment_id, updated.revision, current.state, to, principal,
-                               command_id, reason, dict(changes), now)
+                               command_id, reason, detail, now)
             return self._get_in_tx(conn, experiment_id)
-        return self._db.transaction(tx)
+        return self._write(tx)
 
     def update_kill_progress(self, experiment_id: str, *, expected_state: str,
                              changes: Mapping[str, Any]) -> ExperimentRecord:
@@ -398,7 +446,7 @@ class ExperimentStore:
             updated = replace(current, **changes)
             self._write_in_tx(conn, updated, now, expect_state=current.state, expect_revision=current.revision)
             return self._get_in_tx(conn, experiment_id)
-        return self._db.transaction(tx)
+        return self._write(tx)
 
     def raise_peak(self, experiment_id: str, net_liquidation: float) -> float:
         value = _positive("net_liquidation", net_liquidation)
@@ -411,7 +459,7 @@ class ExperimentStore:
                              "WHERE experiment_id = ?", [value, now, experiment_id])
                 return value
             return current.peak_net_liquidation
-        return self._db.transaction(tx)
+        return self._write(tx)
 
     # -- helpers -------------------------------------------------------------
 

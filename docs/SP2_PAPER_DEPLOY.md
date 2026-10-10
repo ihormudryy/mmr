@@ -11,9 +11,9 @@ Do not skip a "check:". Paper only. Never paste a key, token or `.env` value int
 ## Why the order is like this
 
 - SP1 acceptance needs a judged deployment version. Only the research cycle makes one.
-- The research cycle needs a started experiment, so step 7 starts one and pauses it. A paused experiment admits no new
-  entry. An entry that already passed the send check before the pause still goes out (#124); in step 7 there is none,
-  because no policy and no discretionary digest exist yet.
+- The research cycle needs a started experiment, so step 7 starts one and pauses it. A pause stops every entry
+  not yet being sent. The pause receipt names any entry already being sent (`entries_in_flight`): check it and
+  cancel or flatten it (#124). In step 7 there is none, because no policy and no discretionary digest exist yet.
 - Acceptance needs the `ai` service stopped and no active experiment. So SP2 trades only in step 8.
 - What holds entries off in step 7: the experiment is PAUSED. The `ai` service judges a BUY only when the experiment is ARMED
   (`EXPERIMENT_PAUSED`), the trader refuses an ENTER unless it is ARMED (`EXPERIMENT_NOT_ARMED`), and the discretionary
@@ -225,7 +225,7 @@ Stop commands:
 
 | Goal | Command |
 |---|---|
-| No new AI entries | `mmr experiment pause --reason "<why>"`. An entry already being sent still goes out (#124): check `mmr portfolio` and `mmr orders`, then cancel or flatten it |
+| No new AI entries | `mmr experiment pause --reason "<why>"`. A pause stops every entry not yet being sent; the receipt names any entry already being sent (`entries_in_flight`, also printed by the CLI): check `mmr portfolio` and `mmr orders`, then cancel or flatten it (#124) |
 | Stop the AI service | `docker compose --profile ai stop ai` |
 | Stop the research cycle only | `research.enabled: false` in `ai.yaml`, then step 8.4 |
 | End one judged version | `mmr ai-deployment withdraw sha256:<version> --reason "<why>"` |

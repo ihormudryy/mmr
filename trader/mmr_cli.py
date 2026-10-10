@@ -9359,6 +9359,16 @@ def _trader_for_symbol_resolution(cfg):
         return None
 
 
+def _refuse_unresolved_numeric_target(symbol: str, sec_def) -> None:
+    """An unresolved target is stored under its own name, and a numeric name is the storage key of that conId.
+
+    Bars fetched by the ticker "3002" would later read as conId 3002's history, so they are never stored (#137)."""
+    if sec_def is None and symbol.strip().isdigit():
+        raise DownloadTargetError(
+            f'{symbol} did not resolve to a contract; a numeric target is a conId and its bars would be stored '
+            f'under that conId. Add it to a universe or start the trader so it resolves, then download again')
+
+
 def _resolve_download_symbol(accessor, rpc_mmr, symbol: str):
     """The one SecurityDefinition of ``symbol``: local universes first, then the trader.
 
@@ -9508,6 +9518,7 @@ def _handle_data_download(args: argparse.Namespace):
         try:
             if sec_def is None:
                 sec_def = _resolve_download_symbol(accessor, rpc_mmr, symbol)
+                _refuse_unresolved_numeric_target(symbol, sec_def)
             elif not sec_def.conId:
                 raise DownloadTargetError(f'{symbol}: the universe entry has no conId')
             if source != 'ib' and sec_def is not None:

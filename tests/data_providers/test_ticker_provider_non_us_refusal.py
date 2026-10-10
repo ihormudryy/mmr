@@ -144,6 +144,28 @@ def test_a_download_named_by_conid_fetches_the_resolved_ticker(tmp_path, source)
     assert _stored_rows(db, US_CONID) > 0
 
 
+@pytest.mark.parametrize('source', REST_SOURCES)
+def test_an_unresolved_numeric_target_never_stores_bars_a_later_conid_would_read(tmp_path, source):
+    """``data download 3002`` before 3002 resolves must not leave rows that conId 3002 later reads (mmr-openai)."""
+    db, history = str(tmp_path / 'mmr.duckdb'), _FakeHistory()
+    args = argparse.Namespace(symbols=[str(ASX_CONID)], source=source, bar_size='15 mins', days=5, force=False)
+    summary = _run(db, history, lambda mmr_cli: mmr_cli._handle_data_download(args))
+    assert (summary['failed'], summary['completed']) == (1, 0)
+    assert 'did not resolve' in summary['refused_targets'][0]
+    assert history.tickers == []
+
+    UniverseAccessor(db, 'Universes').insert('asx', _definition(ASX_CONID, 'BHP', 'ASX'))   # bound afterwards
+    assert _stored_rows(db, ASX_CONID) == 0
+
+
+@pytest.mark.parametrize('source', REST_SOURCES)
+def test_an_unresolved_ticker_is_still_fetched_under_its_own_name(tmp_path, source):
+    db, history = str(tmp_path / 'mmr.duckdb'), _FakeHistory()
+    args = argparse.Namespace(symbols=['ZZZZ'], source=source, bar_size='15 mins', days=5, force=False)
+    summary = _run(db, history, lambda mmr_cli: mmr_cli._handle_data_download(args))
+    assert summary['failed'] == 0 and set(history.tickers) == {'ZZZZ'}
+
+
 class _EmptyProvider:
     def __init__(self):
         self.tickers = []

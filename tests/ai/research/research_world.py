@@ -317,8 +317,8 @@ class ResearchWorld:
         return {table: self.node_rows(f"SELECT * FROM {table} ORDER BY 1") for table in RESEARCH_TABLES}
 
     # -- Monday ---------------------------------------------------------------------------------------------------
-    def next_morning(self, hour: int, minute: int) -> None:
-        at = dt.datetime.combine(MONDAY, dt.time(hour, minute), tzinfo=NEW_YORK).astimezone(dt.timezone.utc)
+    def next_morning(self, hour: int, minute: int, second: int = 0) -> None:
+        at = dt.datetime.combine(MONDAY, dt.time(hour, minute, second), tzinfo=NEW_YORK).astimezone(dt.timezone.utc)
         self._refresh_daily_bars(at)
         self.world.served.run_session(at)
 

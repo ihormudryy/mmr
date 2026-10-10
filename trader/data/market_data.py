@@ -1,3 +1,4 @@
+from trader.bar_size import BarSize
 from trader.data.store import DateRange
 from ib_async.ticker import Ticker
 from reactivex import Observer
@@ -142,6 +143,24 @@ def resample_ticks_to_bars(ticks: pd.DataFrame, freq: str,
 
     ohlc.index.name = 'date'
     return ohlc[[c for c in NORMALIZED_COLUMNS if c in ohlc.columns]]
+
+
+def drop_unclosed_bars(bars: pd.DataFrame, bar_size: BarSize, now: dt.datetime) -> pd.DataFrame:
+    """Keep only bars whose close (start label + bar length) is not after ``now`` (issue #146 review).
+
+    Every source labels a bar by its start, and a stored history row may be a bar that was still forming when
+    it was downloaded. Weekly and monthly bars are returned unchanged: pandas labels them by their end.
+    """
+    if bars is None or bars.empty:
+        return bars
+    if bar_size == BarSize.Days1:
+        length = dt.timedelta(days=1)
+    else:
+        try:
+            length = BarSize.intraday_length(str(bar_size))
+        except ValueError:
+            return bars
+    return bars.loc[bars.index + length <= pd.Timestamp(now)]
 
 
 def normalize_historical(df: pd.DataFrame) -> pd.DataFrame:

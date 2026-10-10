@@ -1697,12 +1697,18 @@ class StrategyRuntime():
         bars.index = bars.index.tz_localize('UTC') if bars.index.tz is None else bars.index.tz_convert('UTC')
         return bars
 
+    def _now(self) -> dt.datetime:
+        return dt.datetime.now(dt.timezone.utc)
+
     def _strategy_frame(self, conId: int, bar_size: BarSize) -> Optional[pd.DataFrame]:
         """The OHLCV frame a bar-based strategy should see: historical priming
         bars + the live tick stream resampled to `bar_size` (completed bars only).
         This is what makes bar strategies work live — previously they were handed
-        the raw per-tick, cumulative-volume stream and couldn't compute bars."""
-        from trader.data.market_data import resample_ticks_to_bars
+        the raw per-tick, cumulative-volume stream and couldn't compute bars.
+
+        A bar that has not closed by now is left out, whatever its source: a stored
+        history row can be a bar still forming when it was downloaded (issue #146)."""
+        from trader.data.market_data import drop_unclosed_bars, resample_ticks_to_bars
         key = (conId, bar_size)
         days_needed = self._hist_days_needed(conId, bar_size)
         if key not in self._hist_bars or days_needed > self._hist_bar_days.get(key, 0):
@@ -1726,10 +1732,10 @@ class StrategyRuntime():
         frames = [f for f in (_utc(hist), _utc(live)) if f is not None and not f.empty]
         if not frames:
             return None
-        if len(frames) == 1:
-            return frames[0].sort_index()
-        combined = pd.concat(frames)
-        return combined[~combined.index.duplicated(keep='last')].sort_index()
+        combined = pd.concat(frames) if len(frames) > 1 else frames[0]
+        combined = combined[~combined.index.duplicated(keep='last')].sort_index()
+        closed = drop_unclosed_bars(combined, bar_size, self._now())
+        return closed if not closed.empty else None
 
     def on_ticker_next(self, ticker: Ticker):
         if ticker.contract:

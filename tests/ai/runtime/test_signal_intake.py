@@ -95,7 +95,7 @@ async def test_a_malformed_signal_fails_loudly_and_commits_nothing(rig, field, v
 @pytest.mark.asyncio
 async def test_retained_stale_signals_become_missed(rig):
     old = rig.signals.add(at=et(10, 50))
-    fresh = rig.signals.add(at=et(11, 0))
+    fresh = rig.signals.add(at=et(10, 59))
     await rig.intake.poll()
     assert await rig.intake.expire_stale() == [old["source_event_id"]]
     assert [(row[0], row[1], row[2]) for row in rig.opportunities()] == [

@@ -26,6 +26,7 @@ SOURCE_EVENT_ID = re.compile(r"^sig-[0-9a-f]{32}$")
 RECORD_GENERATION = re.compile(r"^gen-[0-9a-f]{32}$")
 STALE = "STALE"
 BAR_SIZE_UNKNOWN = "STALE_BAR_SIZE_UNKNOWN"
+BAR_NOT_CLOSED = "BAR_NOT_CLOSED"
 _STORED = ("opportunity_id, signal_cursor, strategy_name, conid, action, probability, signal_time, recorded_at, "
            "deployment_digest, deployment_version, source_digest, bar_size")
 _COLUMNS = f"{_STORED}, state"
@@ -160,15 +161,21 @@ class SignalIntake:
 
     def stale_reason(self, opportunity: SignalOpportunity, now: dt.datetime) -> Optional[str]:
         """None while fresh. signal_time is the start of the signal's bar, so the age counts from the bar's close
-        (issue #146). A signal whose bar close is unknown is never fresh."""
+        (issue #146). A signal whose bar close is unknown, or still ahead of ``now``, is never fresh: a bar that has
+        not closed means a bad frame or a clock skew, so the signal is refused for good, not kept until its close."""
         try:
-            bar_length = BarSize.intraday_length(opportunity.bar_size)
+            bar_close = opportunity.signal_time + BarSize.intraday_length(opportunity.bar_size)
         except ValueError:
             logger.error("%s: signal %s from %s has bar size %r, so its bar close is unknown; it is not judged",
                          BAR_SIZE_UNKNOWN, opportunity.opportunity_id, opportunity.strategy_name,
                          opportunity.bar_size)
             return BAR_SIZE_UNKNOWN
-        return None if now - (opportunity.signal_time + bar_length) <= self._max_age else STALE
+        if bar_close > now:
+            logger.error("%s: signal %s from %s is on a bar that closes at %s, after now (%s); it is not judged",
+                         BAR_NOT_CLOSED, opportunity.opportunity_id, opportunity.strategy_name,
+                         bar_close.isoformat(), now.isoformat())
+            return BAR_NOT_CLOSED
+        return None if now - bar_close <= self._max_age else STALE
 
     async def expire_stale(self) -> list[str]:
         now = self._clock.now()

@@ -249,7 +249,7 @@ async def test_an_unfinished_opportunity_is_judged_again_if_fresh_else_missed(ri
 @pytest.mark.asyncio
 async def test_a_buy_outside_the_entry_window_is_missed(tmp_path):
     rig = await rig_at(tmp_path, et(15, 31))
-    buy = rig.trader.signals.add(at=et(15, 31))
+    buy = rig.trader.signals.add(at=et(15, 30))
     await rig.signals_then_drain()
     assert rig.opportunity(buy) == ("MISSED", "OUTSIDE_ENTRY_WINDOW") and rig.engine.calls == []
 

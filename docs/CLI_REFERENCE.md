@@ -83,6 +83,7 @@ research attest bundle <artifact_id>               # sign + export the bundle
 snapshot AMD                 # Price snapshot (default IB; --source alpaca|twelvedata for REST, US only)
 snapshot AAPL --source alpaca               # REST quote via Alpaca (IEX feed), US listings only; --exchange/--currency need IB
 snapshot-batch AAPL MSFT --source alpaca    # Batch quotes; rows have feed + error, unknown symbols reported per symbol
+snapshot AAPL --source ib --json            # no IB market-data subscription (IB 354/10089/10090): code MARKET_DATA_NOT_SUBSCRIBED + IB text + hint; never falls back to delayed on its own, add --delayed
 depth AAPL                   # Level 2 order book (bids/asks + PNG chart)
 depth AAPL --rows 10         # More price levels (max depends on subscription)
 depth BHP --exchange ASX --currency AUD  # International depth

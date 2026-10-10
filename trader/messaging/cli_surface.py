@@ -13,8 +13,9 @@ from typing import Any, Dict, List, Optional
 from ib_async import Contract
 from pydantic import BaseModel, ConfigDict, Field
 
+from trader.listeners.ibreactive import MARKET_DATA_NOT_SUBSCRIBED, MarketDataNotSubscribedError
 from trader.messaging.trader_service_api import TraderServiceApi
-from trader.messaging.typed_rpc import TypedRpcRegistry
+from trader.messaging.typed_rpc import TypedRpcRegistry, _DispatchProblem
 
 
 def _finite_or_none(value: Any) -> Optional[float]:
@@ -246,7 +247,10 @@ def _get_snapshot_handler(api: TraderServiceApi):
                 primaryExchange=str(d.primaryExchange or ''),
                 currency=str(d.currency or ''),
             )
-        ticker = await api.get_snapshot(contract, parsed.delayed)
+        try:
+            ticker = await api.get_snapshot(contract, parsed.delayed)
+        except MarketDataNotSubscribedError as exc:
+            raise _DispatchProblem(MARKET_DATA_NOT_SUBSCRIBED, str(exc)) from exc
         return {'snapshot': _ticker_to_wire(ticker, contract)}
     return _handler
 

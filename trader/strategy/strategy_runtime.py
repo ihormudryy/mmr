@@ -2807,6 +2807,7 @@ class StrategyRuntime():
                     security=instrument, bar_size=strategy.bar_size,
                     historical_days=historical_days, strategy_name=strategy.name):
                 complete = False
+            self._forget_hist_bars(conId, strategy.bar_size)
 
         if strategy.universe:
             # Iterate SecurityDefinitions directly so we can pass them to
@@ -2818,7 +2819,13 @@ class StrategyRuntime():
                         security=sd, bar_size=strategy.bar_size,
                         historical_days=historical_days, strategy_name=strategy.name):
                     complete = False
+                self._forget_hist_bars(sd.conId, strategy.bar_size)
         return complete
+
+    def _forget_hist_bars(self, conId: int, bar_size: BarSize) -> None:
+        """Drop the primed frame after a backfill, so the next frame re-reads the bars it stored."""
+        self._hist_bars.pop((conId, bar_size), None)
+        self._hist_bar_days.pop((conId, bar_size), None)
 
     async def get_historical_data(self):
         for strategy in self.strategy_implementations:

@@ -55,7 +55,7 @@ _IB_REQUEST_SPANS_BY_NAME = {str(size): span for size, span in IB_REQUEST_SPANS.
 
 
 class InvalidWarmupDeclaration(ValueError):
-    """``MIN_BARS`` is set but is not a positive whole number of bars."""
+    """``MIN_BARS`` is present but is not a positive whole number of bars (None included)."""
 
 
 @dataclass(frozen=True)
@@ -68,10 +68,13 @@ class HistoryDepth:
 
 
 def declared_warmup_bars(strategy: Any) -> int:
-    """The strategy's ``MIN_BARS`` (after param overrides); 0 when it declares none."""
-    value = getattr(strategy, WARMUP_ATTRIBUTE, None)
-    if value is None:
+    """The strategy's ``MIN_BARS`` (an instance param override shadows the class attribute).
+
+    0 only when the attribute is absent; a present value that is not a positive int, None included, is refused.
+    """
+    if not hasattr(strategy, WARMUP_ATTRIBUTE):
         return 0
+    value = getattr(strategy, WARMUP_ATTRIBUTE)
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise InvalidWarmupDeclaration(
             f'{WARMUP_ATTRIBUTE} must be a positive whole number of bars, got {value!r}')

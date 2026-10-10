@@ -1,8 +1,10 @@
 """Issue #119: history depth follows a strategy's declared warm-up (MIN_BARS), and the runtime
 holds the strategy back (HISTORY_BELOW_WARMUP) until its frame has that many bars."""
 import asyncio
+import datetime as dt
 import logging
 import os
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -20,7 +22,7 @@ from trader.strategy.history_depth import (
     history_depth,
     ib_request_span,
 )
-from trader.strategy.strategy_runtime import StrategyRuntime, _live_strategy_rows
+from trader.strategy.strategy_runtime import SignalRecordWriteFailed, StrategyRuntime, _live_strategy_rows
 from trader.trading.strategy import Signal, Strategy, StrategyContext
 
 CONID = 265598
@@ -65,7 +67,7 @@ class _Declares:
 def test_a_missing_declaration_is_zero_and_a_bad_one_is_refused():
     assert declared_warmup_bars(object()) == 0
     assert declared_warmup_bars(_Declares(40)) == 40
-    for bad in (0, -5, 40.0, '40', True):
+    for bad in (None, 0, -5, 40.0, '40', True):
         with pytest.raises(InvalidWarmupDeclaration):
             declared_warmup_bars(_Declares(bad))
 
@@ -208,6 +210,7 @@ def _load_runtime(tmp_path, tmp_duckdb_path) -> StrategyRuntime:
     rt.strategies_directory = str(tmp_path / 'strategies')
     rt.strategy_config_file = str(tmp_path / 'strategy_runtime.yaml')
     rt.duckdb_path = tmp_duckdb_path
+    rt._hist_bars, rt._hist_bar_days = {}, {}
     rt.storage = TickStorage(duckdb_path=tmp_duckdb_path)
     rt.universe_accessor = UniverseAccessor.__new__(UniverseAccessor)
     os.makedirs(rt.strategies_directory, exist_ok=True)
@@ -272,3 +275,109 @@ def test_the_startup_fetch_asks_for_the_derived_depth(tmp_path, tmp_duckdb_path)
     rt._trader_gateway = type('Gateway', (), {'resolve_instrument': staticmethod(lambda conid: object())})()
     assert asyncio.run(rt._fetch_strategy_history(instance))
     assert asked == [64]
+
+
+def test_load_refuses_min_bars_none_so_a_one_bar_frame_never_signals(tmp_path, tmp_duckdb_path):
+    rt = _load_runtime(tmp_path, tmp_duckdb_path)
+    assert _load(rt, _write(rt, '    MIN_BARS = None')) is None
+    assert rt.strategy_implementations == []
+
+
+def test_a_param_override_of_a_none_min_bars_is_the_declaration(tmp_path, tmp_duckdb_path):
+    rt = _load_runtime(tmp_path, tmp_duckdb_path)
+    instance = _load(rt, _write(rt, '    MIN_BARS = None'), params={'MIN_BARS': 40})
+    assert instance is not None and instance.history_depth.warmup_bars == 40
+
+
+# --- a backfill makes its new bars visible -----------------------------------------------------------
+
+def _stored_bars(count: int) -> pd.DataFrame:
+    start = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2)).replace(second=0, microsecond=0)
+    index = pd.date_range(start, periods=count, freq='1min', name='date').tz_convert('America/New_York')
+    return pd.DataFrame({'open': 100.0, 'high': 101.0, 'low': 99.0, 'close': 100.0 + np.arange(count) / 10,
+                         'volume': 1000.0, 'average': 100.0, 'bar_count': 10, 'bar_size': '1 min',
+                         'what_to_show': 1}, index=index)
+
+
+def test_bars_stored_by_a_backfill_after_priming_reach_the_frame(tmp_duckdb_path):
+    rt = _runtime()
+    rt._tick_retention_days = 2
+    rt.history_duckdb_path = tmp_duckdb_path
+    tick_data = TickStorage(duckdb_path=tmp_duckdb_path).get_tickdata(bar_size=BarSize.Mins1)
+    all_bars = _stored_bars(5)
+    tick_data.write(CONID, all_bars.iloc[:3])
+    assert len(rt._strategy_frame(CONID, BarSize.Mins1)) == 3
+
+    async def backfill(security, bar_size, historical_days, strategy_name):
+        tick_data.write(CONID, all_bars.iloc[3:])
+        return True
+
+    rt._fetch_history_with_resume = backfill
+    rt._trader_gateway = SimpleNamespace(resolve_instrument=lambda conid: object())
+    strategy = SimpleNamespace(name='s', conids=[CONID], universe=None, bar_size=BarSize.Mins1,
+                               historical_days_prior=1)
+    assert asyncio.run(rt._fetch_strategy_history(strategy))
+    assert len(rt._strategy_frame(CONID, BarSize.Mins1)) == 5
+
+
+# --- a held signal across a hot-swap (case 2 of the mmr-openai review of 2b3f0cda) ---------------------
+
+_SWAPPED = """
+from trader.trading.strategy import Strategy, Signal
+from trader.objects import Action
+
+class AlwaysBuys(Strategy):
+    MIN_BARS = 2
+
+    def on_prices(self, prices):
+        return Signal(source_name=self.name, action=Action.BUY, probability=0.9, risk=0.1)
+"""
+
+
+class _GapEvents:
+    def __init__(self):
+        self.events = []
+
+    def append(self, event):
+        self.events.append(event)
+
+
+@pytest.mark.xfail(reason='settled by #139 held-signal hold', strict=True)
+def test_a_signal_held_before_a_hot_swap_is_not_sent_by_the_replacement_below_its_warm_up(tmp_path):
+    import yaml
+    (tmp_path / 'always_buys.py').write_text(_SWAPPED)
+    entry = {'name': 'swapped', 'module': 'always_buys.py', 'class_name': 'AlwaysBuys', 'bar_size': '1 min',
+             'historical_days_prior': 1, 'conids': [CONID]}
+    (tmp_path / 'strategy_runtime.yaml').write_text(yaml.safe_dump({'strategies': [entry]}))
+    rt = _runtime()
+    del rt._dispatch_once
+    rt.strategies_directory = str(tmp_path)
+    rt.strategy_config_file = str(tmp_path / 'strategy_runtime.yaml')
+    rt.storage = rt.universe_accessor = rt._trader_gateway = None
+    rt.paper_trading, rt._config_mtime = True, 0.0
+    rt.event_store = _GapEvents()
+    if hasattr(StrategyRuntime, '_new_signal_hold'):       # the held-signal hold of PR #139
+        rt._signal_hold = rt._new_signal_hold()
+    sends, failures = [], [SignalRecordWriteFailed('record down')]
+
+    def dispatch_signal(strategy, signal, conId, frame):
+        if failures:
+            raise failures.pop()
+        sends.append((strategy, signal))
+
+    rt._dispatch_signal = dispatch_signal
+    old = rt.load_strategy(name='swapped', bar_size_str='1 min', conids=[CONID], universe=None,
+                           historical_days_prior=1, module='always_buys.py', class_name='AlwaysBuys',
+                           description='')
+    old.enable()
+    rt.strategies[CONID] = [old]
+    _feed(rt, old, 2)                                       # BUY at MIN_BARS 2; its record write fails: held
+
+    rt.update_strategy_params('swapped', {'MIN_BARS': '5'})
+    new = rt.get_strategy('swapped')
+    assert new is not old                                    # the hot-swap replaces the object
+    new.enable()
+    _feed(rt, new, 4)                                        # retries the held BUY, then the gate holds new
+
+    assert sends == []
+    assert rt.history_code(new) == HISTORY_BELOW_WARMUP

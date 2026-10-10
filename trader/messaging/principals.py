@@ -163,6 +163,9 @@ TRADER_ACL: Mapping[tuple[str, str], frozenset[str]] = {
     # The live OCA shrink probe (Plan 6 ruling 23): the operator only, never an AI or the dashboard.
     ("command", "acceptance_mark_start"): frozenset({"cli"}),
     ("command", "acceptance_shrink_probe"): frozenset({"cli"}),
+    # Issue #121: the operator settles an OUTCOME_UNKNOWN command by hand; never an AI or the dashboard.
+    ("command", "settle_unknown_command"): frozenset({"cli"}),
+    ("query", "list_unresolved_commands"): HUMAN,
 }
 
 STRATEGY_ACL: Mapping[tuple[str, str], frozenset[str]] = {

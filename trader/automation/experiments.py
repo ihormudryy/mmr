@@ -255,6 +255,14 @@ def _check_changes(changes: Mapping[str, Any]) -> None:
         raise ValueError(f"only kill, peak and pause columns may change here, not {unknown}")
 
 
+@dataclass(frozen=True)
+class CommittedTransition:
+    """A transition a command's own transaction wrote, and the experiment as it is now."""
+    record: ExperimentRecord
+    revision: int
+    to_state: str
+
+
 class ExperimentStore:
     """Every write is one transaction under the journal's per-database lock."""
 
@@ -306,6 +314,23 @@ class ExperimentStore:
             item["at"] = _as_utc(item["at"])
             out.append(item)
         return out
+
+    def committed_transition(self, command_id: str) -> Optional[CommittedTransition]:
+        """The transition this command's own transaction wrote, or None when it wrote none.
+
+        ``insert_armed`` and ``transition`` write the command id in the transaction of the state change, so a
+        row is proof of the commit. More than one row, or a row of another account, is no proof and raises."""
+        def read(conn):
+            rows = conn.execute("SELECT experiment_id, revision, to_state FROM experiment_transitions "
+                                "WHERE command_id = ?", [command_id]).fetchall()
+            if not rows:
+                return None
+            if len(rows) > 1:
+                raise ValueError(f"command {command_id} wrote {len(rows)} experiment transitions")
+            experiment_id, revision, to_state = rows[0]
+            return CommittedTransition(record=self._require_in_tx(conn, experiment_id), revision=int(revision),
+                                       to_state=to_state)
+        return self._db.transaction(read)
 
     # -- writes --------------------------------------------------------------
 

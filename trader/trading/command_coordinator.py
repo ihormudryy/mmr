@@ -2591,6 +2591,25 @@ REGISTRATION_NOT_COMMITTED = "REGISTRATION_NOT_COMMITTED"
 AI_DEPLOYMENT_WITHDRAW_ACTION = "withdraw_ai_deployment"   # spelled out: importing it would be a cycle
 # The same proof for a withdrawal; the withdraw RPC handler then sends it again under a new command id.
 WITHDRAWAL_NOT_COMMITTED = "WITHDRAWAL_NOT_COMMITTED"
+# Spelled out: importing them from trader.messaging would be a cycle (issue #121).
+EXPERIMENT_COMMAND_ACTIONS = frozenset({"start_experiment", "pause_experiment", "resume_experiment",
+                                        "stop_experiment"})
+EXPERIMENT_COMMAND_NOT_COMMITTED = "EXPERIMENT_COMMAND_NOT_COMMITTED"
+
+# Issue #121: the operator settles an OUTCOME_UNKNOWN row that no evidence can settle. Only actions that write
+# the trader's own journal, config or arm state and never a broker order, and whose reconciler cannot prove
+# "never committed". Never an order, cancel, close, AI entry, judged deployment, experiment or strategy-control
+# command: those touch the broker or settle from their own evidence.
+SETTLE_ACTION = "settle_unknown_command"
+OPERATOR_SETTLEABLE_ACTIONS = frozenset({
+    "reject_proposal", "pause_trading", "resume_trading",
+    "activate_live_canary", "deactivate_live_canary", "activate_allocation", "suspend_allocation",
+    "activate_paper_automation", "deactivate_paper_automation",
+    "publish_ai_risk_policy", "register_discretionary_deployment", "acceptance_mark_start",
+})
+OPERATOR_SETTLED = "OPERATOR_SETTLED"
+# A settle command whose own transaction on its target never committed (it crashed before).
+SETTLE_NOT_COMMITTED = "SETTLE_NOT_COMMITTED"
 
 
 class RegistrationEvidencePort(Protocol):
@@ -2603,6 +2622,27 @@ class WithdrawalEvidencePort(Protocol):
     """The trader's own journal: the outcome of the withdrawal row a command wrote, or None."""
 
     def committed_withdrawal(self, command_id: str) -> Optional[dict[str, Any]]: ...
+
+
+class ExperimentEvidencePort(Protocol):
+    """The trader's own journal: the receipt of the experiment transition a command wrote, or None."""
+
+    def committed_outcome(self, action: str, command_id: str) -> Optional[dict[str, Any]]: ...
+
+
+class OperatorSettleRefused(Exception):
+    def __init__(self, code: str, message: str):
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
+
+
+def settle_receipt(target: LedgerRow) -> dict[str, Any]:
+    """What a settle command returns: the target as the operator left it."""
+    outcome = target.outcome if isinstance(target.outcome, dict) else {}
+    return {"command_id": target.command_id, "action": target.action, "state": target.state,
+            "error_code": target.error_code, "settled_by": outcome.get("settled_by"),
+            "reason": outcome.get("reason")}
 
 
 def _is_cancel_child_of(child: LedgerRow, link: Optional[str], root: LedgerRow, order_id: str) -> bool:
@@ -2652,6 +2692,9 @@ class OutcomeReconciler:
     - ``withdrawals``: ``WithdrawalEvidencePort`` -- the same for an
       ``OUTCOME_UNKNOWN`` ``withdraw_ai_deployment``, from the withdrawal row
       its transaction wrote. Optional: unwired it stays unknown.
+    - ``experiments``: ``ExperimentEvidencePort`` -- the same for the four
+      experiment commands, from the transition row each writes (issue #121).
+      Optional: unwired (live account) they stay unknown.
 
     Command-type awareness ([M1-F3] Task 9 HIGH-1, verbatim): ``reconcile_once``
     discriminates by the command's ACTION, not by ``target_type`` alone --
@@ -2678,6 +2721,7 @@ class OutcomeReconciler:
         closes: Optional[Any] = None,
         registrations: Optional[RegistrationEvidencePort] = None,
         withdrawals: Optional[WithdrawalEvidencePort] = None,
+        experiments: Optional[ExperimentEvidencePort] = None,
         received_at_start: Optional[list[LedgerRow]] = None,
     ):
         self._journal = journal
@@ -2691,6 +2735,7 @@ class OutcomeReconciler:
         self._closes = closes
         self._registrations = registrations
         self._withdrawals = withdrawals
+        self._experiments = experiments
         self._unreadable_evidence: set[str] = set()   # command ids logged once; the 15-minute alert follows
         self._unreadable_sagas: set[str] = set()      # logged once; the 15-minute alert follows
         self._child_collisions: set[str] = set()      # cancel_orders roots whose child-id clash was logged
@@ -2869,6 +2914,10 @@ class OutcomeReconciler:
             return self._reconcile_registration(row, now)
         if action == AI_DEPLOYMENT_WITHDRAW_ACTION:
             return self._reconcile_withdrawal(row, now)
+        if action in EXPERIMENT_COMMAND_ACTIONS:
+            return self._reconcile_experiment(row, now)
+        if action == SETTLE_ACTION:
+            return self._reconcile_settle(row, now)
         # Unmapped action: cannot positively determine an outcome -> stay
         # OUTCOME_UNKNOWN (fail-safe), never rubber-stamp RESOLVED.
         return False
@@ -2898,6 +2947,62 @@ class OutcomeReconciler:
         """A withdrawal is one journal transaction that writes the command id with the withdrawal row."""
         evidence = None if self._withdrawals is None else self._withdrawals.committed_withdrawal
         return self._settle_from_own_commit(row, now, evidence, WITHDRAWAL_NOT_COMMITTED, {"withdrawn": False})
+
+    def _reconcile_experiment(self, row: LedgerRow, now: dt.datetime) -> bool:
+        """An experiment command is one store transaction that writes the command id with the transition.
+
+        A crashed idempotent no-op (pause when already PAUSED, resume when already ARMED) wrote no transition,
+        so it is rejected as never committed: fail-safe, the operator sends it again."""
+        evidence = None
+        if self._experiments is not None:
+            experiments = self._experiments
+            evidence = lambda command_id: experiments.committed_outcome(row.action, command_id)  # noqa: E731
+        return self._settle_from_own_commit(row, now, evidence, EXPERIMENT_COMMAND_NOT_COMMITTED,
+                                            {"experiment_changed": False})
+
+    def _reconcile_settle(self, row: LedgerRow, now: dt.datetime) -> bool:
+        """A settle is one transaction on its target row that writes the settle's command id into its outcome."""
+        return self._settle_from_own_commit(row, now, lambda _command_id: self._settled_by(row),
+                                            SETTLE_NOT_COMMITTED, {"settled": False})
+
+    def _settled_by(self, settle: LedgerRow) -> Optional[dict[str, Any]]:
+        target = self._ledger.get(settle.target_id)
+        outcome = target.outcome if target is not None and isinstance(target.outcome, dict) else {}
+        if outcome.get("settle_command_id") != settle.command_id:
+            return None
+        return settle_receipt(target)
+
+    # -- operator settle (issue #121) ----------------------------------------
+
+    def settle_by_operator(self, target_command_id: str, *, resolved: bool, reason: str, principal: str,
+                           settle_command_id: str, account_id: Optional[str]) -> dict[str, Any]:
+        """OUTCOME_UNKNOWN -> RESOLVED, or REJECTED ``OPERATOR_SETTLED``, by an operator's word.
+
+        Only an action of ``OPERATOR_SETTLEABLE_ACTIONS``. The write is a guarded CAS from OUTCOME_UNKNOWN, so a
+        row the reconciler settled first is never overwritten. The row leaves the reconcile schedule (and its
+        15-minute alert) with the write. Raises ``OperatorSettleRefused`` with the reason it refused."""
+        target = self._ledger.get(target_command_id)
+        if target is None or target.account_id != account_id:
+            raise OperatorSettleRefused("SETTLE_UNKNOWN_COMMAND", f"no command {target_command_id} on this account")
+        if target.state != "OUTCOME_UNKNOWN":
+            raise OperatorSettleRefused("SETTLE_NOT_UNKNOWN", f"command {target_command_id} is {target.state}")
+        if target.action not in OPERATOR_SETTLEABLE_ACTIONS:
+            raise OperatorSettleRefused("SETTLE_ACTION_FORBIDDEN",
+                                        f"{target.action} is settled only by its own evidence")
+        outcome = {"settled_by": principal, "reason": reason, "settle_command_id": settle_command_id}
+        now = self._now_utc()
+        try:
+            if resolved:
+                self._resolve_command_only(target, outcome, now)
+            else:
+                self._reject_command_only(target, error_code=OPERATOR_SETTLED, outcome=outcome, now=now)
+        except IllegalCommandTransition:
+            raise OperatorSettleRefused("SETTLE_NOT_UNKNOWN",
+                                        f"command {target_command_id} was settled meanwhile") from None
+        self._unreadable_evidence.discard(target_command_id)
+        logger.warning("command %s (%s) settled %s by %s: %s", target_command_id, target.action,
+                       "RESOLVED" if resolved else "REJECTED", principal, reason)
+        return settle_receipt(self._ledger.get(target_command_id))
 
     def _settle_from_own_commit(self, row: LedgerRow, now: dt.datetime,
                                 committed_outcome: Optional[Callable[[str], Optional[dict[str, Any]]]],

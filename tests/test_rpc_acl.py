@@ -271,3 +271,13 @@ def test_acceptance_rights_are_exact():                                   # SP1 
         assert TRADER_ACL[("query", method)] == frozenset({"cli", "dashboard", "ai_supervisor"})
     for method in ("acceptance_mark_start", "acceptance_shrink_probe"):
         assert TRADER_ACL[("command", method)] == frozenset({"cli"})      # never an AI, never the dashboard
+
+
+def test_settle_is_cli_only_and_the_listing_is_for_humans(served_with_acl):      # issue #121
+    assert TRADER_ACL[("command", "settle_unknown_command")] == frozenset({"cli"})
+    for principal in ("dashboard", "strategy", "ai_supervisor", "ai_research", "research"):
+        assert _code(served_with_acl, principal, "command", "settle_unknown_command") == "PERMISSION_DENIED"
+    assert _code(served_with_acl, "cli", "command", "settle_unknown_command") == "OK"
+    assert TRADER_ACL[("query", "list_unresolved_commands")] == HUMAN
+    registered = {(r.socket_role, r.method) for r in build_full_production_registry().registrations()}
+    assert {("command", "settle_unknown_command"), ("query", "list_unresolved_commands")} <= registered

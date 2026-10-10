@@ -98,15 +98,21 @@ Armed paper automation cannot exit safely yet, and the evidence step has a gap i
 - **A single-step command left `RECEIVED` by a crash** (only the rows found
   when the trader starts, before it serves) is parked `OUTCOME_UNKNOWN`
   (`RECEIVED_AT_RESTART`) and settled from evidence it can read (registration,
-  withdrawal, create; a `cancel_orders` root resolves once all its child
-  cancels settled and is `CANCEL_FANOUT_NOT_STARTED` with none, so send the
-  cancel again; reject and pause/resume only if they committed; a failed read
-  is retried, never taken as "not committed"); any other one (a partial
-  `cancel_orders` fan-out, a reject or pause/resume that did not commit, the
-  four experiment commands, discretionary registration, canary, allocation,
-  paper automation) stays `OUTCOME_UNKNOWN`, alerts after 15 minutes and keeps
-  `reconciliation_safe()` false until an operator settles its ledger row by
-  hand (no tool for it yet).
+  withdrawal, create, the four experiment commands from the transition row
+  each writes, so a crashed no-op pause or resume is
+  `EXPERIMENT_COMMAND_NOT_COMMITTED` and is sent again; a `cancel_orders` root
+  resolves once all its child cancels settled and is
+  `CANCEL_FANOUT_NOT_STARTED` with none, so send the cancel again; reject and
+  pause/resume only if they committed; a failed read is retried, never taken
+  as "not committed"); any other one (a partial `cancel_orders` fan-out, a
+  reject or pause/resume that did not commit, discretionary registration,
+  canary, allocation, paper automation) stays `OUTCOME_UNKNOWN`, alerts after
+  15 minutes and keeps `reconciliation_safe()` false until an operator settles
+  it: `mmr reconcile unknown` lists the rows, `mmr reconcile settle CMD_ID
+  --outcome resolved|rejected --reason "..."` settles one after checking the
+  real state (cli only, audited, no broker action ever; see
+  `docs/CLI_REFERENCE.md`). Known gap: a partial `cancel_orders` fan-out is
+  not in the settle allow-list (it is a cancel), so it still stays unknown.
 
 Resolved: the production approval no longer builds an empty broker snapshot.
 `production_evidence.py` (2026-10-04) captures the fenced broker snapshot, a live

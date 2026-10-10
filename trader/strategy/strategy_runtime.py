@@ -819,8 +819,9 @@ class StrategyRuntime():
     def disable_strategy(self, name: str) -> StrategyState:
         for implementation in self.strategy_implementations:
             if name == implementation.name:
-                state = implementation.disable()
-                self._signal_hold.note_disabled(name)
+                with self._signal_hold.no_dispatch():
+                    state = implementation.disable()
+                    self._signal_hold.note_disabled(name)
                 self._schedule_persist_enabled(name, False)
                 self._announce_and_drain(name)
                 return state
@@ -857,13 +858,14 @@ class StrategyRuntime():
 
     def unload_strategy(self, name: str) -> bool:
         """Remove a loaded strategy from every dispatch list; False when none has this name."""
-        instance = self.get_strategy(name)
-        if instance is None:
-            return False
-        self.strategy_implementations.remove(instance)
-        for bucket in self.strategies.values():
-            if instance in bucket:
-                bucket.remove(instance)
+        with self._signal_hold.no_dispatch():
+            instance = self.get_strategy(name)
+            if instance is None:
+                return False
+            self.strategy_implementations.remove(instance)
+            for bucket in self.strategies.values():
+                if instance in bucket:
+                    bucket.remove(instance)
         self._last_dispatched_bar = {
             key: value for key, value in self._last_dispatched_bar.items() if key[1] != name}
         sys.modules.pop(f'_mmr_strategy_{name}', None)

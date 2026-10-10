@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 
 import pytest
 
@@ -12,9 +13,11 @@ from tests.automation.test_controller_epoch import Clock
 from trader.data.event_store import EventType
 from trader.data.strategy_signal_record import source_event_id_for
 from trader.strategy.signal_hold import MAX_HELD_SIGNALS
+from trader.trading.strategy import StrategyState
 
 CONID = 4391
 ALWAYS = 10 ** 6
+WAIT = 10          # seconds; only a guard against a hang, never part of an assertion's timing
 
 
 @pytest.fixture
@@ -144,3 +147,98 @@ def test_a_full_hold_writes_each_dropped_signal_as_a_gap_while_events_can_be_wri
     tick_bars(rt, strategy, range(31, 31 + MAX_HELD_SIGNALS + 1))
     assert [g.metadata['count'] for g in gaps(rt)] == [1, 1]
     assert rt._signal_hold.held_count((CONID, strategy.name)) == MAX_HELD_SIGNALS
+
+
+# -- a disable from the RPC thread against a dispatch on the loop (mmr-openai review of 0818eaf5, PR #139) --
+
+class ObservedLock:
+    """The hold's dispatch lock, reporting when another thread has to wait for it and pausing the loop before it."""
+
+    def __init__(self, *, contended, pause_thread=None, paused=None, resume=None):
+        self._lock = threading.RLock()
+        self.contended, self.pause_thread, self.paused, self.resume = contended, pause_thread, paused, resume
+
+    def __enter__(self):
+        if self.pause_thread is not None and threading.current_thread() is self.pause_thread:
+            self.pause_thread = None
+            self.paused.set()
+            assert self.resume.wait(WAIT)
+        if not self._lock.acquire(blocking=False):
+            self.contended.set()
+            self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self._lock.release()
+
+
+def watch_side_effects(rt, strategy):
+    """Each record, publish and proposal of the dispatch, with the strategy state at that moment."""
+    seen = []
+    record, publish, propose = rt._record_signal, rt.zmq_messagebus_client.write, rt.signal_proposer.on_signal
+    rt._record_signal = lambda *a: (record(*a), seen.append(('record', strategy.state)))
+    rt.zmq_messagebus_client.write = lambda *a: (publish(*a), seen.append(('publish', strategy.state)))
+    rt.signal_proposer.on_signal = lambda *a: (propose(*a), seen.append(('proposal', strategy.state)))
+    return seen
+
+
+def disable_on_rpc_thread(rt, strategy, done):
+    thread = threading.Thread(target=lambda: (rt.disable_strategy(strategy.name), done.set()), name='rpc')
+    thread.start()
+    return thread
+
+
+def test_a_disable_during_the_held_record_write_waits_until_the_dispatch_is_done(held):
+    """OpenAI's probe: pause in _record_signal on a retry, disable from the RPC thread, resume."""
+    rt, strategy = held
+    rt.signal_record.failures_left = 0
+    seen = watch_side_effects(rt, strategy)
+    in_write, resume, disable_progressed = threading.Event(), threading.Event(), threading.Event()
+    rt._signal_hold._dispatch_lock = ObservedLock(contended=disable_progressed)
+    record = rt._record_signal
+    rt._record_signal = lambda *a: (in_write.set(), resume.wait(WAIT), record(*a))
+    loop = threading.Thread(target=rt._retry_held_signals, name='loop')
+    loop.start()
+    assert in_write.wait(WAIT)
+    rpc = disable_on_rpc_thread(rt, strategy, disable_progressed)
+    assert disable_progressed.wait(WAIT)                    # the disable finished, or it waits for the dispatch
+    resume.set()
+    loop.join(WAIT)
+    rpc.join(WAIT)
+    running = StrategyState.RUNNING
+    assert seen == [('record', running), ('publish', running), ('proposal', running)]   # all before the disable
+    assert strategy.state == StrategyState.DISABLED and gaps(rt) == []
+
+
+def test_a_disable_before_the_held_dispatch_takes_the_lock_makes_a_gap_and_no_dispatch(held):
+    rt, strategy = held
+    rt.signal_record.failures_left = 0
+    paused, resume, disabled = threading.Event(), threading.Event(), threading.Event()
+    loop = threading.Thread(target=rt._retry_held_signals, name='loop')
+    rt._signal_hold._dispatch_lock = ObservedLock(contended=threading.Event(), pause_thread=loop,
+                                                  paused=paused, resume=resume)
+    loop.start()
+    assert paused.wait(WAIT)                                # the retry is about to check the strategy
+    disable_on_rpc_thread(rt, strategy, disabled).join(WAIT)
+    assert disabled.is_set()
+    resume.set()
+    loop.join(WAIT)
+    assert nothing_acted_on(rt)
+    assert [g.metadata['reason'] for g in gaps(rt)] == ['STRATEGY_DISABLED']
+
+
+def test_a_disable_while_a_fresh_signal_is_computed_makes_a_gap_and_no_dispatch(tmp_path, installed_strategy, clock):
+    installed_strategy.ctx.auto_execute = 'propose'
+    rt, _ = ticking_runtime(tmp_path, clock, installed_strategy, fail_after_write=False)
+    rt.signal_record.failures_left = 0
+    rt._schedule_persist_enabled = lambda name, enabled: None
+    rt._announce_and_drain = lambda name: None
+    on_prices = installed_strategy.on_prices
+
+    def disabled_mid_bar(frame):
+        disable_on_rpc_thread(rt, installed_strategy, threading.Event()).join(WAIT)
+        return on_prices(frame)
+    installed_strategy.on_prices = disabled_mid_bar
+    rt._on_tick_for_strategy(installed_strategy, CONID)
+    assert nothing_acted_on(rt)
+    assert [g.metadata['reason'] for g in gaps(rt)] == ['STRATEGY_DISABLED']

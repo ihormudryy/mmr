@@ -10,13 +10,21 @@ The hold is bounded per (conId, strategy). Once full, each newer signal is dropp
 and counted; the count is written as one ``SIGNAL_GAP`` event as soon as any event
 can be written. A failing record logs one ERROR when the hold starts and one
 ``SIGNAL_HOLD_FULL`` ERROR when it first drops a signal, not one per tick.
+
+Every dispatch, fresh or held, checks that its strategy may still act and then
+writes the record and runs its side effects under one lock. A disable or unload
+takes the same lock, so it lands either before the check (the signal becomes a
+gap) or after the side effects (the signal was dispatched while enabled), never
+between them (mmr-openai review of PR #139).
 """
 from __future__ import annotations
 
 import datetime as dt
 import logging
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 import pandas as pd
 
@@ -71,7 +79,10 @@ class _Hold:
 
 
 class SignalHold:
-    """Per (conId, strategy name) queue of signals waiting for the record. Used from the event loop only."""
+    """Per (conId, strategy name) queue of signals waiting for the record.
+
+    The queue is used from the event loop only; ``no_dispatch`` and ``note_disabled`` come from other threads.
+    """
 
     def __init__(self, *, dispatch: Callable[[HeldSignal], None],
                  block_reason: Callable[[Any], Optional[str]],
@@ -84,9 +95,18 @@ class SignalHold:
         self._holds: Dict[tuple, _Hold] = {}
         # Bumped from the RPC thread on every disable; a held signal compares it with its own copy.
         self._disables: Dict[str, int] = {}
+        # Reentrant: a dispatch may disable its own strategy (an AI source file changed after load).
+        self._dispatch_lock = threading.RLock()
+
+    @contextmanager
+    def no_dispatch(self) -> Iterator[None]:
+        """Hold while a strategy is disabled or unloaded, so no dispatch straddles the change."""
+        with self._dispatch_lock:
+            yield
 
     def note_disabled(self, strategy_name: str) -> None:
-        self._disables[strategy_name] = self._disables.get(strategy_name, 0) + 1
+        with self._dispatch_lock:
+            self._disables[strategy_name] = self._disables.get(strategy_name, 0) + 1
 
     def held_count(self, key: tuple) -> int:
         hold = self._holds.get(key)
@@ -100,9 +120,9 @@ class SignalHold:
             self._enqueue(key, hold, held)
             return
         try:
-            self._dispatch(held)
-        except SignalRecordWriteFailed as ex:
-            logging.error('signal record write failed for %s conId %s; holding its signals (at most %d) and '
+            self._settle(held)
+        except (SignalRecordWriteFailed, SignalGapWriteFailed) as ex:
+            logging.error('signal of %s conId %s could not be written; holding its signals (at most %d) and '
                           'retrying on each tick and reconcile: %s', key[1], key[0], self._capacity, ex)
             self._holds.setdefault(key, _Hold()).signals.append(held)
 
@@ -143,17 +163,21 @@ class SignalHold:
             hold.signals.pop(0)
 
     def _settle(self, held: HeldSignal) -> None:
-        if held.block_reason is None:
-            held.block_reason = self._why_blocked(held)
-        if held.block_reason is None:
-            self._dispatch(held)
-            return
+        with self._dispatch_lock:
+            if held.block_reason is None:
+                held.block_reason = self._why_blocked(held)
+            if held.block_reason is None:
+                self._dispatch(held)
+                return
+        self._write_blocked_gap(held)
+
+    def _write_blocked_gap(self, held: HeldSignal) -> None:
         signal_time = held.signal_time
         action = str(held.signal.action)
         self._write(held.strategy.name, held.conid, {
             'reason': held.block_reason, 'action': action, 'signal_time': signal_time.isoformat(),
             'source_event_id': source_event_id_for(held.strategy.name, held.conid, action, signal_time)})
-        logging.warning('held %s signal of %s conId %s at %s was not dispatched (%s); written as SIGNAL_GAP',
+        logging.warning('%s signal of %s conId %s at %s was not dispatched (%s); written as SIGNAL_GAP',
                         action, held.strategy.name, held.conid, signal_time.isoformat(), held.block_reason)
 
     def _why_blocked(self, held: HeldSignal) -> Optional[str]:

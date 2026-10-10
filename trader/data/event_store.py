@@ -14,6 +14,8 @@ class EventType(str, Enum):
     ORDER_CANCELLED = 'ORDER_CANCELLED'
     ORDER_REJECTED = 'ORDER_REJECTED'
     RISK_GATE_REJECTED = 'RISK_GATE_REJECTED'
+    # A strategy signal that never reached the signal record (strategy_runtime's signal hold).
+    SIGNAL_GAP = 'SIGNAL_GAP'
 
 
 @dataclass

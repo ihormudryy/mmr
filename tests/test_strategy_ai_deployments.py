@@ -446,7 +446,7 @@ def test_an_overlapping_reconcile_neither_feeds_nor_backfills_an_instance_still_
     path = bar_recording_strategy(history_rt, record)
     history = HeldHistoryClient()
     history_rt.historical_data_client = history
-    history_rt._pending_signals = {}
+    history_rt._signal_hold = history_rt._new_signal_hold()
     history_rt._hist_bars[(CONID, ONE_MIN)] = backfilled_bars().tz_convert("UTC")   # a bar would reach on_prices
     wire_runtime_reconcile(history_rt, path, [active(path)])
     reconcile_a = threading.Thread(target=history_rt._reconcile_sync)

@@ -52,6 +52,9 @@ from trader.strategy.ai_deployment_source import (
     source_unchanged,
 )
 from trader.strategy.signal_proposer import SignalProposer
+from trader.strategy.signal_hold import (
+    STRATEGY_DISABLED, STRATEGY_UNLOADED, HeldSignal, SignalHold, SignalRecordWriteFailed,
+)
 from trader.strategy.strategy_revisions import StrategyCommandReceipt, StrategyRevisionStore
 from trader.strategy.trader_gateway import StrategyTraderGateway
 from trader.trading.strategy import Signal, Strategy, StrategyConfig, StrategyContext, StrategyState
@@ -161,16 +164,12 @@ class ControlRevisionConflict(Exception):
         )
 
 
-class SignalRecordWriteFailed(Exception):
-    """The durable signal record write failed or its outcome is unknown.
-
-    The signal is kept and retried with the same ``source_event_id``, which the
-    record treats as the same row (SP2 Plan 1, PR #78 review).
-    """
-
-
 class AiHistoryBackfillError(Exception):
     """An AI instance's history did not load; it must not trade on partial data."""
+
+
+def _is_dispatchable(strategy: Strategy) -> bool:
+    return strategy.state in (StrategyState.RUNNING, StrategyState.WAITING_HISTORICAL_DATA)
 
 
 def _running_loop() -> Optional[asyncio.AbstractEventLoop]:
@@ -569,9 +568,8 @@ class StrategyRuntime():
         # Last completed bar timestamp dispatched per (conId, strategy name), so
         # a strategy sees each bar once (not on every tick).
         self._last_dispatched_bar: Dict[tuple, pd.Timestamp] = {}
-        # Signals whose durable record write failed, per (conId, strategy name),
-        # oldest first. Retried on every tick before any newer signal.
-        self._pending_signals: Dict[tuple, List[tuple]] = {}
+        # Signals whose durable record write failed, per (conId, strategy name).
+        self._signal_hold = self._new_signal_hold()
         # Config-file change detection. Must exist from construction:
         # reload_strategies (RPC → _reconcile) can fire while run() is still
         # in its initial historical fetch, long before run() stamps the real
@@ -822,6 +820,7 @@ class StrategyRuntime():
         for implementation in self.strategy_implementations:
             if name == implementation.name:
                 state = implementation.disable()
+                self._signal_hold.note_disabled(name)
                 self._schedule_persist_enabled(name, False)
                 self._announce_and_drain(name)
                 return state
@@ -1570,10 +1569,7 @@ class StrategyRuntime():
         )
 
     def __get_enabled_strategies(self, conid: int) -> List[Strategy]:
-        if conid in self.strategies:
-            return [strategy for strategy in self.strategies[conid]
-                    if strategy.state == StrategyState.RUNNING or strategy.state == StrategyState.WAITING_HISTORICAL_DATA]
-        return []
+        return [strategy for strategy in self.strategies.get(conid, []) if _is_dispatchable(strategy)]
 
     @log_method
     def get_strategies(self) -> List[Strategy]:
@@ -1684,7 +1680,7 @@ class StrategyRuntime():
 
     def _on_tick_for_strategy(self, strategy: Strategy, conId: int) -> None:
         dkey = (conId, strategy.name)
-        self._retry_pending_signals(dkey)
+        self._signal_hold.retry(dkey)
         try:
             # Hand the strategy proper OHLCV bars (historical priming +
             # resampled live ticks), and only when a NEW completed bar has
@@ -1721,25 +1717,37 @@ class StrategyRuntime():
 
         if not signal:
             return
-        pending = self._pending_signals.get(dkey)
-        if pending:
-            pending.append((strategy, signal, conId, frame))      # keep the record in signal order
-            return
-        if not self._dispatch_once(strategy, signal, conId, frame):
-            self._pending_signals[dkey] = [(strategy, signal, conId, frame)]
+        self._signal_hold.dispatch(dkey, strategy, signal, conId, frame)
 
-    def _retry_pending_signals(self, dkey: tuple) -> None:
-        """Dispatch held signals oldest first; stop at the first record write that fails again."""
-        pending = self._pending_signals.get(dkey)
-        while pending:
-            strategy, signal, conId, frame = pending[0]
-            if not self._dispatch_once(strategy, signal, conId, frame):
-                return
-            pending.pop(0)
-        self._pending_signals.pop(dkey, None)
+    def _new_signal_hold(self) -> SignalHold:
+        return SignalHold(dispatch=self._dispatch_held, block_reason=self._held_signal_block_reason,
+                          write_gap=self._write_signal_gap)
 
-    def _dispatch_once(self, strategy: Strategy, signal, conId: int, frame: pd.DataFrame) -> bool:
-        """False only when the durable record write failed: the signal must be retried.
+    def _dispatch_held(self, held: HeldSignal) -> None:
+        self._dispatch_once(held.strategy, held.signal, held.conid, held.frame)
+
+    def _held_signal_block_reason(self, strategy: Strategy) -> Optional[str]:
+        if self.get_strategy(strategy.name) is not strategy:
+            return STRATEGY_UNLOADED
+        if not _is_dispatchable(strategy):
+            return STRATEGY_DISABLED
+        return None
+
+    def _write_signal_gap(self, strategy_name: str, conid: int, metadata: dict) -> None:
+        # The action stays in metadata only, so no reader can count a gap row as a BUY or SELL.
+        self.event_store.append(TradingEvent(
+            event_type=EventType.SIGNAL_GAP, timestamp=dt.datetime.now(), strategy_name=strategy_name,
+            conid=conid, metadata=metadata))
+
+    def _retry_held_signals(self) -> None:
+        """Retry every held signal on the reconcile cadence, including those of a disabled strategy."""
+        try:
+            self._signal_hold.retry_all()
+        except Exception as ex:
+            logging.warning('held-signal retry failed (will retry next cycle): %s', ex)
+
+    def _dispatch_once(self, strategy: Strategy, signal, conId: int, frame: pd.DataFrame) -> None:
+        """Raises SignalRecordWriteFailed when the durable record write failed: the signal must be retried.
 
         Any later failure (event store, publish) is logged and the signal is not
         replayed, so it is never published or bridged twice.
@@ -1747,16 +1755,13 @@ class StrategyRuntime():
         try:
             self._dispatch_signal(strategy, signal, conId=conId, frame=frame)
         except SignalRecordWriteFailed:
-            logging.exception('signal record write failed for %s conId %s; retrying on the next tick',
-                              getattr(strategy, 'name', '?'), conId)
-            return False
+            raise
         except Exception:
             # A failure persisting/publishing one signal must not kill the
             # feed or the other strategies either.
             logging.exception(
                 'failed to record/publish signal from %s for conId %s',
                 getattr(strategy, 'name', '?'), conId)
-        return True
 
     def _record_signal(self, strategy: Strategy, signal, conId: int, frame: pd.DataFrame) -> None:
         """Spec 6.1: BUY/SELL go to the durable record before any publish; a failed write raises."""
@@ -2312,7 +2317,12 @@ class StrategyRuntime():
         loop would stall live ticker dispatch. It is also isolated in its
         own try/except: a proposal-store failure must not skip the config
         reload + re-subscription work that follows.
+
+        Held signals are retried first, on the loop like the tick path that
+        also touches the hold, so a disabled strategy's held signal is settled
+        even though no tick reaches it.
         """
+        self._retry_held_signals()
         try:
             await asyncio.to_thread(self.signal_proposer.expire_stale)
         except Exception as ex:

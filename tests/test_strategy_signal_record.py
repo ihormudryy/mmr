@@ -153,6 +153,8 @@ def ticking_runtime(tmp_path, clock, strategy, *, fail_after_write):
     rt = _make_runtime(tmp_path)
     real = StrategySignalRecord(DuckDBConnection.get_instance(str(tmp_path / "s.duckdb")), now=clock)
     rt.signal_record = FlakyRecord(real, fail_after_write=fail_after_write)
+    strategy.enable()
+    rt.strategy_implementations.append(strategy)
     rt.current_frame = _frame(last_time="2026-10-07 14:30")
     rt._strategy_frame = lambda conId, bar_size: rt.current_frame
     calls = []

@@ -34,6 +34,7 @@ def _make_runtime(tmp_path, duckdb_path=None) -> StrategyRuntime:
     rt.universe_accessor = None  # type: ignore
     rt._config_mtime = 0.0
     rt._last_dispatched_bar = {}
+    rt._signal_hold = rt._new_signal_hold()
     rt._trader_gateway = None  # type: ignore
     rt.paper_trading = True
     if duckdb_path:

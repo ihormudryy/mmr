@@ -9419,6 +9419,7 @@ def _handle_data_download(args: argparse.Namespace):
     from trader.data.data_access import TickStorage
     from trader.data.store import DateRange
     from trader.data.universe import UniverseAccessor
+    from trader.data_providers.alpaca.us_listing import ALPACA_SOURCE, NonUsInstrumentError, require_us_listing
     from trader.objects import BarSize
 
     container = Container.instance()
@@ -9501,14 +9502,18 @@ def _handle_data_download(args: argparse.Namespace):
 
     targets = ([(definition.symbol, definition) for definition in bound_definitions]
                if bound_definitions is not None else [(symbol, None) for symbol in args.symbols])
+    refused_targets: List[str] = []
     for symbol, sec_def in targets:
         try:
             if sec_def is None:
                 sec_def = _resolve_download_symbol(accessor, rpc_mmr, symbol)
             elif not sec_def.conId:
                 raise DownloadTargetError(f'{symbol}: the universe entry has no conId')
-        except DownloadTargetError as ex:
+            if source == ALPACA_SOURCE and sec_def is not None:
+                require_us_listing(sec_def)
+        except (DownloadTargetError, NonUsInstrumentError) as ex:
             failed += 1
+            refused_targets.append(str(ex))
             if not _json_mode:
                 console.print(f'[red]  {ex}[/red]')
             continue
@@ -9632,6 +9637,7 @@ def _handle_data_download(args: argparse.Namespace):
             'skipped_up_to_date': skipped_up_to_date,
             'failed': failed,
             'rows_written': total_rows_written,
+            'refused_targets': refused_targets,
         }))
     else:
         print_status(
@@ -9647,6 +9653,7 @@ def _handle_data_download(args: argparse.Namespace):
         'skipped_up_to_date': skipped_up_to_date,
         'failed': failed,
         'rows_written': total_rows_written,
+        'refused_targets': refused_targets,
     }
 
 
@@ -10047,6 +10054,14 @@ def _auto_source_for_universe(universe_symbols) -> str:
     return 'alpaca' if us_count >= len(universe_symbols) / 2 else 'ib'
 
 
+def _refresh_failure_message(summary: Dict[str, Any], failed_count: int) -> str:
+    if summary.get('error'):
+        return summary['error']
+    message = f'{failed_count} symbol(s) failed to download'
+    refused_targets = summary.get('refused_targets') or []
+    return f'{message}: {"; ".join(refused_targets)}' if refused_targets else message
+
+
 def _handle_data_refresh(args: argparse.Namespace):
     """Run declarative refresh jobs from data_refresh.yaml. Each job is a
     thin wrapper around ``data download`` — same underlying machinery, just
@@ -10144,8 +10159,7 @@ def _handle_data_refresh(args: argparse.Namespace):
                                 'symbols': len(symbols), 'bar_size': bar_size,
                                 'days': days, 'downloaded': summary.get('completed', 0),
                                 'failed_symbols': dl_failed,
-                                **({} if job_ok else {'error': summary.get('error')
-                                                      or f'{dl_failed} symbol(s) failed to download'})})
+                                **({} if job_ok else {'error': _refresh_failure_message(summary, dl_failed)})})
             finally:
                 _json_mode = saved_json_mode
         except Exception as ex:

@@ -12,6 +12,7 @@ from trader.data.data_access import SecurityDefinition, TickData, TickStorage
 from trader.data.store import DateRange
 from trader.data.universe import Universe, UniverseAccessor
 from trader.data_providers import Capability, ProviderError, ProviderRegistry
+from trader.data_providers.alpaca.us_listing import ALPACA_SOURCE, require_us_listing
 from trader.listeners.ib_history_worker import IBHistoryWorker
 from trader.messaging.clientserver import RPCServer
 from trader.messaging.data_service_api import DataServiceApi
@@ -124,6 +125,8 @@ class DataService:
         async with sem:
             self._running_count += 1
             try:
+                if source == ALPACA_SOURCE:
+                    require_us_listing(security)
                 provider = registry.get(Capability.HISTORY, source)
                 logging.info('downloading {} {} from {} to {}'.format(
                     source, security.symbol, pdt(date_range.start), pdt(date_range.end)

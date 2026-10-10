@@ -51,11 +51,15 @@ class DockerHelperResult:
 
 
 
+HELPER_FILES = ("docker-compose.yml", "docker-compose.test.override.yml", "config_defaults")
+
+
 class FakeDocker:
     def __init__(self, tmp_path: Path):
         self.home = tmp_path / "home"
         self.bin_dir = tmp_path / "bin"
         self.log_path = tmp_path / "docker.log"
+        self.root = self._private_checkout(tmp_path / "repo")
         self.home.mkdir()
         self.bin_dir.mkdir()
         fake_docker = self.bin_dir / "docker"
@@ -119,6 +123,18 @@ exit 0
     def rpc_dir(self) -> Path:
         return self.home / ".config/mmr/keys/rpc"
 
+    @staticmethod
+    def _private_checkout(root: Path) -> Path:
+        """docker.sh reads and writes ``.env`` next to itself, so each test runs its own copy (issue #99)."""
+        root.mkdir()
+        helper = root / "docker.sh"
+        helper.write_bytes((REPO_ROOT / "docker.sh").read_bytes())
+        helper.chmod(helper.stat().st_mode | stat.S_IXUSR)
+        for name in HELPER_FILES:
+            (root / name).symlink_to(REPO_ROOT / name)
+        (root / ".env").write_text("TWS_USERID=test-user\nTWS_PASSWORD=test-password\nTRADING_MODE=paper\n")
+        return root
+
     def write_keys(self) -> None:
         write_keyset(self.rpc_dir)
         private = self.home / ".config" / "mmr" / "keys" / "private"
@@ -139,8 +155,8 @@ exit 0
         if env:
             process_env.update(env)
         completed = subprocess.run(
-            [str(REPO_ROOT / "docker.sh"), *args],
-            cwd=REPO_ROOT,
+            [str(self.root / "docker.sh"), *args],
+            cwd=self.root,
             env=process_env,
             text=True,
             input=stdin,
@@ -152,16 +168,7 @@ exit 0
 
 @pytest.fixture
 def fake_docker(tmp_path: Path):
-    env_file = REPO_ROOT / ".env"
-    original_env = env_file.read_bytes() if env_file.exists() else None
-    env_file.write_text("TWS_USERID=test-user\nTWS_PASSWORD=test-password\nTRADING_MODE=paper\n")
-    try:
-        yield FakeDocker(tmp_path)
-    finally:
-        if original_env is None:
-            env_file.unlink(missing_ok=True)
-        else:
-            env_file.write_bytes(original_env)
+    return FakeDocker(tmp_path)
 
 
 def test_exec_defaults_to_trader(fake_docker: FakeDocker):
@@ -458,8 +465,8 @@ def test_K_runs_the_mount_check_in_an_isolated_project_with_the_test_override(fa
     calls = _compose_lines(fake_docker)
     assert calls
     prefix = ["compose", "-p", "mmr-keycheck",
-              "-f", str(REPO_ROOT / "docker-compose.yml"),
-              "-f", str(REPO_ROOT / "docker-compose.test.override.yml")]
+              "-f", str(fake_docker.root / "docker-compose.yml"),
+              "-f", str(fake_docker.root / "docker-compose.test.override.yml")]
     for call in calls:
         assert call[:7] == prefix, call
         assert "up" not in call and "--profile" not in call and "fullstack-tests" not in call

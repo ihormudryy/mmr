@@ -31,18 +31,17 @@ def test_backup_retries_past_a_separate_process_writer(tmp_path):
     which is not the deployment scenario — the backup runs as its own process.)"""
     import subprocess
     import sys
-    import time
     src = tmp_path / 'live.duckdb'
     _make_db(src, [(1, 'x')])
-    # Separate process: open RW, insert, hold the lock ~0.8s, then release.
+    # Separate process: open RW, insert, say so, hold the lock ~0.8s, then release.
     holder = subprocess.Popen([
         sys.executable, '-c',
         "import duckdb,time,sys; c=duckdb.connect(sys.argv[1]); "
-        "c.execute(\"INSERT INTO t VALUES (2, 'y')\"); time.sleep(0.8); c.close()",
+        "c.execute(\"INSERT INTO t VALUES (2, 'y')\"); print('locked', flush=True); time.sleep(0.8); c.close()",
         str(src),
-    ])
+    ], stdout=subprocess.PIPE, text=True)
     try:
-        time.sleep(0.2)                        # ensure the holder has the lock
+        assert holder.stdout.readline().strip() == 'locked'   # a fixed sleep raced under parallel workers (#99)
         dst = tmp_path / 'live_bak.duckdb'
         backup_database(str(src), str(dst))    # retries until the holder frees it
         v = duckdb.connect(str(dst), read_only=True)

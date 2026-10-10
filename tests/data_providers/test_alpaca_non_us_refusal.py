@@ -90,5 +90,32 @@ def test_the_data_service_does_not_fetch_a_non_us_security_from_alpaca(tmp_duckd
             patch('trader.data_providers.builtin._alpaca_history', return_value=provider):
         result = asyncio.run(service.pull_history('alpaca', symbols=['BHP'], prev_days=3))
     assert provider.tickers == []
-    assert result['completed'] == 0 and result['failed'] == result['enqueued'] >= 1
+    assert (result['enqueued'], result['completed'], result['failed']) == (0, 0, 1)
     assert 'ALPACA_NON_US_INSTRUMENT' in result['errors'][0]
+
+
+def test_a_non_us_security_already_covered_is_still_refused(tmp_duckdb_path):
+    """The refusal comes before the coverage check, so a covered range never reads as success (mmr-openai)."""
+    provider = _RecordingProvider()
+    service = DataService(alpaca_api_key_id='k', alpaca_api_secret_key='s', duckdb_path=tmp_duckdb_path)
+    asx = SimpleNamespace(symbol='BHP', exchange='SMART', conId=ASX_CONID, primaryExchange='ASX',
+                          timeZoneId='Australia/Sydney')
+    with patch.object(service, '_resolve_symbols', return_value=[asx]), \
+            patch('trader.data_service._try_get_exchange_calendar', return_value=object()), \
+            patch('trader.data.data_access.TickData.missing', return_value=[]), \
+            patch('trader.data_providers.builtin._alpaca_history', return_value=provider):
+        result = asyncio.run(service.pull_history('alpaca', symbols=['BHP'], prev_days=3))
+    assert provider.tickers == []
+    assert (result['completed'], result['failed']) == (0, 1)
+    assert 'ALPACA_NON_US_INSTRUMENT' in result['errors'][0]
+
+
+def test_a_download_named_by_conid_fetches_the_resolved_ticker(tmp_path):
+    """``data download 4391`` resolves the conId; Alpaca must be asked for that instrument's ticker, not '4391'."""
+    db, history = str(tmp_path / 'mmr.duckdb'), _FakeHistory()
+    UniverseAccessor(db, 'Universes').insert('us', _definition(US_CONID, 'AAPL', 'NASDAQ'))
+    args = argparse.Namespace(symbols=[str(US_CONID)], source='alpaca', bar_size='15 mins', days=5, force=False)
+    summary = _run(db, history, lambda mmr_cli: mmr_cli._handle_data_download(args))
+    assert summary['failed'] == 0
+    assert history.tickers and set(history.tickers) == {'AAPL'}
+    assert _stored_rows(db, US_CONID) > 0

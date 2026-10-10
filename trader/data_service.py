@@ -12,12 +12,12 @@ from trader.data.data_access import SecurityDefinition, TickData, TickStorage
 from trader.data.store import DateRange
 from trader.data.universe import Universe, UniverseAccessor
 from trader.data_providers import Capability, ProviderError, ProviderRegistry
-from trader.data_providers.alpaca.us_listing import ALPACA_SOURCE, require_us_listing
+from trader.data_providers.alpaca.us_listing import ALPACA_SOURCE, NonUsInstrumentError, require_us_listing
 from trader.listeners.ib_history_worker import IBHistoryWorker
 from trader.messaging.clientserver import RPCServer
 from trader.messaging.data_service_api import DataServiceApi
 from trader.objects import BarSize, WhatToShow
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import argparse
 import asyncio
@@ -37,6 +37,22 @@ def _try_get_exchange_calendar(security: SecurityDefinition):
             return exchange_calendars.get_calendar(security.exchange)
         except Exception:
             return None
+
+
+def _split_refused_listings(source: str, securities: List[SecurityDefinition]) -> Tuple[list, List[str]]:
+    """Alpaca looks bars up by ticker: a non-US listing is refused before any coverage check or fetch (#127)."""
+    if source != ALPACA_SOURCE:
+        return list(securities), []
+    allowed, refused = [], []
+    for security in securities:
+        try:
+            require_us_listing(security)
+        except NonUsInstrumentError as ex:
+            logging.error(str(ex))
+            refused.append(str(ex))
+        else:
+            allowed.append(security)
+    return allowed, refused
 
 
 class DataService:
@@ -125,8 +141,6 @@ class DataService:
         async with sem:
             self._running_count += 1
             try:
-                if source == ALPACA_SOURCE:
-                    require_us_listing(security)
                 provider = registry.get(Capability.HISTORY, source)
                 logging.info('downloading {} {} from {} to {}'.format(
                     source, security.symbol, pdt(date_range.start), pdt(date_range.end)
@@ -241,6 +255,7 @@ class DataService:
         start_date = dateify(dt.datetime.now() - dt.timedelta(days=prev_days + 1), make_sod=True)
         end_date = dateify(dt.datetime.now() - dt.timedelta(days=1), make_eod=True)
 
+        securities, refused = _split_refused_listings(source, securities)
         sem = asyncio.Semaphore(max_concurrent)
         tasks = []
 
@@ -269,14 +284,14 @@ class DataService:
 
         enqueued = len(tasks)
         if enqueued == 0:
-            return {'enqueued': 0, 'completed': 0, 'failed': 0, 'errors': []}
+            return {'enqueued': 0, 'completed': 0, 'failed': len(refused), 'errors': refused}
 
         logging.info('enqueued {} {} download tasks'.format(enqueued, source))
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        errors = []
+        errors = list(refused)
         completed = 0
-        failed = 0
+        failed = len(refused)
         for r in results:
             if isinstance(r, Exception):
                 failed += 1

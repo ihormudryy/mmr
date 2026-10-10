@@ -9586,7 +9586,8 @@ def _handle_data_download(args: argparse.Namespace):
                     ))
                 else:
                     df = worker.get_history(
-                        ticker=symbol,
+                        # The resolved instrument's ticker, never the typed name (a conId string, #127).
+                        ticker=sec_def.symbol if sec_def is not None else symbol,
                         bar_size=bar_size,
                         start_date=dr.start,
                         end_date=dr.end,

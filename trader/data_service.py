@@ -12,7 +12,7 @@ from trader.data.data_access import SecurityDefinition, TickData, TickStorage
 from trader.data.store import DateRange
 from trader.data.universe import Universe, UniverseAccessor
 from trader.data_providers import Capability, ProviderError, ProviderRegistry
-from trader.data_providers.alpaca.us_listing import ALPACA_SOURCE, NonUsInstrumentError, require_us_listing
+from trader.data_providers.us_listing import NonUsInstrumentError, require_us_listing
 from trader.listeners.ib_history_worker import IBHistoryWorker
 from trader.messaging.clientserver import RPCServer
 from trader.messaging.data_service_api import DataServiceApi
@@ -40,13 +40,11 @@ def _try_get_exchange_calendar(security: SecurityDefinition):
 
 
 def _split_refused_listings(source: str, securities: List[SecurityDefinition]) -> Tuple[list, List[str]]:
-    """Alpaca looks bars up by ticker: a non-US listing is refused before any coverage check or fetch (#127)."""
-    if source != ALPACA_SOURCE:
-        return list(securities), []
+    """REST providers look bars up by ticker: a non-US listing is refused before any coverage check or fetch (#127, #137)."""
     allowed, refused = [], []
     for security in securities:
         try:
-            require_us_listing(security)
+            require_us_listing(source, security)
         except NonUsInstrumentError as ex:
             logging.error(str(ex))
             refused.append(str(ex))

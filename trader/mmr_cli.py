@@ -9420,7 +9420,7 @@ def _handle_data_download(args: argparse.Namespace):
     from trader.data.data_access import TickStorage
     from trader.data.store import DateRange
     from trader.data.universe import UniverseAccessor
-    from trader.data_providers.alpaca.us_listing import ALPACA_SOURCE, NonUsInstrumentError, require_us_listing
+    from trader.data_providers.us_listing import NonUsInstrumentError, require_us_listing
     from trader.objects import BarSize
 
     container = Container.instance()
@@ -9510,8 +9510,8 @@ def _handle_data_download(args: argparse.Namespace):
                 sec_def = _resolve_download_symbol(accessor, rpc_mmr, symbol)
             elif not sec_def.conId:
                 raise DownloadTargetError(f'{symbol}: the universe entry has no conId')
-            if source == ALPACA_SOURCE and sec_def is not None:
-                require_us_listing(sec_def)
+            if source != 'ib' and sec_def is not None:
+                require_us_listing(source, sec_def)
         except (DownloadTargetError, NonUsInstrumentError) as ex:
             failed += 1
             refused_targets.append(str(ex))

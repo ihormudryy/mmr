@@ -19,8 +19,9 @@
 #                + `mmr universe add ...` if you want an ad-hoc list).
 #   source     — 'alpaca', 'twelvedata', 'massive', or 'ib'. Optional — when
 #                omitted, US exchanges → 'alpaca' (free, SIP), all others → 'ib'.
-#                An 'alpaca' job refuses (ALPACA_NON_US_INSTRUMENT) any entry whose
-#                primary exchange is not a US listing; the job then reports failed.
+#                An 'alpaca', 'massive' or 'twelvedata' job refuses
+#                (<SOURCE>_NON_US_INSTRUMENT, e.g. ALPACA_NON_US_INSTRUMENT) any entry
+#                whose primary exchange is not a US listing; the job then reports failed.
 #   bar_size   — "1 day", "1 min", etc. Same vocab as `mmr data download`.
 #   days       — lookback window. Keep 1-min windows small (90d for US,
 #                30d for ASX) — IB historical pacing is the bottleneck.

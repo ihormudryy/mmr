@@ -1462,7 +1462,8 @@ def test_received_single_step_rows_from_before_the_start_are_parked_then_settled
     assert set(requeued) == {"aidep-old", "start-old"}
     parked = recon.ledger.get("start-old")
     assert (parked.state, parked.error_code) == ("OUTCOME_UNKNOWN", RECEIVED_AT_RESTART)
-    assert recon.ledger.get("approve-old").state == "RECEIVED"                   # a saga recovers on its own
+    approve = recon.ledger.get("approve-old")                                   # a saga never started (#130)
+    assert (approve.state, approve.error_code) == ("REJECTED", "CRASH_ORPHANED")
     assert recon.ledger.get("aidep-live").state == "RECEIVED"
     reconciler.run_due(NOW)
     assert (recon.ledger.get("aidep-old").state, recon.ledger.get("aidep-old").outcome) == ("RESOLVED", outcome)

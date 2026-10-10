@@ -113,6 +113,15 @@ Armed paper automation cannot exit safely yet, and the evidence step has a gap i
   real state (cli only, audited, no broker action ever; see
   `docs/CLI_REFERENCE.md`). Known gap: a partial `cancel_orders` fan-out is
   not in the settle allow-list (it is a cancel), so it still stays unknown.
+- **A saga command left `RECEIVED` by a crash** (issue #130, same start
+  snapshot). Approve, cancel, strategy control, automated intent and AI
+  decision write nothing before they move their row on, so the row is
+  `REJECTED` `CRASH_ORPHANED` (nothing was sent; send it again if still
+  wanted). `publish_ai_risk_policy` may have committed its revision, so it is
+  parked `OUTCOME_UNKNOWN`: check `mmr ai-policy show`, then `mmr reconcile
+  settle`. `liquidate_account` is parked too: with no close root its claim
+  never committed (`LIQUIDATION_NOT_STARTED`); with one it settles from that
+  root.
 
 Resolved: the production approval no longer builds an empty broker snapshot.
 `production_evidence.py` (2026-10-04) captures the fenced broker snapshot, a live

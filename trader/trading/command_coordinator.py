@@ -834,6 +834,7 @@ class CommandLedger:
         expected_version: Optional[int] = None,
         source: str = "test",
         outcome: Optional[dict[str, Any]] = None,
+        error_code: Optional[str] = None,
     ) -> LedgerRow:
         conn = self._journal.connect()
         row = conn.execute(
@@ -842,11 +843,11 @@ class CommandLedger:
                 command_id, request_hash, account_id, action, target_type,
                 target_id, expected_version, state, outcome, error_code,
                 source, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING """ + ", ".join(_LEDGER_COLUMNS),
             [
                 command_id, request_hash, account_id, action, target_type,
-                target_id, expected_version, state, outcome, source,
+                target_id, expected_version, state, outcome, error_code, source,
                 _as_utc(created_at) if created_at is not None else _as_utc(updated_at),
                 _as_utc(updated_at),
             ],
@@ -2572,8 +2573,20 @@ SAGA_ACTIONS = frozenset({
     "approve_proposal", "cancel_order", "liquidate_account", "enable_strategy", "disable_strategy",
     "update_strategy_params", "execute_automated_intent", "publish_ai_risk_policy", "submit_ai_paper_decision",
 })
+# Issue #130: how a restart settles a saga row an earlier process left RECEIVED. These handlers write nothing
+# durable before they move the row on (the approve/cancel risk-decision record is no order), so such a row never
+# started and is rejected CRASH_ORPHANED. A test keeps the two sets a partition of SAGA_ACTIONS.
+SAGA_ACTIONS_IDLE_WHILE_RECEIVED = frozenset({
+    "approve_proposal", "cancel_order", "enable_strategy", "disable_strategy", "update_strategy_params",
+    "execute_automated_intent", "submit_ai_paper_decision",
+})
+# These commit work while the row is still RECEIVED (the policy revision, the close claim), so a restart parks
+# them OUTCOME_UNKNOWN like a single-step command and their evidence or the operator settles them.
+SAGA_ACTIONS_COMMITTING_WHILE_RECEIVED = frozenset({"publish_ai_risk_policy", "liquidate_account"})
 # A single-step command still RECEIVED at a restart: its handler died or its final write failed (issue #114).
 RECEIVED_AT_RESTART = "RECEIVED_AT_RESTART"
+# A liquidate_account left RECEIVED by a crash that holds no close root: its claim never committed (issue #130).
+LIQUIDATION_NOT_STARTED = "LIQUIDATION_NOT_STARTED"
 # A cancel_orders root that left no child cancel_order: no cancel was sent, so it is no success (PR #122).
 CANCEL_FANOUT_NOT_STARTED = "CANCEL_FANOUT_NOT_STARTED"
 
@@ -2804,7 +2817,9 @@ class OutcomeReconciler:
 
         Issue #114: first parks single-step rows left ``RECEIVED`` by an earlier
         process at ``OUTCOME_UNKNOWN`` (``RECEIVED_AT_RESTART``), so the loop
-        below schedules them and their action's evidence settles them."""
+        below schedules them and their action's evidence settles them. Issue
+        #130: a saga row left ``RECEIVED`` is rejected like a ``VALIDATED``
+        orphan, or parked when its handler commits work while ``RECEIVED``."""
         self._park_received_at_start()
         requeued: list[str] = []
         for row in self._ledger.reconcilable():
@@ -2816,15 +2831,19 @@ class OutcomeReconciler:
         return requeued
 
     def _park_received_at_start(self) -> None:
-        """RECEIVED -> OUTCOME_UNKNOWN for the single-step rows of the start snapshot, once.
+        """Settle the RECEIVED rows of the start snapshot, once.
 
-        Never terminal: only the action's own evidence settles a row, and an action without a resolver stays
-        OUTCOME_UNKNOWN (and alerts after 15 minutes). Sagas are left alone. One failed row never stops the
-        others; it stays RECEIVED until the next start. A later rescan parks nothing."""
+        A saga that writes nothing while RECEIVED never started: REJECTED ``CRASH_ORPHANED``. Every other row
+        is parked OUTCOME_UNKNOWN: only the action's own evidence settles it, and an action without a resolver
+        stays OUTCOME_UNKNOWN (and alerts after 15 minutes). One failed row never stops the others; it stays
+        RECEIVED until the next start. A later rescan touches nothing."""
         snapshot = list(self._received_at_start)
-        self._received_at_start.clear()          # shared with any later stack of this process: parked once
+        self._received_at_start.clear()          # shared with any later stack of this process: handled once
         for row in snapshot:
-            if row.action in SAGA_ACTIONS:
+            if row.action in SAGA_ACTIONS_IDLE_WHILE_RECEIVED:
+                if not self._terminalize_pre_dispatch_orphan(row):
+                    logger.error("command %s (%s) stays RECEIVED: it could not be rejected as never started",
+                                 row.command_id, row.action)
                 continue
             try:
                 self._park_received(row)
@@ -2908,6 +2927,8 @@ class OutcomeReconciler:
         if action == AI_PAPER_ENTRY_ACTION:
             # An ENTER is judged by its entry order; a CLOSE (no bracket) by its close root.
             return self._reconcile_automated_intent(row, now)
+        if action == "liquidate_account" and row.error_code == RECEIVED_AT_RESTART:
+            return self._reconcile_liquidation_left_received(row, now)
         if action in CLOSE_RESOLVED_ACTIONS:
             return self._reconcile_close(row, now)
         if action == AI_DEPLOYMENT_REGISTER_ACTION:
@@ -3141,6 +3162,23 @@ class OutcomeReconciler:
         )
         return True
 
+    def _reconcile_liquidation_left_received(self, row: LedgerRow, now: dt.datetime) -> bool:
+        """A liquidation commits its claim and its join row in one transaction while its ledger row is still
+        RECEIVED. A row an earlier process left RECEIVED without a join row therefore never claimed, and no
+        handler runs it any more: REJECTED. With a join row it resolves from its close root."""
+        if self._closes is None:
+            return False
+        try:
+            root_id = self._closes.root_for(row.command_id)
+        except Exception:
+            self._evidence_unreadable(row)
+            return False
+        if root_id is not None:
+            return self._reconcile_close(row, now)
+        self._reject_command_only(row, error_code=LIQUIDATION_NOT_STARTED,
+                                  outcome={"reconciled": "never_started"}, now=now)
+        return True
+
     def _has_close_root(self, command_id: str) -> bool:
         return self._closes is not None and self._closes.root_for(command_id) is not None
 
@@ -3369,16 +3407,17 @@ class OutcomeReconciler:
         return bool(row[0]), row[1]
 
     def _terminalize_pre_dispatch_orphan(self, row: LedgerRow) -> bool:
-        """Terminalize a crash-orphaned ``VALIDATED`` row to
+        """Terminalize a crash-orphaned ``VALIDATED`` row, or a ``RECEIVED``
+        saga row that never started (issue #130), to
         ``REJECTED``/``CRASH_ORPHANED`` (MEDIUM-4). Returns ``True`` on a
         committed terminalization. Guarded per-row: a lost CAS (raced away from
-        VALIDATED) or any write failure is swallowed so one bad row never
+        its state) or any write failure is swallowed so one bad row never
         aborts the whole startup rescan."""
         now = self._now_utc()
 
         def work(conn: duckdb.DuckDBPyConnection, append) -> None:
             self._ledger.transition_in_tx(
-                conn, row.command_id, "VALIDATED", "REJECTED",
+                conn, row.command_id, row.state, "REJECTED",
                 error_code="CRASH_ORPHANED", now=now,
             )
             append(

@@ -6,7 +6,7 @@ ALLOWED_MODULE_ATTRIBUTES[module]; nothing listed is a module (the walk test
 in tests/authored/test_allowed_api.py proves it on the shipped build).
 typing, dataclasses and trader.authored.api come only by from-import, and a
 from-import may bind only the names in ALLOWED_FROM_IMPORT_NAMES[module]
-(Plan 1 rulings 5 and 11).
+(Plan 1 rulings 5, 15 and 24).
 A builtin may be named only if it is in ALLOWED_BUILTINS, and every AST node
 must be one of ALLOWED_AST_NODES.
 DENIED_CHAIN_NAMES are refused anywhere in an attribute chain. The lists

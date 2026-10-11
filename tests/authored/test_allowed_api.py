@@ -24,7 +24,7 @@ def test_imports_and_from_imports_together_are_the_spec_seven_modules():
 
 
 def test_typing_and_dataclasses_are_from_import_only():
-    # Plain `import typing` would expose typing.operator, typing.sys, ... (Plan 1 ruling 11).
+    # Plain `import typing` would expose typing.operator, typing.sys, ... (Plan 1 ruling 24).
     assert not {"typing", "dataclasses"} & ALLOWED_IMPORTS
 
 

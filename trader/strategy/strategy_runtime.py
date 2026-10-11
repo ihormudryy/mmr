@@ -2709,6 +2709,23 @@ class StrategyRuntime():
             except Exception:
                 return None
 
+    @staticmethod
+    def _history_window_start(now: dt.datetime, historical_days: int, cal, tz: str) -> dt.datetime:
+        """Start of the history window: ``historical_days`` calendar days back, widened with an exchange
+        calendar to cover that many completed sessions, so a weekend or Monday start still loads Friday (#152)."""
+        calendar_start = dateify(now - dt.timedelta(days=historical_days), timezone=tz, make_sod=True)
+        if cal is None:
+            return calendar_start
+        try:
+            today = pd.Timestamp(dateify(now, timezone=tz).date())
+            last_completed = cal.date_to_session(today - pd.Timedelta(days=1), direction='previous')
+            first_session = cal.session_offset(last_completed, -(historical_days - 1))
+        except Exception as ex:   # outside the calendar's bounds
+            logging.warning('history window: no session math for %s days (%s); using calendar days',
+                            historical_days, ex)
+            return calendar_start
+        return min(calendar_start, dateify(first_session.date(), timezone=tz, make_sod=True))
+
     async def _fetch_history_with_resume(
         self,
         security: SecurityDefinition,
@@ -2738,15 +2755,11 @@ class StrategyRuntime():
         # Keyed by conId below: the store refuses the StrategyInstrument that resolve_instrument returns.
         tick_data = self.storage.get_tickdata(bar_size=bar_size)
         tz = security.timeZoneId or 'US/Eastern'
-        # dateify() with timezone= returns a tz-aware dt.datetime even
-        # when given a naive datetime or a dt.date.
-        window_start = dateify(
-            dt.datetime.now() - dt.timedelta(days=historical_days),
-            timezone=tz, make_sod=True,
-        )
-        window_end = dateify(dt.datetime.now(), timezone=tz, make_eod=True)
-
+        now = self._now()
         cal = self._try_get_exchange_calendar(security)
+        window_start = self._history_window_start(now, historical_days, cal, tz)
+        window_end = dateify(now, timezone=tz, make_eod=True)
+
         if cal is not None:
             try:
                 date_ranges = tick_data.missing(

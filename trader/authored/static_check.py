@@ -7,31 +7,22 @@ from __future__ import annotations
 
 import ast
 import builtins
-import re
 import threading
 import warnings
 from dataclasses import dataclass
 
 from trader.authored.allowed_api import (
     ALLOWED_AST_NODES, ALLOWED_BUILTINS, ALLOWED_FROM_IMPORT_NAMES, ALLOWED_FROM_IMPORTS,
-    ALLOWED_IMPORTS, ALLOWED_MODULE_ATTRIBUTES, DENIED_CHAIN_NAMES, DENIED_CHAIN_PREFIXES,
+    ALLOWED_IMPORTS, ALLOWED_MODULE_ATTRIBUTES, BANNED_ATTRIBUTES, BANNED_NAMES,
+    DENIED_CHAIN_NAMES, DENIED_CHAIN_PREFIXES, IO_ATTRIBUTE_PREFIXES, IO_EXEMPT_NAMES, IO_NAMES,
+    PROTECTED_NAMES,
 )
 
 MAX_SOURCE_BYTES = 20_480
 BASE_CLASS = "AuthoredStrategy"
 API_MODULE = "trader.authored.api"
-# Names whose meaning the trader relies on; the file may import them, never rebind them.
-_PROTECTED_NAMES = frozenset({BASE_CLASS, "Decision"})
 _BUILTIN_NAMES = frozenset(dir(builtins))
-
-BANNED_NAMES = frozenset({
-    "eval", "exec", "compile", "open", "__import__", "globals", "locals",
-    "vars", "getattr", "setattr", "delattr", "input", "breakpoint",
-    "memoryview", "format"})
-BANNED_ATTRIBUTES = frozenset({"format", "format_map"})
-_IO_PREFIX = re.compile(r"^(read_|to_)")
-_IO_NAMES = frozenset({"load", "save", "savez", "fromfile", "tofile", "eval",
-                       "query", "ctypeslib", "pickle"})
+_LITERAL_EVAL_ERRORS = (ValueError, TypeError, SyntaxError, MemoryError, RecursionError)
 
 
 @dataclass(frozen=True)
@@ -53,9 +44,9 @@ def _is_plain_importable(module: str) -> bool:
 
 
 def _is_io_attribute(name: str) -> bool:
-    if name == "to_numpy":
+    if name in IO_EXEMPT_NAMES:
         return False
-    return bool(_IO_PREFIX.match(name)) or name in _IO_NAMES
+    return name.startswith(IO_ATTRIBUTE_PREFIXES) or name in IO_NAMES
 
 
 def _has_denied_prefix(name: str) -> bool:
@@ -122,7 +113,7 @@ class _Checker(ast.NodeVisitor):
         self._check_not_builtin(node, bound_name)
 
     def _check_not_protected(self, node: ast.AST, bound_name: str) -> None:
-        if bound_name in _PROTECTED_NAMES:
+        if bound_name in PROTECTED_NAMES:
             self.add("class_shape", node, f"{bound_name} re-bound")
 
     def _check_not_builtin(self, node: ast.AST, bound_name: str) -> None:
@@ -395,6 +386,17 @@ def _check_class_shape(statement: ast.ClassDef, base_imported: bool, checker: _C
                     f"{BASE_CLASS} is not imported from {API_MODULE}")
 
 
+def _has_literal_value(statement: ast.Assign | ast.AnnAssign) -> bool:
+    """Spec 7.2 allows constant assignments only; ast.literal_eval also accepts -1."""
+    if statement.value is None:
+        return False
+    try:
+        ast.literal_eval(statement.value)
+    except _LITERAL_EVAL_ERRORS:
+        return False
+    return True
+
+
 def _check_module_shape(tree: ast.Module, checker: _Checker) -> None:
     classes = 0
     body = tree.body
@@ -407,6 +409,9 @@ def _check_module_shape(tree: ast.Module, checker: _Checker) -> None:
         if isinstance(statement, (ast.Import, ast.ImportFrom)):
             continue
         if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            if not _has_literal_value(statement):
+                checker.add("module_statement", statement,
+                            "module-level assignment must have a literal value")
             continue
         if isinstance(statement, ast.ClassDef):
             classes += 1

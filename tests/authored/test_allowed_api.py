@@ -10,8 +10,8 @@ import pytest
 
 from trader.authored.allowed_api import (
     ALLOWED_AST_NODES, ALLOWED_BUILTINS, ALLOWED_FROM_IMPORT_NAMES, ALLOWED_FROM_IMPORTS, ALLOWED_IMPORTS,
-    ALLOWED_MODULE_ATTRIBUTES, DENIED_CHAIN_NAMES,
-    DENIED_CHAIN_PREFIXES,
+    ALLOWED_MODULE_ATTRIBUTES, BANNED_ATTRIBUTES, BANNED_NAMES, DENIED_CHAIN_NAMES, DENIED_CHAIN_PREFIXES,
+    IO_ATTRIBUTE_PREFIXES, IO_EXEMPT_NAMES, IO_NAMES, PROTECTED_NAMES,
 )
 
 
@@ -171,3 +171,18 @@ def test_walk_really_reaches_the_cython_introspection_names():
     assert {"func_globals", "func_code"} <= set(reached)
     assert _reaches_the_interpreter(reached["func_globals"]) and _reaches_the_interpreter(reached["func_code"])
     assert all(_is_denied(name) for name in ("func_globals", "func_code"))
+
+
+def test_the_checker_rule_data_lives_with_the_allow_lists():
+    assert {"eval", "exec", "getattr", "__import__", "format"} <= BANNED_NAMES
+    assert BANNED_ATTRIBUTES == frozenset({"format", "format_map"})
+    assert IO_ATTRIBUTE_PREFIXES == ("read_", "to_")
+    assert IO_EXEMPT_NAMES == frozenset({"to_numpy"})
+    assert {"load", "save", "query", "pickle"} <= IO_NAMES
+    assert PROTECTED_NAMES == frozenset({"AuthoredStrategy", "Decision"})
+
+
+def test_no_allowed_name_is_also_banned():
+    assert not ALLOWED_BUILTINS & BANNED_NAMES
+    for names in ALLOWED_MODULE_ATTRIBUTES.values():
+        assert not names & (BANNED_NAMES | DENIED_CHAIN_NAMES | IO_NAMES)

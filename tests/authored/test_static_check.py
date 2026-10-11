@@ -122,6 +122,26 @@ def test_a_module_level_statement_is_refused():
     assert "module_statement" in _rules(CLEAN + "\nprint('hi')\n")
 
 
+@pytest.mark.parametrize("assignment", [
+    "X = len([1])",
+    "X = np.mean([1.0])",
+    "X = [v for v in (1, 2)]",
+    "X = 1 + 2",
+    "X: int",
+])
+def test_a_module_level_assignment_without_a_literal_value_is_refused(assignment):
+    source = CLEAN.replace("\n\nclass Good", f"\n{assignment}\n\n\nclass Good", 1)
+    assert "module_statement" in _rules(source)
+
+
+@pytest.mark.parametrize("assignment", [
+    "X = 1", "X = -2.5", "X = (1, 'a')", "X = {'a': [1, 2]}", "X: float = 0.5", "X = None",
+])
+def test_a_module_level_literal_assignment_passes(assignment):
+    source = CLEAN.replace("\n\nclass Good", f"\n{assignment}\n\n\nclass Good", 1)
+    assert check_source(source) == []
+
+
 def test_a_file_that_does_not_parse_is_one_violation():
     violations = check_source("class Good(AuthoredStrategy:\n")
     assert len(violations) == 1 and violations[0].rule == "unparseable"

@@ -106,3 +106,20 @@ DENIED_CHAIN_NAMES: frozenset[str] = frozenset({
 # addition to the exact names in DENIED_CHAIN_NAMES.
 DENIED_CHAIN_PREFIXES: tuple[str, ...] = (
     "func_", "gi_", "cr_", "ag_", "f_", "tb_", "co_", "im_")
+
+# Names refused anywhere (rule banned_name), on top of the builtin allow-list.
+BANNED_NAMES: frozenset[str] = frozenset({
+    "eval", "exec", "compile", "open", "__import__", "globals", "locals",
+    "vars", "getattr", "setattr", "delattr", "input", "breakpoint",
+    "memoryview", "format"})
+BANNED_ATTRIBUTES: frozenset[str] = frozenset({"format", "format_map"})
+
+# An attribute that reads or writes outside the process: read_*/to_* (except the
+# names in IO_EXEMPT_NAMES) and the exact names in IO_NAMES.
+IO_ATTRIBUTE_PREFIXES: tuple[str, ...] = ("read_", "to_")
+IO_EXEMPT_NAMES: frozenset[str] = frozenset({"to_numpy"})
+IO_NAMES: frozenset[str] = frozenset({
+    "load", "save", "savez", "fromfile", "tofile", "eval", "query", "ctypeslib", "pickle"})
+
+# Names whose meaning the trader relies on; a file may import them, never re-bind them.
+PROTECTED_NAMES: frozenset[str] = frozenset({"AuthoredStrategy", "Decision"})

@@ -1,8 +1,13 @@
 """SP3 Plan 1 Task 3: the streamed-evaluation benchmark (spec 10)."""
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from scripts.sp3_benchmark import (
-    BenchmarkTiming, extrapolate, ruling_text, stream_evaluation, synthetic_session,
+    BenchmarkTiming, extrapolate, parse_signal, ruling_text, stream_evaluation,
+    synthetic_session,
 )
 
 PARAMS = {"RANGE_MINUTES": 30, "VOLUME_MULT": 1.5, "RTH_OPEN_MIN": 570,
@@ -45,3 +50,21 @@ def test_ruling_text_names_the_four_hour_rule():
                                    holdout_sessions=90, cohort_points=3, tunables=2,
                                    bars_per_session=390, folds=6))
     assert "4 h" in text and "period_sessions" in text
+
+
+def _signal(**overrides) -> bytes:
+    reply = {"v": 1, "type": "SIGNAL", "session": 0, "t": "T", "action": "BUY", "probability": 0.6}
+    return json.dumps({**reply, **overrides}).encode()
+
+
+def test_parse_signal_accepts_the_full_signal_shape():
+    assert parse_signal(_signal(), session=0, t="T")["probability"] == 0.6
+    assert parse_signal(_signal(action=None, probability=None), session=0, t="T")["action"] is None
+
+
+@pytest.mark.parametrize("bad", [
+    {"type": "ERROR"}, {"v": 2}, {"session": 1}, {"t": "U"}, {"probability": None},
+])
+def test_parse_signal_rejects_a_reply_that_does_not_match_the_bar(bad):
+    with pytest.raises(ValueError, match="bad SIGNAL reply"):
+        parse_signal(_signal(**bad), session=0, t="T")

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, importlib, json, sys, time
+import argparse, importlib, json, logging, sys, time
 from dataclasses import dataclass
 from multiprocessing import Pipe, Process
 from pathlib import Path
@@ -19,6 +19,8 @@ MIN_PERIOD_SESSIONS = 132
 PARAMS = {"RANGE_MINUTES": 30, "VOLUME_MULT": 1.5, "RTH_OPEN_MIN": 570,
           "RTH_CLOSE_MIN": 960, "VOLUME_SMA_BARS": 20, "MIN_BARS": 40}
 COLUMNS = ("open", "high", "low", "close", "volume")
+PROTOCOL_VERSION = 1
+QUIET_LOGGERS = ("data", "backtester", "trader.data.duckdb_store")
 
 
 @dataclass(frozen=True)
@@ -76,8 +78,22 @@ def _child(conn, module_name, class_name, lookback, params):
         history = pd.DataFrame(buffer[:size], columns=COLUMNS)
         history.index = pd.DatetimeIndex(stamps, tz="UTC", name="date")
         decision = strategy.on_bar(history, params)
-        conn.send_bytes(json.dumps(
-            {"action": None if decision is None else decision.action}).encode())
+        conn.send_bytes(json.dumps({
+            "v": PROTOCOL_VERSION, "type": "SIGNAL", "session": message["session"],
+            "t": message["t"],
+            "action": None if decision is None else decision.action,
+            "probability": None if decision is None else decision.probability}).encode())
+
+
+def parse_signal(raw: bytes, *, session: int, t: str) -> dict:
+    reply = json.loads(raw.decode())
+    expected = {"v": PROTOCOL_VERSION, "type": "SIGNAL", "session": session, "t": t}
+    for key, value in expected.items():
+        if reply.get(key) != value:
+            raise ValueError(f"bad SIGNAL reply: {key}={reply.get(key)!r}, expected {value!r}")
+    if (reply.get("action") is None) != (reply.get("probability") is None):
+        raise ValueError(f"bad SIGNAL reply: action and probability disagree: {reply!r}")
+    return reply
 
 
 def stream_evaluation(module_name, class_name, frames, *, lookback, params):
@@ -95,13 +111,13 @@ def stream_evaluation(module_name, class_name, frames, *, lookback, params):
     s0, t0, v0 = rows[0]
     parent.send_bytes(json.dumps({"v": 1, "session": s0, "conid": 1, "t": t0, "open": v0[0], "high": v0[1],
                                   "low": v0[2], "close": v0[3], "volume": v0[4]}).encode())
-    parent.recv_bytes()
+    parse_signal(parent.recv_bytes(), session=s0, t=t0)
     bars = 0
     started = time.perf_counter()
     for session_index, iso, v in rows[1:]:
         parent.send_bytes(json.dumps({"v": 1, "session": session_index, "conid": 1, "t": iso, "open": v[0],
                                       "high": v[1], "low": v[2], "close": v[3], "volume": v[4]}).encode())
-        decisions.append(json.loads(parent.recv_bytes().decode())["action"])
+        decisions.append(parse_signal(parent.recv_bytes(), session=session_index, t=iso)["action"])
         bars += 1
     elapsed = time.perf_counter() - started
     parent.send_bytes(json.dumps({"type": "close"}).encode())
@@ -117,6 +133,8 @@ def in_process_baseline(frames, conid=4391):
     from trader.objects import BarSize
     from trader.simulation.backtester import Backtester, BacktestConfig
     import datetime as dt, tempfile, os
+    for name in QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
     path = os.path.join(tempfile.mkdtemp(), "bench.duckdb")
     combined = pd.concat(frames); combined.index.name = "date"
     DuckDBDataStore(path).write(str(conid), combined)
@@ -204,7 +222,8 @@ def main(argv=None):
                            cohort_points=3, tunables=2, bars_per_session=390, folds=6)
     print(f"streamed per-bar (median of {args.runs}): {per_bar_ms:.4f} ms ({fired} signals fired)")
     print(f"in-process backtest per-bar: {base.per_bar_ms:.4f} ms ({trades} trades)")
-    print(f"combined per-bar (streamed + backtester loop): {combined:.4f} ms")
+    print(f"combined per-bar (streamed + backtester loop): {combined:.4f} ms "
+          "(upper bound: strategy time counted twice)")
     print(f"total bar sends (full scale): {estimate['total_bar_sends']:,}")
     print(f"estimated full evaluation: {estimate['hours']:.2f} h")
     print(ruling_text(estimate))

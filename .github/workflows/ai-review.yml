@@ -39,7 +39,7 @@ jobs:
           ref: master
 
       - id: app-token
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ env.REVIEWER_KEY == 'openai' && vars.MMR_OPENAI_APP_ID || vars.MMR_GROK_APP_ID }}
           private-key: ${{ env.REVIEWER_KEY == 'openai' && secrets.MMR_OPENAI_APP_KEY || secrets.MMR_GROK_APP_KEY }}

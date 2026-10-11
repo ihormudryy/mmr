@@ -521,8 +521,11 @@ with the plan rulings.
   the static check. A hostile check passes only if the escape opened, failed at
   `BAR` for its own reason, and a neighbouring session and `PING` still answer.
   The run refuses while a live session is open (`PONG.live_open`, owner ruling),
-  so a probe never runs next to a live strategy's child. The host records the
-  printed result as `cli`.
+  so a probe never runs next to a live strategy's child. Each hostile file
+  attempts a genuinely forbidden act (write under read-only `/store`, fork past
+  the process limit, kill across uids, open a socket on a network-less
+  container), so its `BAR` fails for the reason the check expects. The host
+  records the printed result as `cli`.
 - **Startup CAP_CHOWN.** The supervisor needs CHOWN once, to give each slot its
   own `/tmp/s<uid>` (mode 0700); it drops CHOWN before it serves. The serving
   set stays SETUID, SETGID and KILL. After a session a short helper running as
@@ -531,7 +534,13 @@ with the plan rulings.
   `RLIMIT_AS` is the address space at fork plus 256 MiB.
 - **Entries stop at the send.** A retired or switched-off authored strategy is
   also refused on the order saga's SUBMITTING transaction, so a retirement
-  between the last gate and the broker send stops the entry.
+  between the last gate and the broker send stops the entry. The gate resolves
+  the record from the entering version's base deployment, so a renewed version
+  is fenced as well.
+- **The live proof is never cached.** The strategy service reads the trader's
+  latest proof for the sandbox build on every new session and every bar, so a
+  proof withdrawn for a build already running stops the next bar (zero stale
+  bars).
 - **Author spend has its own role.** The trader's `ai_costs.role` accepts
   `author` (journal migration 132 rebuilds the table, rows and seals unchanged).
 - **Tunables carry a default.** `submit_authored_strategy` sends

@@ -1551,7 +1551,7 @@ class Evil(AuthoredStrategy):
 
 The next nine files are the runtime-hostile set Plan 2 loads as probes with the static check skipped (Plan 2 `HOSTILE_ESCAPES`, ruling 11; spec 10 "hostile session"). Each must be refused by `check_source` **and** raise at run time inside the sandbox. `escape_pd_io_common_oskill.py` above is the ninth (the exact OpenAI path). Where the hostile act itself passes the checker (a large `np.ones`, a busy loop), the file names a local with a leading underscore: that is its static violation and changes nothing at run time.
 
-`escape_read_config_keys.py`:
+`escape_read_config_keys.py` (`/home/trader/.config` is a root-owned 0700 tmpfs, so a non-root child cannot traverse it; no keys are mounted either):
 ```python
 import pandas as pd
 
@@ -1564,14 +1564,14 @@ class Evil(AuthoredStrategy):
         return Decision(action="BUY", probability=0.5) if len(keys) else None
 ```
 
-`escape_write_outside_tmpfs.py`:
+`escape_write_outside_tmpfs.py` (writes to the read-only `/store` mount, never the writable `/tmp` tmpfs, so the write genuinely fails; review r2 #1):
 ```python
 from trader.authored.api import AuthoredStrategy, Decision
 
 
 class Evil(AuthoredStrategy):
     def on_bar(self, history, params):
-        history.to_csv("/tmp/escape.csv")
+        history.to_csv("/store/escape.csv")       # /store is the read-only authored-strategy mount
         return Decision(action="BUY", probability=0.5)
 ```
 
@@ -1656,6 +1656,22 @@ class Evil(AuthoredStrategy):
         conn = net.create_connection(("1.1.1.1", 443), 1)
         return Decision(action="BUY", probability=0.5) if conn else None
 ```
+
+**Corpus recheck (review r2 #1).** Each hostile file must be impossible in the real container at `BAR`, and Plan 2's `EXPECTED_FAULT_MARKERS` names the error that proves the attempt failed (never a load error). Checked one by one:
+
+| File | Attempt | Why it fails in the sandbox | Expected error |
+|---|---|---|---|
+| `escape_read_config_keys` | read the RPC key file | `/home/trader/.config` is a root-owned 0700 tmpfs a non-root child cannot traverse (no keys mounted either) | `PermissionError` |
+| `escape_write_outside_tmpfs` | write under `/store` | `/store` is a read-only mount (**changed** from `/tmp`, which is a writable tmpfs) | `Read-only file system` |
+| `escape_fork_bomb` | `os.fork()` | `RLIMIT_NPROC` 1 refuses a new process | `BlockingIOError` / `Resource temporarily unavailable` |
+| `escape_allocate_past_limit` | `np.ones(2**33)` (64 GB) | `RLIMIT_AS` is baseline + 256 MiB | `MemoryError` / `Unable to allocate` |
+| `escape_loop_forever` | busy loop | the 2 s per-bar wall timeout kills the child | `bar timeout` |
+| `escape_pd_io_common_oskill` | `os.kill(getppid(), 9)` | the child has no `CAP_KILL` and the supervisor is uid 0 | `PermissionError` (EPERM) |
+| `escape_kill_other_child` | kill another slot child | each child has its own uid; cross-uid kill is EPERM | `PermissionError` (EPERM) |
+| `escape_sys_modules_lookup` | `posix.kill(getppid(), 9)` via `os.sys.modules` | same EPERM | `PermissionError` (EPERM) |
+| `escape_open_socket` | open a TCP connection | `network_mode: none` (no route) | `OSError` / `Network is unreachable` |
+
+Only `escape_write_outside_tmpfs` needed a change (its old `/tmp/escape.csv` would have succeeded on the writable tmpfs). The two static-only files (`escape_subclasses_walk` and the like) are refused by `check_source` and never loaded in the sandbox; they are not in `HOSTILE_ESCAPES`.
 
 - [ ] **Step 2: Write the failing test** (`tests/authored/test_escape_corpus.py`)
 

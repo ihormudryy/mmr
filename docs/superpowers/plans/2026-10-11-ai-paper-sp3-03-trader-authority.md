@@ -51,7 +51,7 @@ Each ruling is one line; the owner confirms them in the index under "Owner rulin
 15. **Plan 3 ruling 15 (decision D3; owner ruling 2026-10-11):** The in-container step refuses (`LIVE_SESSIONS_OPEN`, exit 3, nothing printed) while the sandbox reports an open live session before or after the run, so no hostile probe runs next to a live strategy's child (Plan 2 rulings 21, 29). `prove-isolation` runs `<compose> exec -T research mmr ai-author prove-isolation --in-container` (research socket and pool, never a live slot). The in-container step builds no SDK and needs no key: it runs Plan 2's `run_isolation_checks` (posture from `PONG` incl. caps, seccomp, no-new-privileges, network, env, read-only root and pids 64; a benign session; every hostile escape) and prints the proof JSON. The host step checks it with `RecordIsolationProofRequest` and records it as `cli`. No `docker inspect` (decision D2).
 16. **Plan 3 ruling 16 (review r1 #4):** The entry gate is in `DeploymentActivity.entry_refusal`, which both admission and final dispatch call: switch off → `AUTHORED_STRATEGIES_DISABLED`, record not `DEPLOYED` → `DEPLOYMENT_NOT_ACTIVE`; `CLOSE` and `PARTIAL_CLOSE` never reach it; `DeploymentActivity.active()` (what `get_active_ai_deployments` gives the strategy service) leaves out an authored deployment the gate would refuse, so a retired one is not reloaded even before its withdrawal lands (ruling 18). The last check is `send_gate_in_tx` on the saga's SUBMITTING transaction (added to `_ai_paper_send_gate_in_tx`): a retirement or switch-off that commits before the SUBMITTING row refuses the send; one that commits after it finds the entry already in flight, as an SP2c withdrawal does.
 17. **Plan 3 ruling 17:** A research report must name the record's current request id; a repeat of the same event and request id is `UNCHANGED`, so a retried `SANDBOX_UNAVAILABLE` counts one attempt; the third attempt is `FAILED SANDBOX_UNAVAILABLE`.
-18. **Plan 3 ruling 18 (decision D4):** `retire_authored_strategy {digest, code: SANDBOX_ERROR|SANDBOX_DIGEST_MISMATCH, detail}` moves `DEPLOYED → RETIRED` with reason `SANDBOX_ERROR` (spec 8 row "digest mismatch"; the code stays in the history), then withdraws the deployment version through the SP2c path (`AiDeploymentVersionStore.withdraw`, reason `AUTHORED_SANDBOX_ERROR`, principal `strategy`, command id `authored-retire:<version>`). A withdrawal refused `WITHDRAWAL_ENTRY_IN_FLIGHT` replies `REFUSED` with `retryable: true` and the record already `RETIRED`; a repeat re-checks the withdrawal and is `UNCHANGED`.
+18. **Plan 3 ruling 18 (decision D4; review r2 #3):** `retire_authored_strategy {digest, code: SANDBOX_ERROR|SANDBOX_DIGEST_MISMATCH, detail}` moves `DEPLOYED → RETIRED` with reason `SANDBOX_ERROR` (spec 8 row "digest mismatch"; the code stays in the history), then withdraws the deployment version through the SP2c path (`AiDeploymentVersionStore.withdraw`, reason `AUTHORED_SANDBOX_ERROR`, principal `strategy`, command id `authored-retire:<version>`). A withdrawal refused `WITHDRAWAL_ENTRY_IN_FLIGHT` replies `REFUSED` with `retryable: true` and the record already `RETIRED`; a repeat re-checks the withdrawal and is `UNCHANGED`. The SUBMITTING-transaction gate (`send_gate_in_tx`) resolves the authored record from the entering version's **base deployment** (`ai_deployment_versions.base_digest` → `ai_deployments.strategy_path`), so every version of the line — an initial version or a renewal on the same base — is refused once the record is `RETIRED`, not only the version stored in the record's `deployment_version` column.
 19. **Plan 3 ruling 19:** For spec 7.7, `judged_count` is the number of authored records with a recorded judgment (any verdict), returned by `report_authored_evaluation` and both list reads; Plan 4 adds the file's own trials.
 20. **Plan 3 ruling 20:** The trader mounts `mmr_authored_strategies` read-write at `/store`, as Plan 2 ruling 22 asks (`MMR_AUTHORED_STORE_DIR=/store` in compose; a host run defaults to `~/.local/share/mmr/authored_strategies`); the image's `/store` is owned by `trader`; files are 0644; whichever of Plans 2 and 3 merges second keeps one Dockerfile line and one top-level volume entry.
 21. **Plan 3 ruling 21:** Isolation records are insert-only and not sealed (no secret, a `cli`-only writer); `proof_id` is the digest of the body, so a resend is `EXISTING`; `passed` must equal "every check passed".
@@ -3531,9 +3531,11 @@ class IsolationProofs:
 Add to the imports:
 
 ```python
+import json
+
 from trader.automation.ai_deployments import AiDeployment, DeploymentRefused
 from trader.automation.authored_refusals import AUTHORED_ISOLATION_UNPROVEN
-from trader.research.strategy_key import authored_digest_of_path
+from trader.research.strategy_key import authored_digest_of_path, is_authored_path
 ```
 
 Add above `class AuthoredStrategyStore`:
@@ -3543,6 +3545,17 @@ def _running_image_in_tx(conn: Any) -> Optional[str]:
     row = conn.execute("SELECT sandbox_image_digest FROM authored_strategies WHERE sandbox_image_seen_at "
                        "IS NOT NULL ORDER BY sandbox_image_seen_at DESC, digest LIMIT 1").fetchone()
     return None if row is None else row[0]
+
+
+def _authored_digest_of_version_in_tx(conn: Any, version_digest: str) -> Optional[str]:
+    """The authored file digest behind a deployment version, via its base deployment's strategy_path, or None for
+    a catalogue or unknown version (review r2 #3). Works for an initial or a renewed version (both share the base)."""
+    row = conn.execute("SELECT d.record_json FROM ai_deployment_versions v JOIN ai_deployments d "
+                       "ON d.digest = v.base_digest WHERE v.digest = ?", [version_digest]).fetchone()
+    if row is None:
+        return None
+    path = json.loads(row[0]).get("strategy_path", "")
+    return authored_digest_of_path(path) if is_authored_path(path) else None
 
 
 def _may_register(record: AuthoredRecord, judgment_id: str, class_name: str, kind: str) -> bool:
@@ -3576,9 +3589,14 @@ Add these methods to `AuthoredStrategyStore`:
                                     "run mmr ai-author prove-isolation")
 
     def send_gate_in_tx(self, conn: Any, request: Any) -> Optional[str]:
-        """Review r1 #4: the last check of an authored ENTER, on the saga's SUBMITTING transaction. A retirement
-        or a switch-off commits either before this read (the send is refused) or after the SUBMITTING row
-        (the entry was already in flight, as with an SP2c withdrawal)."""
+        """Review r1 #4 and r2 #3: the last check of an authored ENTER, on the saga's SUBMITTING transaction. A
+        retirement or a switch-off commits either before this read (the send is refused) or after the SUBMITTING
+        row (the entry was already in flight, as with an SP2c withdrawal).
+
+        The authored record is resolved from the entering version's **base deployment**, not from the record's own
+        `deployment_version`: a renewal seals a new version on the same base, and the record keeps the initial
+        version in that column (the authored line is not renewed, Plan 4 ruling 21, but a renewal must still be
+        fenced). So every version of an authored line is gated by the record's current state."""
         from trader.automation.ai_paper_evidence import AI_PAPER_ACTION
 
         body = getattr(request, "body", None) or {}
@@ -3587,12 +3605,13 @@ Add these methods to `AuthoredStrategyStore`:
         version = body.get("deployment_version")
         if version is None:
             return None
-        row = conn.execute("SELECT state FROM authored_strategies WHERE deployment_version = ?", [version]).fetchone()
-        if row is None:
-            return None                                   # a catalogue version
+        digest = _authored_digest_of_version_in_tx(conn, version)
+        if digest is None:
+            return None                                   # a catalogue version (or unknown: handled elsewhere)
         if not self._config.enabled:
             return AUTHORED_STRATEGIES_DISABLED
-        return None if row[0] == DEPLOYED.value else "DEPLOYMENT_NOT_ACTIVE"
+        record = record_in_tx(conn, digest)
+        return None if record is not None and record.state == DEPLOYED else "DEPLOYMENT_NOT_ACTIVE"
 
     def registration_refusal(self, deployment: AiDeployment, judgment_id: str, *, kind: str) -> None:
         """Spec 7.3, 7.9 and 8 before an authored deployment registers; raises DeploymentRefused."""
@@ -3754,26 +3773,52 @@ and add:
 
 ```python
     def arm_authored(self, store_dir):
-        """SP3 Plan 3: a DEPLOYED authored record bound to this world's version, and its SUBMITTING gate."""
+        """SP3 Plan 3 (review r2 #3): a DEPLOYED authored record behind its own base deployment and an INITIAL
+        version, plus the SUBMITTING gate and a ``renew`` that seals a renewal version on the same base. Returns
+        ``ArmedAuthored(store, digest, base, initial_version, renew)``; ``renew()`` returns the new version."""
+        import hashlib
+        from types import SimpleNamespace
+
         from tests.automation.authored_fixtures import submit_request
+        from tests.automation.judged_deployment import deploy_facts
+        from trader.automation.ai_deployment_versions import INITIAL, RENEWAL, DeploymentVersion
+        from trader.automation.ai_deployments import AiDeployment
         from trader.automation.authored_config import AuthoredStrategiesConfig
         from trader.automation.authored_files import AuthoredFileStore
         from trader.automation.authored_schema import apply_authored_migrations
         from trader.automation.authored_strategies import (
             DEPLOYED, EVALUATING, SHADOW, AuthoredStrategyStore, move_in_tx, record_in_tx,
         )
+        from trader.research.strategy_key import authored_strategy_path
+
         apply_authored_migrations(SchemaMigrator(self.db))
         store = AuthoredStrategyStore(self.db, config=AuthoredStrategiesConfig(enabled=True),
                                       files=AuthoredFileStore(store_dir), now=self.clock)
         digest = store.submit(submit_request())["record"]["digest"]
+        record = {**GOOD, "strategy_path": authored_strategy_path(digest), "strategy_digest": digest,
+                  "class_name": "RangeBreak", "params": {"RANGE_BARS": 15}, "evidence_ref": "trial:authored"}
+        base, _ = self.deployments.register(AiDeployment.from_json(record), principal="ai_research",
+                                            command_id="dep-authored")
+
+        def seal(judgment_id, *, prior=None):
+            kind = INITIAL if prior is None else RENEWAL
+            self.judgments.seed(deploy_facts(record, judgment_id, kind=kind, renews=prior))
+            version = DeploymentVersion(base, judgment_id, kind, prior, dt.date(2026, 7, 17), dt.date(2026, 8, 14))
+            return self.db.transaction(lambda conn: self.versions.seal_in_tx(
+                conn, version, request_digest="sha256:" + hashlib.sha256(judgment_id.encode()).hexdigest(),
+                principal="ai_research", command_id=f"seed-{judgment_id}"))[0]
+
+        initial = seal("jdg-authored-1")
         steps = ((EVALUATING, {"evaluation_request_id": "sha256:" + "1" * 64}),
-                 (SHADOW, {"verdict": "DEPLOY", "judgment_id": "jdg-00000001", "evaluation_request_id": None}),
-                 (DEPLOYED, {"deployment_version": self.version_digest}))
+                 (SHADOW, {"verdict": "DEPLOY", "judgment_id": "jdg-authored-1", "evaluation_request_id": None}),
+                 (DEPLOYED, {"deployment_version": initial}))
         for target, changes in steps:
             self.db.transaction(lambda conn, target=target, changes=changes: move_in_tx(
                 conn, record_in_tx(conn, digest), target, event="TEST", reason=None, now=self.clock(), **changes))
         self._authored_gate = store.send_gate_in_tx
-        return store, digest
+        renew_ids = iter(f"jdg-authored-{n}" for n in range(2, 9))
+        return SimpleNamespace(store=store, digest=digest, base=base, version=initial,
+                               renew=lambda prior=initial: seal(next(renew_ids), prior=prior))
 ```
 
 Write `tests/automation/test_authored_send_gate.py`:
@@ -3800,44 +3845,62 @@ def retire(store, digest):
         {"digest": digest, "code": "SANDBOX_ERROR", "detail": "live fault"}))
 
 
+def enter(world, armed, version):
+    return world.submit(deployment_digest=armed.base, deployment_version=version, source_digest=armed.digest)
+
+
 def test_a_deployed_authored_version_still_enters(world, tmp_path):
-    world.arm_authored(tmp_path / "store")
-    assert world.submit().state == "SUBMITTED" and len(world.dispatch.plans) == 1
+    armed = world.arm_authored(tmp_path / "store")
+    assert enter(world, armed, armed.version).state == "SUBMITTED" and len(world.dispatch.plans) == 1
 
 
 def test_a_retirement_after_the_final_gate_and_before_the_send_stops_the_entry(world, tmp_path):
-    store, digest = world.arm_authored(tmp_path / "store")
+    armed = world.arm_authored(tmp_path / "store")
     real = world.guard.revalidate
 
     def gate_then_retire(*args, **kwargs):
         permit = real(*args, **kwargs)                  # the final gate passed: the record was DEPLOYED
-        assert retire(store, digest)["record"]["state"] == "RETIRED"
+        assert retire(armed.store, armed.digest)["record"]["state"] == "RETIRED"
         return permit
     world.guard.revalidate = gate_then_retire
-    receipt = world.submit()
+    receipt = enter(world, armed, armed.version)
     assert (receipt.state, receipt.error_code) == ("REJECTED", "DEPLOYMENT_NOT_ACTIVE")
     assert world.dispatch.plans == []                     # no broker send
 
 
+def test_a_retirement_before_the_send_stops_an_entry_on_a_renewed_version(world, tmp_path):   # review r2 #3
+    armed = world.arm_authored(tmp_path / "store")
+    renewed = armed.renew()                              # a new version on the same base; the record still holds V1
+    real = world.guard.revalidate
+
+    def gate_then_retire(*args, **kwargs):
+        permit = real(*args, **kwargs)
+        assert retire(armed.store, armed.digest)["record"]["state"] == "RETIRED"
+        return permit
+    world.guard.revalidate = gate_then_retire
+    receipt = enter(world, armed, renewed)
+    assert (receipt.state, receipt.error_code) == ("REJECTED", "DEPLOYMENT_NOT_ACTIVE")
+    assert world.dispatch.plans == []                     # the gate resolved the record from the renewed version
+
+
 def test_a_switch_off_after_the_final_gate_and_before_the_send_stops_the_entry(world, tmp_path):
-    store, _digest = world.arm_authored(tmp_path / "store")
+    armed = world.arm_authored(tmp_path / "store")
     real = world.guard.revalidate
 
     def gate_then_switch_off(*args, **kwargs):
         permit = real(*args, **kwargs)
-        store._config = replace(store.config, enabled=False)   # what a restart with the switch off reads
+        armed.store._config = replace(armed.store.config, enabled=False)   # a restart with the switch off
         return permit
     world.guard.revalidate = gate_then_switch_off
-    receipt = world.submit()
+    receipt = enter(world, armed, armed.version)
     assert (receipt.state, receipt.error_code) == ("REJECTED", "AUTHORED_STRATEGIES_DISABLED")
     assert world.dispatch.plans == []
 
 
 def test_a_catalogue_version_is_not_touched_by_the_authored_gate(world, tmp_path):
-    store, _digest = world.arm_authored(tmp_path / "other-store")
-    world.db.execute("UPDATE authored_strategies SET deployment_version = NULL")   # no authored row binds it
-    store._config = replace(store.config, enabled=False)
-    assert world.submit().state == "SUBMITTED"
+    armed = world.arm_authored(tmp_path / "store")
+    armed.store._config = replace(armed.store.config, enabled=False)
+    assert world.submit().state == "SUBMITTED"            # the world's own catalogue version still enters
 ```
 
 - [ ] **Step 9: Run the tests to verify they pass**
@@ -4260,14 +4323,15 @@ def test_the_command_stack_hands_the_saga_the_authored_check(world, tmp_path):
     from trader.automation.ai_paper_decision import AI_PAPER_ACTION
     from trader.trading.command_stack import _AiPaperParts, _ai_paper_send_gate_in_tx
 
-    store, digest = world.arm_authored(tmp_path / "store")
+    armed = world.arm_authored(tmp_path / "store")
     parts = _AiPaperParts(config=None, policy=world.policy, entry_filter=world.entry_filter,
                           deployments=world.deployments, scope_checks=None, filter_refusal=None,
-                          versions=world.versions, activity=world.activity, authored=store)
+                          versions=world.versions, activity=world.activity, authored=armed.store)
     gate = _ai_paper_send_gate_in_tx(parts)
-    request = SimpleNamespace(action=AI_PAPER_ACTION, body=world.body())
-    assert world.db.transaction(lambda conn: gate(conn, request)) is None
-    retire(store, digest)
+    request = SimpleNamespace(action=AI_PAPER_ACTION, body=world.body(
+        deployment_digest=armed.base, deployment_version=armed.renew(), source_digest=armed.digest))
+    assert world.db.transaction(lambda conn: gate(conn, request)) is None      # entry on a renewed version
+    retire(armed.store, armed.digest)
     assert world.db.transaction(lambda conn: gate(conn, request)) == "DEPLOYMENT_NOT_ACTIVE"
 ```
 

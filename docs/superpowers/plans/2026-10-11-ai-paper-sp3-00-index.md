@@ -92,7 +92,7 @@ method owns its names and wire shape; the others use them exactly as written her
     `trader/research/authored_outcome.py` (the end and its report bodies).
   - `trader/authored/streaming.py` (`BarStream(session, conid)`, `decision_signal`).
   - `trader/strategy/authored_runtime.py` (live proxy `AuthoredLiveStrategy(..., proof_gate)`, loader
-    `AuthoredDeployments` with `refresh_proof` and `is_proven`).
+    `AuthoredDeployments` with `is_proven`, which reads the trader proof fresh on every call).
   - `EvaluationPaths.sandbox_socket` (default `RESEARCH_SOCKET`).
   - `ResearchServiceConfig.authored_evaluation_sessions` (default 302) and `authored_walk_forward(config)` in
     `trader/research/service_config.py`.
@@ -175,7 +175,7 @@ Security:
 - Plan 2 ruling 27 / D2 / C3 (review r1 #3): no `docker inspect`; the proof checks posture incl. read-only root and pids 64; nine hostile files incl. open-socket; a hostile check passes only if the escape OPENED, faulted at BAR with its expected marker, and a neighbouring benign session and PING survive.
 - Plan 2 ruling 28 (review r1 #2): a slot is wiped by a helper running as the slot uid, so the serving supervisor keeps only SETUID, SETGID and KILL; a failed wipe quarantines the slot.
 - Plan 2 ruling 29 / owner ruling 2026-10-11: `OPENED` reports the session's build; `PONG` reports `live_open`; `prove-isolation` refuses (`LIVE_SESSIONS_OPEN`) while any live session is open.
-- Plan 2 ruling 30 (review r1 #8): the full-stack runner shares nothing with a live stack: project `mmr-sbxtest` and its own volumes, no published host port, a throwaway `HOME` with copied config and test-only keys, no `.env`; it renders the config and refuses before `up` if any of that fails.
+- Plan 2 ruling 30 (review r1 #8, r2 #2): the full-stack runner starts only `sandbox` and `fullstack-tests` (never ib-gateway), under `env -i` (no operator broker/provider variables), with a test-only image tag (never `mmr:latest`), project `mmr-sbxtest` and its own volumes, no published host port, a throwaway `HOME` with copied config and test-only keys, no `.env`. The render guard inspects every service's environment and image and refuses before `up` on any ib-gateway service, credential variable with a value, production image tag, published port, live-config bind or `.env`.
 - Plan 1 rulings 5-8: the checker refuses `from numpy import x`, extends the deny-list, refuses a bare module alias, and checks every string literal.
 - Plan 3 ruling 2: an authored case must hash to the key's digest (`CASE_MALFORMED` otherwise).
 - Plan 3 ruling 12 / C1 (review r1 #5): registration needs a passing proof for both the build that evaluated the record and the build research reported last, rechecked inside the seal transaction; it does not prove the build running now. The binding gate is the strategy service's: no live session on a build without a passing proof (Plan 4 ruling 19).
@@ -186,14 +186,14 @@ Security:
 Money and risk:
 
 - Plan 3 ruling 4 / C2: `max_active` is 1-3; `enabled: true` needs `ai_paper.enabled: true`.
-- Plan 3 ruling 16 (review r1 #4): switch off or retirement refuses authored entries at admission, at dispatch and on the saga's SUBMITTING transaction (`send_gate_in_tx`); closes always pass.
+- Plan 3 ruling 16 / 18 (review r1 #4, r2 #3): switch off or retirement refuses authored entries at admission, at dispatch and on the saga's SUBMITTING transaction (`send_gate_in_tx`), which resolves the record from the entering version's base deployment so a renewed version is fenced too; closes always pass.
 - Plan 3 ruling 18 / D4: a live fault retires the record and withdraws the deployment version; open positions keep their stops.
 - Plan 4 ruling 15: an authored signal carries `risk = 0.0`; Jev and the risk gate size the trade.
 - Plan 4 ruling 21: an authored line is never renewed; it ends `EXPIRED`.
 - Plan 4 ruling 12: Jev's `strategy_trials` for an authored key = authored files judged so far + this file's trials.
 - Plan 5 ruling 8: a registration refused `AUTHORED_ISOLATION_UNPROVEN` waits for the next research evening.
 - Plan 5 ruling 14 (owner confirmed 2026-10-11): author spend has its own `ai_costs` role `author` (trader migration 132 rebuilds the table, rows and seals copied unchanged).
-- Plan 4 ruling 19 (review r1 #6): the live proof is refreshed at every reconcile and checked before every new session and on every bar; an unproven build gives no signal and an alarm, never a retirement.
+- Plan 4 ruling 19 (review r1 #6, r2 #4): the proof is never cached; `is_proven` reads the authoritative trader proof for the build on every call, before every new session and on every bar, fail-closed. A proof withdrawn for a running build stops the next OPEN and bar with zero stale bars.
 - Plan 4 ruling 10 (review r1 #7): an authored end the trader refuses for good parks the request (claim open, `AUTHORED_REPORT_REFUSED`, resent hourly and at restart); refusal is never delivery.
 
 Deploy and runbook:

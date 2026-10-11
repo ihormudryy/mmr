@@ -49,7 +49,7 @@ Task 13 checks these lines against the index.
 16. **Plan 4 ruling 16:** A bar with a missing or non-finite field, or a time not after the last sent bar, is not sent and decides nothing. `BarStream` is the only guard against Plan 2's `SandboxProtocolError`, so every send goes through it.
 17. **Plan 4 ruling 17:** An alarm is an ERROR log line that starts with a stable code: `AUTHORED_SANDBOX_UNAVAILABLE` (once per outage per instance, an INFO line on recovery), `AUTHORED_SANDBOX_FAULT`, `AUTHORED_ISOLATION_UNPROVEN`, `AUTHORED_DIGEST_MISMATCH`. The strategy service has no other alarm channel.
 18. **Plan 4 ruling 18:** A fault disables the instance at once and sends nothing on the tick thread; the reconcile thread sends `retire_authored_strategy` until `UPDATED`/`UNCHANGED` (a `REFUSED` with `retryable: true`, such as `WITHDRAWAL_ENTRY_IN_FLIGHT`, is sent again; a non-retryable refusal stops the resend, logged). This process never reloads a retired digest. Plan 3 moves the record to `RETIRED` and withdraws the deployment version (Plan 3 ruling 18, decision D4), so `get_active_ai_deployments` stops listing it at once and a restart does not load it again.
-19. **Plan 4 ruling 19 (review r1 #6):** At load and at every reconcile the strategy service pings the live socket and reads `get_isolation_proof` for that build; the result is the one proven build (none on any failure). A live proxy pings before every new session (first OPEN, reconnect, day rollover) and opens nothing on an unproven build, and on every bar it checks the build its session's `OPENED` reported (Plan 2 ruling 29): an unproven or withdrawn build ends the session with an `AUTHORED_ISOLATION_UNPROVEN` alarm and no signal; the strategy stays deployed and nothing is retired. No passing proof at load, an unreachable sandbox or an unreachable trader means not loaded, retried next reconcile.
+19. **Plan 4 ruling 19 (review r1 #6, r2 #4):** The proof is never cached. `AuthoredDeployments.is_proven(build)` reads the authoritative `get_isolation_proof` for that build from the trader on **every** call and is fail-closed (False on a refusal, a transport error or a non-passing/other-build proof). The live proxy holds `is_proven` as its gate: it pings the live socket before every new session (first OPEN, reconnect, day rollover) and, if unproven, opens nothing; and on every bar it calls the gate for the build its session's `OPENED` reported (Plan 2 ruling 29). So a proof withdrawn for a build already running stops the next OPEN and the next bar with zero stale bars — no reconcile needed. An unproven or withdrawn build ends the session with an `AUTHORED_ISOLATION_UNPROVEN` alarm and no signal; the strategy stays deployed and nothing is retired. At load, no passing proof, an unreachable sandbox or an unreachable trader means not loaded, retried next reconcile.
 20. **Plan 4 ruling 20:** At load the path's digest must equal the deployment's `strategy_digest` (else refused, alarm, retired `SANDBOX_DIGEST_MISMATCH`); on every dispatch `source_unchanged` asks the instance (not faulted, still the bound digest); the sandbox re-hashes the stored file at every OPEN.
 21. **Plan 4 ruling 21:** An authored line is not renewed: SP2c renewal refuses a key off the allowlist (an authored key never is on it) and the file's one holdout is spent; the line ends `EXPIRED`.
 22. **Plan 4 ruling 22 (resolved by decision D1, spec section 14):** Spec 7.5 sized the live pool at 9 as "3 deploys × up to 3 conids", but `max_cohort_points` counts parameter points and a deployment binds 8–20 conids. The spec is amended: one live session per deployment holds all its conids (Plan 2 ruling 26), the live pool is 3 and the trader caps `max_active` at 3 (controller decision C2). `SANDBOX_BUSY` live stays an availability error.
@@ -2705,7 +2705,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: Plan 3's widened `ActiveAiDeployment` (checked in Task 1); Task 9 `AuthoredLiveStrategy`; Plan 3 `is_authored_path`, `authored_digest_of_path`, `authored_strategy_path`, `get_isolation_proof` (`{image_digest}` → `{found, proof: {image_digest, passed, ...}}`), `retire_authored_strategy` (`{digest, code, detail}` → `{status: UPDATED|UNCHANGED|REFUSED, code, detail, retryable, record}`); Plan 2 `SandboxClient(LIVE_SOCKET)`, `ping().image_digest`.
-- Produces: `AuthoredDeployments(*, client, trader_query, trader_command)` with `build(name, deployment, *, storage, universe_accessor) -> Optional[AuthoredLiveStrategy]`, `refresh_proof() -> bool`, `is_proven(build) -> bool` (the live proxies' `proof_gate`), `request_retirement(digest, code)`, `send_retirements()`; `proof_passes(reply, image_digest) -> bool`; `source_unchanged(instance)` asks an authored instance; `StrategyRuntime._authored_deployments`.
+- Produces: `AuthoredDeployments(*, client, trader_query, trader_command)` with `build(name, deployment, *, storage, universe_accessor) -> Optional[AuthoredLiveStrategy]`, `is_proven(build) -> bool` (the live proxies' `proof_gate`; reads the trader fresh every call, no cache — review r2 #4), `request_retirement(digest, code)`, `send_retirements()`; `proof_passes(reply, image_digest) -> bool`; `source_unchanged(instance)` asks an authored instance; `StrategyRuntime._authored_deployments`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2854,24 +2854,32 @@ def test_a_sandbox_rebuilt_after_the_load_gives_no_signal_until_its_build_is_pro
     instance = instance_of(world)
     instance._dispatch_conid = CONID
     world.sandbox.image_digest = "e4f5a6b-20261012T090000Z"              # build B replaced the proven build
+    world.query.answer("get_isolation_proof", {"found": False, "proof": None})   # B has no proof yet
     frame = bars(3)
     assert instance.on_prices(frame) is None and world.sandbox.sessions == []
     assert world.rt.signal_record.read(0, 10).signals == []
     world.query.answer("get_isolation_proof", proof(image="e4f5a6b-20261012T090000Z"))
-    world.rt._authored_deployments.refresh_proof()                       # what every reconcile does
-    signal = instance.on_prices(frame)
+    signal = instance.on_prices(frame)                                   # read fresh: no reconcile needed
     world.rt._dispatch_once(instance, signal, CONID, frame)
     assert len(world.rt.signal_record.read(0, 10).signals) == 1
 
 
-def test_a_later_failing_proof_stops_the_running_instance(world):
+def test_a_failed_proof_for_the_same_build_before_first_open_gives_no_signal(world):      # review r2 #4
+    reconcile(world, [authored_active(world.sandbox)])                   # build A proven, no session opened yet
+    instance = instance_of(world)
+    instance._dispatch_conid = CONID
+    world.query.answer("get_isolation_proof", proof(passed=False))       # A's proof withdrawn; no reconcile
+    assert instance.on_prices(bars(3)) is None                          # the gate re-reads, so no first OPEN
+    assert world.sandbox.sessions == [] and world.rt.signal_record.read(0, 10).signals == []
+
+
+def test_a_later_failing_proof_stops_the_running_instance_at_the_next_bar(world):         # review r2 #4
     reconcile(world, [authored_active(world.sandbox)])
     instance = instance_of(world)
     instance._dispatch_conid = CONID
-    assert instance.on_prices(bars(3)) is not None
-    world.query.answer("get_isolation_proof", proof(passed=False))
-    world.rt._authored_deployments.refresh_proof()
-    assert instance.on_prices(bars(4)) is None and world.sandbox.open_sessions == []
+    assert instance.on_prices(bars(3)) is not None                      # opened on the proven build
+    world.query.answer("get_isolation_proof", proof(passed=False))       # the same build's proof is withdrawn
+    assert instance.on_prices(bars(4)) is None and world.sandbox.open_sessions == []   # next bar re-reads, stops
 
 
 def test_a_trader_that_refuses_the_proof_read_loads_nothing(world, caplog):
@@ -2925,13 +2933,20 @@ def test_a_final_refusal_stops_the_resend(world, caplog):
     assert len(retirements(world)) == 1 and "AUTHORED_STATE_CONFLICT" in caplog.text
 
 
-def test_reconcile_refreshes_the_proof_and_sends_pending_retirements(world):
+def test_reconcile_sends_pending_retirements(world):
     world.rt._config_mtime = None
     world.rt._authored_deployments.request_retirement("sha256:" + "a" * 64, "SANDBOX_ERROR")
     world.rt._reconcile_sync()
     assert len(retirements(world)) == 1
-    assert ("get_isolation_proof", {"image_digest": IMAGE_DIGEST}) in world.query.calls
-    assert world.rt._authored_deployments.is_proven(IMAGE_DIGEST)
+
+
+def test_is_proven_reads_the_trader_every_call_and_never_caches(world):                   # review r2 #4
+    deployments = world.rt._authored_deployments
+    world.query.answer("get_isolation_proof", proof(), proof(passed=False))   # pass once, then fail (repeats)
+    assert deployments.is_proven(IMAGE_DIGEST) is True
+    assert deployments.is_proven(IMAGE_DIGEST) is False                  # a second call re-reads, not cached
+    reads = [body for method, body in world.query.calls if method == "get_isolation_proof"]
+    assert reads[-2:] == [{"image_digest": IMAGE_DIGEST}, {"image_digest": IMAGE_DIGEST}]
 
 
 def test_unloading_closes_its_sessions(world):
@@ -3002,7 +3017,7 @@ class AuthoredDeployments:
         self._lock = threading.Lock()
         self._retiring: dict[str, str] = {}           # digest -> fault code, until the trader answers
         self._retired: set[str] = set()
-        self._proven_build: Optional[str] = None      # the live build with a passing proof, at the last refresh
+        self._unproven_build: Optional[str] = None    # the build the last is_proven call found unproven (alarm once)
 
     def build(self, name: str, deployment: Any, *, storage: Any,
               universe_accessor: Any) -> Optional[AuthoredLiveStrategy]:
@@ -3016,7 +3031,13 @@ class AuthoredDeployments:
                           deployment.version_digest, deployment.strategy_digest, deployment.strategy_path)
             self.request_retirement(digest, "SANDBOX_DIGEST_MISMATCH")
             return None
-        if not self.refresh_proof():
+        try:
+            build = self._client.ping().image_digest
+        except SandboxUnavailable as exc:
+            logging.error("%s: the live sandbox does not answer (%s); authored deployment %s waits",
+                          SANDBOX_UNAVAILABLE_ALARM, exc, name)
+            return None
+        if not self.is_proven(build):                 # a fresh trader read; no cache (review r2 #4)
             return None
         instance = AuthoredLiveStrategy(client=self._client, digest=digest, class_name=deployment.class_name,
                                         params=deployment.params, bar_size=deployment.bar_size,
@@ -3078,42 +3099,32 @@ class AuthoredDeployments:
         return True
 
     def is_proven(self, build: Optional[str]) -> bool:
-        """The live proxies' proof gate (review r1 #6): only the build the last refresh proved."""
-        with self._lock:
-            return build is not None and build == self._proven_build
-
-    def refresh_proof(self) -> bool:
-        """At every load and every reconcile: the build the live sandbox reports now, and whether its newest
-        proof passed. Any failure leaves no proven build, so live sessions stop (fail closed)."""
-        proven = self._isolation_proven()
-        with self._lock:
-            self._proven_build = proven
-        return proven is not None
-
-    def _isolation_proven(self) -> Optional[str]:
-        """Spec 7.9 and Plan 4 ruling 19: the live build id when it has a passing proof (D2), else None."""
+        """Review r2 #4: the authoritative latest proof for ``build``, read from the trader on every call (no
+        cache), so a proof withdrawn for a build already running stops the next OPEN and the next bar. A read
+        failure or a refusal is fail-closed (False). The gate the live proxy holds is this method; it is called
+        before every new session and on every bar for the build the session's OPENED reports."""
+        if build is None:
+            return False
         try:
-            image_digest = self._client.ping().image_digest
-        except SandboxUnavailable as exc:
-            logging.error("%s: the live sandbox does not answer (%s); authored deployments wait",
-                          SANDBOX_UNAVAILABLE_ALARM, exc)
-            return None
-        try:
-            reply = self._query.call("get_isolation_proof", {"image_digest": image_digest}, dict,
+            reply = self._query.call("get_isolation_proof", {"image_digest": build}, dict,
                                      timeout=TRADER_TIMEOUT_SECONDS)
         except TypedRpcRemoteError as remote:
-            logging.error("%s: get_isolation_proof refused (%s: %s); authored deployments are not loaded",
+            logging.error("%s: get_isolation_proof refused (%s: %s); authored deployments give no signal",
                           ISOLATION_ALARM, remote.code, remote.message)
-            return None
+            return False
         except TRANSPORT_ERRORS as exc:
-            logging.warning("isolation proof not readable (%s); authored deployments wait for the next reconcile",
+            logging.warning("isolation proof not readable (%s); authored deployments give no signal this bar",
                             type(exc).__name__)
-            return None
-        if not proof_passes(reply, image_digest):
-            logging.error("%s: no passing isolation proof for sandbox build %s; run `mmr ai-author "
-                          "prove-isolation`", ISOLATION_ALARM, image_digest)
-            return None
-        return image_digest
+            return False
+        passed = proof_passes(reply, build)
+        if not passed:
+            if self._unproven_build != build:
+                self._unproven_build = build
+                logging.error("%s: no passing isolation proof for sandbox build %s; run `mmr ai-author "
+                              "prove-isolation`", ISOLATION_ALARM, build)
+        else:
+            self._unproven_build = None
+        return passed
 ```
 
 - [ ] **Step 4: Ask the instance in `source_unchanged`**
@@ -3203,16 +3214,15 @@ In `_reconcile_sync`, right after the `source.reconcile()` block:
         authored = getattr(self, '_authored_deployments', None)
         if authored is not None:
             try:
-                authored.refresh_proof()          # Plan 4 ruling 19: the live proxies read it on every bar
-                authored.send_retirements()
+                authored.send_retirements()      # the proof is read fresh at each OPEN and bar, not cached
             except Exception as ex:
-                logging.warning('authored proof refresh or retirements failed (will retry next cycle): %s', ex)
+                logging.warning('authored retirements not sent (will retry next cycle): %s', ex)
 ```
 
 - [ ] **Step 6: Run the tests and the SP2c strategy tests**
 
 Run: `.venv/bin/python -m pytest tests/strategy/test_authored_deployments.py tests/strategy/test_authored_live.py tests/test_strategy_ai_deployments.py tests/test_strategy_artifact_soft_load.py tests/test_strategy_runtime.py -q`
-Expected: PASS. If `test_reconcile_refreshes_the_proof_and_sends_pending_retirements` fails on a runtime attribute the test runtime lacks, set it in that test the way `tests/test_strategy_runtime.py` builds its runtime; do not change `_reconcile_sync` for the test.
+Expected: PASS. If `test_reconcile_sends_pending_retirements` fails on a runtime attribute the test runtime lacks, set it in that test the way `tests/test_strategy_runtime.py` builds its runtime; do not change `_reconcile_sync` for the test.
 
 - [ ] **Step 7: Commit**
 

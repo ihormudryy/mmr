@@ -3530,7 +3530,7 @@ Built and merged with the switch off and the author model empty. Turn it on in t
    live sandbox session is open (owner ruling 2026-10-11: a hostile probe must never run next to a live strategy's
    child). On first turn-on there is none. Later (after a rebuild): set `ai_paper.authored_strategies.enabled: false`,
    `docker compose restart trader`, wait one strategy reconcile (30 s) so the strategy service closes its authored
-   sessions, run the command, then turn the switch back on. The command refuses with `LIVE_SESSIONS_OPEN` (exit 1,
+   sessions, run the command, then turn the switch back on. The command refuses with `LIVE_SESSIONS_OPEN` (exit 3,
    nothing recorded) while the sandbox reports an open live session.
    - check: it prints a pass and the sandbox build id. Until a pass exists for that build the trader refuses
      every authored registration (`AUTHORED_ISOLATION_UNPROVEN`) and the strategy service opens no live session

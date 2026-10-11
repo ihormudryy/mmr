@@ -2932,7 +2932,7 @@ HOSTILE_ESCAPES: tuple[str, ...] = (
 # Review r1 #3: what the real child reports when each escape is stopped at BAR. A fault without its marker
 # (a load error, an unrelated exception) is not containment: the hostile operation may never have run.
 EXPECTED_FAULT_MARKERS: dict[str, tuple[str, ...]] = {
-    "escape_read_config_keys": ("FileNotFoundError", "PermissionError"),
+    "escape_read_config_keys": ("PermissionError", "FileNotFoundError"),
     "escape_write_outside_tmpfs": ("PermissionError", "Read-only file system"),
     "escape_fork_bomb": ("BlockingIOError", "Resource temporarily unavailable"),
     "escape_allocate_past_limit": ("MemoryError", "Unable to allocate"),
@@ -3991,12 +3991,22 @@ The sandbox full-stack run must share nothing with a live stack on the same host
 Write `docker-compose.sbxtest.override.yml` (applied only by the runner, after `docker-compose.test.override.yml`):
 
 ```yaml
-# SP3 Plan 2 ruling 30: the sandbox full-stack test shares nothing with a live stack on the same host.
-# Applied ONLY by scripts/run_sandbox_fullstack.sh (never auto-loaded). No service publishes a host port, and
-# ib-gateway gets no .env (no IB credentials: a second login would end the live gateway's session).
-# scripts/check_sbxtest_config.py refuses the run if the rendered config still publishes a port, binds a path
-# under the operator's ~/.config/mmr or ~/.local/share/mmr, or reads .env.
+# SP3 Plan 2 ruling 30 (review r2 #2): the sandbox full-stack test shares nothing with a live stack on the same
+# host. Applied ONLY by scripts/run_sandbox_fullstack.sh (never auto-loaded). The runner renders and starts only
+# `sandbox` and `fullstack-tests`, so ib-gateway (and trader, strategy, data, dashboard, scheduler) never start.
+# Both rendered services use a test-only image tag; fullstack-tests runs the sandbox test and depends only on
+# `sandbox`; no host port is published; ib-gateway gets no .env. scripts/check_sbxtest_config.py refuses the run
+# if the rendered config names ib-gateway, publishes a port, carries a credential variable with a value, binds a
+# path under the operator's ~/.config/mmr or ~/.local/share/mmr, reads .env, or still carries the mmr:latest tag.
 services:
+  sandbox:
+    image: ${MMR_SBXTEST_IMAGE}            # a test-only tag; never mmr:latest
+  fullstack-tests:
+    image: ${MMR_SBXTEST_IMAGE}-test       # a distinct test-stage tag, so `up --build` never overwrites sandbox's
+    depends_on: !reset [sandbox]           # no trader/ib-gateway; the sandbox test needs neither
+    command: ["python", "-m", "pytest", "tests/fullstack/test_sandbox_service.py", "-q"]
+  # Defensive: even though the runner never starts these, strip their published ports and the gateway's .env so a
+  # future `up` of the whole profile by mistake still cannot bind a live port or log in to IB.
   ib-gateway:
     ports: !reset []
     env_file: !reset []
@@ -4005,6 +4015,8 @@ services:
   dashboard:
     ports: !reset []
 ```
+
+Plan 3 Task 10's `tests/fullstack/test_prove_isolation_in_research.py` adds `research` to the runner's service list and, in this override, `research: {depends_on: !reset [sandbox], env_file: !reset [], ports: !reset []}`, so that test pulls no trader or ib-gateway either.
 
 Write `scripts/check_sbxtest_config.py`:
 
@@ -4022,6 +4034,11 @@ from typing import Any, Iterable
 
 LIVE_PORTS = frozenset({7496, 7497, 5901, 7424, 8081, *range(42001, 42010), *range(42101, 42110)})
 PROJECT_PREFIX = "mmr-sbxtest"
+PRODUCTION_IMAGE = "mmr:latest"
+# Any of these on a rendered service's environment, with a non-empty value, means live broker/provider access.
+CREDENTIAL_PREFIXES = ("TWS_", "IB_", "TWS", "ALPACA_", "MASSIVE_", "TWELVEDATA_", "OPENROUTER_", "AWS_", "AZURE_")
+CREDENTIAL_NAMES = frozenset({"TRADING_MODE"})
+FORBIDDEN_SERVICES = frozenset({"ib-gateway"})
 
 
 def _sources(service: dict) -> Iterable[str]:
@@ -4030,13 +4047,40 @@ def _sources(service: dict) -> Iterable[str]:
             yield str(volume.get("source", ""))
 
 
+def _environment(service: dict) -> dict:
+    env = service.get("environment") or {}
+    if isinstance(env, list):                           # compose may render it as ["K=v", ...]
+        env = dict(item.split("=", 1) if "=" in item else (item, "") for item in env)
+    return env
+
+
+def _is_credential(name: str) -> bool:
+    return name in CREDENTIAL_NAMES or name.startswith(CREDENTIAL_PREFIXES)
+
+
 def problems(config: dict[str, Any], *, operator_home: str, repo_root: str) -> list[str]:
     found = []
     if not str(config.get("name", "")).startswith(PROJECT_PREFIX):
         found.append(f"project {config.get('name')!r} is not {PROJECT_PREFIX}*")
     forbidden = [Path(operator_home, ".config", "mmr"), Path(operator_home, ".local", "share", "mmr")]
     live_env = Path(repo_root, ".env")
+    built_images: dict[str, str] = {}             # image tag -> the first built service that claims it
     for name, service in sorted((config.get("services") or {}).items()):
+        if service.get("build"):
+            image = str(service.get("image", ""))
+            if image in built_images:              # two built services, one tag: `up --build` overwrites one
+                found.append(f"{name} and {built_images[image]} both build image {image!r}; use distinct tags")
+            built_images[image] = name
+        if name in FORBIDDEN_SERVICES:
+            found.append(f"{name} is in the rendered config; the sandbox test needs no broker gateway")
+        image = str(service.get("image", ""))
+        if image == PRODUCTION_IMAGE:
+            found.append(f"{name} uses the production image {image!r}; use a {PROJECT_PREFIX}:<run id> tag")
+        if service.get("build") and not image.startswith(f"{PROJECT_PREFIX}:"):
+            found.append(f"{name} builds image {image!r}, not a {PROJECT_PREFIX}:<run id> tag")
+        for key, value in _environment(service).items():
+            if _is_credential(str(key)) and str(value).strip():
+                found.append(f"{name} carries credential/mode variable {key} with a value")
         for port in service.get("ports", []) or []:
             published = port.get("published") if isinstance(port, dict) else port
             note = " (a live port)" if str(published).isdigit() and int(published) in LIVE_PORTS else ""
@@ -4082,14 +4126,17 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "run_sandbox_fullstack.sh"
 sys.path.insert(0, str(ROOT / "scripts"))
-from check_sbxtest_config import LIVE_PORTS, problems  # noqa: E402
+from check_sbxtest_config import LIVE_PORTS, PRODUCTION_IMAGE, problems  # noqa: E402
 
 HOME = "/Users/operator"
+IMAGE = "mmr-sbxtest:abc123-test"
 SAFE = {"name": "mmr-sbxtest",
-        "services": {"sandbox": {"volumes": [{"type": "volume", "source": "mmr_sandbox_live"}]},
-                     "trader": {"volumes": [{"type": "bind", "source": "/tmp/sbx-home/.config/mmr"}]},
-                     "fullstack-tests": {"volumes": [{"type": "bind", "source": "/var/run/docker.sock"}]}},
-        "volumes": {"mmr_db_data": {"name": "mmr-sbxtest_mmr_db_data"}}}
+        "services": {"sandbox": {"image": IMAGE, "build": {"context": "."},
+                                 "volumes": [{"type": "volume", "source": "mmr_sandbox_live"}]},
+                     "fullstack-tests": {"image": IMAGE + "-test", "build": {"context": "."},
+                                         "environment": {"MMR_FAKE_BROKER": "1", "TZ": "UTC"},
+                                         "volumes": [{"type": "bind", "source": "/var/run/docker.sock"}]}},
+        "volumes": {"mmr_sandbox_live": {"name": "mmr-sbxtest_mmr_sandbox_live"}}}
 
 
 def test_a_safe_config_passes():
@@ -4098,13 +4145,22 @@ def test_a_safe_config_passes():
 
 @pytest.mark.parametrize("change, fragment", [
     (lambda c: c.update(name="mmr"), "project 'mmr'"),
-    (lambda c: c["services"]["trader"].update(ports=[{"published": "42101", "target": 42101}]), "a live port"),
-    (lambda c: c["services"]["trader"].update(ports=[{"published": "55555", "target": 1}]), "publishes host port"),
-    (lambda c: c["services"]["trader"]["volumes"].append({"type": "bind", "source": f"{HOME}/.config/mmr"}),
+    (lambda c: c["services"].update({"ib-gateway": {"image": "ghcr.io/x:latest"}}), "needs no broker gateway"),
+    (lambda c: c["services"]["sandbox"].update(image=PRODUCTION_IMAGE), "production image"),
+    (lambda c: c["services"]["sandbox"].update(image="mmr:some-other"), "not a mmr-sbxtest"),
+    (lambda c: c["services"]["fullstack-tests"].update(image=IMAGE), "both build image"),  # == sandbox's tag
+    (lambda c: c["services"]["sandbox"].update(environment={"TWS_USERID": "live-user"}), "credential/mode"),
+    (lambda c: c["services"]["sandbox"].update(environment={"TRADING_MODE": "live"}), "credential/mode"),
+    (lambda c: c["services"]["sandbox"].update(environment={"IB_ACCOUNT": "U123"}), "credential/mode"),
+    (lambda c: c["services"]["sandbox"].update(environment={"ALPACA_API_KEY_ID": "k"}), "credential/mode"),
+    (lambda c: c["services"]["sandbox"].update(environment={"OPENROUTER_API_KEY": "k"}), "credential/mode"),
+    (lambda c: c["services"]["sandbox"].update(ports=[{"published": "42101", "target": 42101}]), "a live port"),
+    (lambda c: c["services"]["sandbox"].update(ports=[{"published": "55555", "target": 1}]), "publishes host port"),
+    (lambda c: c["services"]["sandbox"]["volumes"].append({"type": "bind", "source": f"{HOME}/.config/mmr"}),
      "live config"),
-    (lambda c: c["services"]["trader"]["volumes"].append(
+    (lambda c: c["services"]["sandbox"]["volumes"].append(
         {"type": "bind", "source": f"{HOME}/.config/mmr/keys/rpc/trader.key"}), "live config"),
-    (lambda c: c["services"]["trader"]["volumes"].append(
+    (lambda c: c["services"]["sandbox"]["volumes"].append(
         {"type": "bind", "source": f"{HOME}/.local/share/mmr/logs"}), "live config"),
     (lambda c: c["services"]["sandbox"].update(env_file=[{"path": "/repo/.env"}]), "live credentials"),
     (lambda c: c["volumes"].update(mmr_ai_data={"name": "mmr_mmr_ai_data"}), "outside the test project"),
@@ -4115,6 +4171,18 @@ def test_each_way_to_touch_a_live_stack_is_refused(change, fragment):
     assert any(fragment in line for line in problems(config, operator_home=HOME, repo_root="/repo"))
 
 
+def test_an_empty_credential_value_is_allowed():
+    config = json.loads(json.dumps(SAFE))
+    config["services"]["sandbox"]["environment"] = {"TWS_USERID": "", "TRADING_MODE": ""}
+    assert problems(config, operator_home=HOME, repo_root="/repo") == []
+
+
+def test_a_list_style_environment_is_inspected_too():
+    config = json.loads(json.dumps(SAFE))
+    config["services"]["sandbox"]["environment"] = ["TWS_PASSWORD=secret"]
+    assert any("credential/mode" in line for line in problems(config, operator_home=HOME, repo_root="/repo"))
+
+
 def test_the_live_port_list_covers_the_gateway_rpc_and_dashboard_ports():
     assert {7496, 7497, 5901, 7424, 8081, 42001, 42005, 42101, 42102, 42104, 42105} <= LIVE_PORTS
 
@@ -4123,31 +4191,45 @@ def run_with_fake_docker(tmp_path, **env):
     bin_dir, log = tmp_path / "bin", tmp_path / "docker.log"
     bin_dir.mkdir()
     rendered = json.dumps(SAFE)
+    # `docker` logs its whole environment and argv, so a test can prove env -i stripped the operator's variables.
     (bin_dir / "docker").write_text(
-        f'#!/bin/bash\necho "HOME=$HOME $*" >> {log}\n'
+        f'#!/bin/bash\n{{ echo "ENV:"; env; echo "ARGV: $*"; }} >> {log}\n'
         f'if [[ " $* " == *" config "* ]]; then echo \'{rendered}\'; fi\n')
     (bin_dir / "docker").chmod(0o755)
-    (bin_dir / "uv").write_text(f'#!/bin/bash\necho "uv HOME=$HOME $*" >> {log}\n')       # mmr keys init
+    (bin_dir / "uv").write_text(f'#!/bin/bash\necho "ARGV: uv HOME=$HOME $*" >> {log}\n')   # mmr keys init
     (bin_dir / "uv").chmod(0o755)
     result = subprocess.run(["bash", str(SCRIPT)], capture_output=True, text=True, timeout=60,
                             env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "HOME": HOME, **env})
     return result, (log.read_text().splitlines() if log.exists() else [])
 
 
-def test_the_runner_uses_a_throwaway_home_the_test_project_and_no_env_file(tmp_path):
-    result, calls = run_with_fake_docker(tmp_path)
+def test_the_runner_uses_a_throwaway_home_the_test_project_and_only_the_two_services(tmp_path):
+    result, lines = run_with_fake_docker(tmp_path)
     assert result.returncode == 0, result.stderr
-    compose = [call for call in calls if call.startswith("HOME=")]
-    assert compose and all(" compose -p mmr-sbxtest " in call for call in compose)
-    assert all(not call.startswith(f"HOME={HOME} ") for call in calls)          # never the operator's home
-    assert all("--env-file" in call and "docker-compose.sbxtest.override.yml" in call for call in compose)
-    assert any(" keys init" in call for call in calls if call.startswith("uv "))  # test-only keys
-    assert any(" up " in call for call in compose) and any(" down -v " in call for call in compose)
+    argv = [line[len("ARGV: "):] for line in lines if line.startswith("ARGV: ")]
+    compose = [call for call in argv if " compose -p mmr-sbxtest " in call]
+    assert compose and all("docker-compose.sbxtest.override.yml" in call and "--env-file" in call for call in compose)
+    assert all(not call.startswith(f"uv HOME={HOME} ") for call in argv)         # never the operator's home
+    assert any("keys init" in call for call in argv)                             # test-only keys
+    up = next(call for call in compose if " up " in f" {call} ")
+    assert up.rstrip().endswith("sandbox fullstack-tests")                       # only the two services
+    assert "ib-gateway" not in " ".join(compose) and "trader" not in up
+    assert any(" down -v " in f" {call} " for call in compose)
+
+
+def test_compose_runs_without_the_operator_broker_variables(tmp_path):
+    result, lines = run_with_fake_docker(
+        tmp_path, TWS_USERID="live-user", TWS_PASSWORD="secret", TRADING_MODE="live", IB_ACCOUNT="U999",
+        ALPACA_API_KEY_ID="ak", OPENROUTER_API_KEY="ok")
+    assert result.returncode == 0, result.stderr
+    env_block = "\n".join(lines)
+    for leaked in ("live-user", "secret", "TRADING_MODE=live", "U999", "ALPACA_API_KEY_ID", "OPENROUTER_API_KEY"):
+        assert leaked not in env_block, leaked                      # env -i kept them out of every docker call
 
 
 def test_a_rendered_config_that_touches_a_live_stack_stops_the_run_before_up(tmp_path):
     unsafe = json.loads(json.dumps(SAFE))
-    unsafe["services"]["trader"]["ports"] = [{"published": "42101", "target": 42101}]
+    unsafe["services"]["sandbox"]["ports"] = [{"published": "42101", "target": 42101}]
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     log = tmp_path / "docker.log"
@@ -4175,23 +4257,29 @@ def test_the_script_warns_against_a_live_host():
 
 
 @pytest.mark.skipif(shutil.which("docker") is None, reason="docker is not installed")
-def test_the_real_rendered_config_passes_the_checker(tmp_path):
+def test_the_real_rendered_config_of_the_two_services_passes_the_checker(tmp_path):
     empty_env = tmp_path / "compose.env"
     empty_env.write_text("")
+    # Exactly what the runner renders: the two services, a test-only image, and operator creds exported to prove
+    # env -i would have been needed (here we pass a clean env explicitly).
     rendered = subprocess.run(
         ["docker", "compose", "-p", "mmr-sbxtest", "--env-file", str(empty_env), "-f", "docker-compose.yml",
          "-f", "docker-compose.test.override.yml", "-f", "docker-compose.sbxtest.override.yml",
-         "--profile", "test", "config", "--format", "json"],
+         "--profile", "test", "config", "--format", "json", "sandbox", "fullstack-tests"],
         cwd=ROOT, capture_output=True, text=True, timeout=120,
-        env={**os.environ, "HOME": str(tmp_path / "home"),
+        env={"PATH": os.environ["PATH"], "HOME": str(tmp_path / "home"), "MMR_BUILD_ID": "abc123-test",
+             "MMR_SBXTEST_IMAGE": "mmr-sbxtest:abc123-test",
              "DOCKER_CONFIG": os.environ.get("DOCKER_CONFIG", str(Path.home() / ".docker"))})
     if rendered.returncode != 0:
         pytest.skip(f"docker compose config is not available here: {rendered.stderr[-200:]}")
     config = json.loads(rendered.stdout)
     assert config["name"] == "mmr-sbxtest"
+    assert set(config["services"]) == {"sandbox", "fullstack-tests"}      # ib-gateway et al. are not rendered
     assert problems(config, operator_home=str(Path.home()), repo_root=str(ROOT)) == []
-    ports = [p for s in config["services"].values() for p in s.get("ports", []) or []]
-    assert ports == []                                       # nothing published, so no live port either
+    images = [s.get("image") for s in config["services"].values()]
+    assert images and all(str(img).startswith("mmr-sbxtest:") for img in images)   # never mmr:latest
+    assert len(set(images)) == len(images)                                          # one tag per built service
+    assert [p for s in config["services"].values() for p in s.get("ports", []) or []] == []
 ```
 
 - [ ] **Step 4: Write the run script** `scripts/run_sandbox_fullstack.sh`:
@@ -4202,9 +4290,14 @@ def test_the_real_rendered_config_passes_the_checker(tmp_path):
 #
 # WARNING: never run this against the live stack. It is built to share nothing with one on the same host:
 #   - its own compose project (mmr-sbxtest), so its own containers, network and named volumes (mmr-sbxtest_*);
+#   - it starts ONLY `sandbox` and `fullstack-tests` (review r2 #2), so ib-gateway, trader, strategy, data,
+#     dashboard and scheduler never start -- no second IB login, no live service touched;
+#   - a test-only image tag (mmr-sbxtest:<run id>), never the production mmr:latest;
 #   - no published host port (docker-compose.sbxtest.override.yml);
 #   - ${HOME} points at a throwaway directory with a copy of config_defaults and keys generated for this run,
 #     never the operator's ~/.config/mmr; .env is neither interpolated (--env-file is an empty file) nor injected;
+#   - compose runs under `env -i` (only PATH/HOME/DOCKER_CONFIG/the MMR_* vars), so an exported TWS_USERID,
+#     TWS_PASSWORD, TRADING_MODE, IB_*, ALPACA_*, ... never interpolates into any service;
 #   - the rendered config is checked (scripts/check_sbxtest_config.py) and the run refuses before `up` otherwise.
 # It removes its containers, volumes and the throwaway directory when it ends.
 set -o errexit -o pipefail -o nounset
@@ -4226,19 +4319,29 @@ cp -R config_defaults/. "$TEST_HOME/.config/mmr/"
 HOME="$TEST_HOME" uv run --frozen --project "$BUILDDIR" mmr keys init     # keys for this run only
 export HOME="$TEST_HOME"
 export MMR_BUILD_ID="${MMR_BUILD_ID:-$(git rev-parse --short HEAD 2>/dev/null || echo nogit)-test}"
+export MMR_SBXTEST_IMAGE="mmr-sbxtest:${MMR_BUILD_ID}"             # a test-only tag, never mmr:latest
+# The exact services the sandbox tests need; nothing else is rendered or started (review r2 #2).
+SERVICES=(sandbox fullstack-tests)
 compose=(docker compose -p "$PROJECT" --env-file "$TEST_HOME/compose.env" -f docker-compose.yml
          -f docker-compose.test.override.yml -f docker-compose.sbxtest.override.yml --profile test)
+# A clean environment for every compose call: only what compose and docker need. An operator's exported broker
+# or provider variables (TWS_*, IB_*, ALPACA_*, ...) are not present, so none can interpolate into a service.
+clean=(env -i "PATH=$PATH" "HOME=$HOME" "DOCKER_CONFIG=$DOCKER_CONFIG" "UV_CACHE_DIR=$UV_CACHE_DIR"
+       "MMR_BUILD_ID=$MMR_BUILD_ID" "MMR_SBXTEST_IMAGE=$MMR_SBXTEST_IMAGE" "TERM=${TERM:-dumb}")
+for var in DOCKER_HOST DOCKER_CONTEXT; do                       # which daemon to talk to, not a credential
+  [[ -n "${!var:-}" ]] && clean+=("$var=${!var}")
+done
 cleanup() {
-  "${compose[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+  "${clean[@]}" "${compose[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$TEST_HOME"
 }
 trap cleanup EXIT
-"${compose[@]}" config --format json \
+"${clean[@]}" "${compose[@]}" config --format json "${SERVICES[@]}" \
   | python3 scripts/check_sbxtest_config.py "$OPERATOR_HOME" "$BUILDDIR" || exit 2
-"${compose[@]}" up --build --abort-on-container-exit fullstack-tests
+"${clean[@]}" "${compose[@]}" up --build --abort-on-container-exit "${SERVICES[@]}"
 ```
 
-Make both scripts executable (`chmod +x scripts/run_sandbox_fullstack.sh scripts/check_sbxtest_config.py`). `-p` overrides the base file's `name: mmr`. If `mmr keys init` needs more than `HOME` on the base (for example a `--dir` flag), use that flag with `$TEST_HOME/.config/mmr`; never let it write to the operator's home. Run `.venv/bin/python -m pytest tests/test_sandbox_fullstack_runner.py -q`: PASS (the real-render test skips without Docker; when it runs and a service still publishes a port or binds the operator's config, add the `!reset` line for that service to the override, never relax the checker).
+Make both scripts executable (`chmod +x scripts/run_sandbox_fullstack.sh scripts/check_sbxtest_config.py`). `-p` overrides the base file's `name: mmr`; `config <services>` renders only the named services, so ib-gateway and the rest never appear and never start. If `mmr keys init` needs more than `HOME` on the base (for example a `--dir` flag), use that flag with `$TEST_HOME/.config/mmr`; never let it write to the operator's home. Run `.venv/bin/python -m pytest tests/test_sandbox_fullstack_runner.py -q`: PASS (the real-render test skips without Docker; when it runs and a service still publishes a port, carries a credential or binds the operator's config, add the `!reset` line for that service to the override, never relax the checker).
 
 - [ ] **Step 5: Note on running.** These container tests need Docker and are not part of the unit suite (they skip without `MMR_FAKE_BROKER=1` and the mounted socket, like the existing `tests/fullstack/*`). Do not run them from this plan's unit steps. The owner runs `scripts/run_sandbox_fullstack.sh` on a host with Docker. State in the PR that they were not run here if Docker was unavailable.
 

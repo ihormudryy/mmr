@@ -211,3 +211,59 @@ def test_the_orb_fixture_passes():
 def test_a_source_that_is_not_a_string_is_one_violation():
     violations = check_source(b"x = 1\n")  # type: ignore[arg-type]
     assert [v.rule for v in violations] == ["unparseable"]
+
+
+# --- names imported with from, and names a definition binds -------------------
+
+@pytest.mark.parametrize("statement", [
+    "from typing import operator",
+    "from typing import types as t",
+    "from typing import functools",
+    "from dataclasses import inspect",
+    "from dataclasses import copy",
+    "from trader.authored.api import pd",
+    "from trader.authored.api import math",
+    "from trader.authored.api import abstractmethod",
+])
+def test_a_from_import_of_a_name_outside_the_allow_list_is_refused(statement):
+    assert "from_import_not_allowed" in _rules(statement + "\n" + CLEAN)
+
+
+@pytest.mark.parametrize("statement", [
+    "from typing import Optional, Sequence",
+    "from dataclasses import dataclass, field",
+    "from trader.authored.api import ACTIONS, MAX_LOOKBACK_BARS, MIN_LOOKBACK_BARS",
+])
+def test_a_from_import_of_an_allowed_name_passes(statement):
+    assert check_source(statement + "\n" + CLEAN) == []
+
+
+def test_every_from_import_module_has_a_name_list():
+    from trader.authored.allowed_api import ALLOWED_FROM_IMPORTS
+    from trader.authored.static_check import ALLOWED_FROM_IMPORT_NAMES
+    assert set(ALLOWED_FROM_IMPORT_NAMES) == set(ALLOWED_FROM_IMPORTS)
+
+
+@pytest.mark.parametrize("statement, rule", [
+    ("from typing import Mapping as _m", "dunder_name"),
+    ("from typing import Mapping as os", "banned_name"),
+    ("import numpy as sys", "banned_name"),
+    ("import numpy as _np", "dunder_name"),
+])
+def test_an_import_alias_is_checked_like_a_name(statement, rule):
+    assert rule in _rules(statement + "\n" + CLEAN)
+
+
+@pytest.mark.parametrize("definition", [
+    "    def __init_subclass__(cls):\n        return None\n",
+    "    def __getattribute__(self, name):\n        return None\n",
+    "    def _helper(self):\n        return None\n",
+])
+def test_a_method_with_a_private_or_dunder_name_is_refused(definition):
+    body = CLEAN.replace("    def on_bar", definition + "\n    def on_bar")
+    assert "dunder_name" in _rules(body)
+
+
+def test_a_parameter_with_a_dunder_name_is_refused():
+    body = CLEAN.replace("def on_bar(self, history, params)", "def on_bar(self, history, params, __x=1)")
+    assert "dunder_name" in _rules(body)

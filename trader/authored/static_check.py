@@ -23,6 +23,18 @@ BANNED_NAMES = frozenset({
     "vars", "getattr", "setattr", "delattr", "input", "breakpoint",
     "memoryview", "format"})
 BANNED_ATTRIBUTES = frozenset({"format", "format_map"})
+# Names a from-import may bind, per module. ALLOWED_FROM_IMPORTS names the module
+# only; without this list `from typing import operator` or
+# `from trader.authored.api import pd` would bind a whole module.
+ALLOWED_FROM_IMPORT_NAMES: dict[str, frozenset[str]] = {
+    "typing": frozenset({
+        "Any", "ClassVar", "Dict", "Final", "Iterable", "List", "Literal",
+        "Mapping", "Optional", "Sequence", "Tuple", "Union"}),
+    "dataclasses": frozenset({"dataclass", "field"}),
+    "trader.authored.api": frozenset({
+        "AuthoredStrategy", "Decision", "ACTIONS", "MIN_LOOKBACK_BARS",
+        "MAX_LOOKBACK_BARS"}),
+}
 _IO_PREFIX = re.compile(r"^(read_|to_)")
 _IO_NAMES = frozenset({"load", "save", "savez", "fromfile", "tofile", "eval",
                        "query", "ctypeslib", "pickle"})
@@ -70,6 +82,7 @@ class _Checker(ast.NodeVisitor):
     # --- imports -------------------------------------------------------
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
+            self._check_alias(node, alias)
             if alias.name not in ALLOWED_IMPORTS or "." in alias.name:
                 self.add("import_not_allowed", node, f"import {alias.name}")
                 continue
@@ -83,7 +96,17 @@ class _Checker(ast.NodeVisitor):
             self.add("import_star", node, f"from {module} import *")
         elif module not in ALLOWED_FROM_IMPORTS:
             self.add("from_import_not_allowed", node, f"from {module} import ...")
+        else:
+            for alias in node.names:
+                self._check_alias(node, alias)
+                if alias.name not in ALLOWED_FROM_IMPORT_NAMES.get(module, frozenset()):
+                    self.add("from_import_not_allowed", node,
+                             f"name {alias.name} not importable from {module}")
         self.generic_visit(node)
+
+    def _check_alias(self, node: ast.AST, alias: ast.alias) -> None:
+        for name in alias.name.split(".") + ([alias.asname] if alias.asname else []):
+            self._check_identifier(node, name)
 
     # --- names, attributes, strings -----------------------------------
     def visit_Name(self, node: ast.Name) -> None:
@@ -167,12 +190,18 @@ class _Checker(ast.NodeVisitor):
             self.add("banned_statement", node, "lambda with defaults")
         self.generic_visit(node)
 
+    def visit_arg(self, node: ast.arg) -> None:
+        self._check_identifier(node, node.arg)
+        self.generic_visit(node)
+
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._check_identifier(node, node.name)
         if node.decorator_list:
             self.add("banned_statement", node, f"decorator on {node.name}")
         self.generic_visit(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._check_identifier(node, node.name)
         if node.decorator_list:
             self.add("banned_statement", node, f"decorator on {node.name}")
         self.generic_visit(node)

@@ -53,7 +53,7 @@ class OpeningRangeBreakout(AuthoredStrategy):
         range_high = float(np.max(high[in_range]))
         range_low = float(np.min(low[in_range]))
         volume_average = float(np.mean(volume[-sma_bars:]))
-        if volume_average <= 0.0:
+        if np.isnan(volume_average) or volume_average <= 0.0:
             return None
 
         last_close = float(close[-1])

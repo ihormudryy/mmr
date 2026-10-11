@@ -11,9 +11,9 @@ PARAMS = {"RANGE_MINUTES": 30, "VOLUME_MULT": 1.5, "RTH_OPEN_MIN": 570,
           "RTH_CLOSE_MIN": 960, "VOLUME_SMA_BARS": 20, "MIN_BARS": 40}
 
 
-def _session(n=120, breakout_at=80, base=100.0):
+def _session(n=120, breakout_at=80, base=100.0, start="2024-01-02 14:30:00"):
     """One regular session of 1-min UTC bars, flat open range then a volume-backed break up."""
-    start = pd.Timestamp("2024-01-02 14:30:00", tz="UTC")  # 09:30 ET
+    start = pd.Timestamp(start, tz="UTC")  # default 09:30 ET
     index = pd.date_range(start, periods=n, freq="1min", tz="UTC")
     close = np.full(n, base)
     close[breakout_at:] = base + 2.0          # break above the 09:30-10:00 range high
@@ -40,10 +40,22 @@ def test_no_signal_until_more_than_min_bars_bars_are_seen():
 
 
 def test_no_signal_before_the_opening_range_closes():
-    frame = _session()
+    # Start at 08:30 ET so the frame passes the MIN_BARS gate while the last bar (09:45 ET) is
+    # still inside the 09:30-10:00 range. The last bar has a stale high below its close, so
+    # only the "range has not closed" check keeps this crossing quiet.
+    frame = _session(start="2024-01-02 13:30:00", breakout_at=75)
+    frame.iloc[75, frame.columns.get_loc("high")] = 100.25
+    history = frame.iloc[:76]
+    assert len(history) > OpeningRangeBreakout.MIN_BARS
+    assert history.index[-1].tz_convert("America/New_York").strftime("%H:%M") == "09:45"
+    assert OpeningRangeBreakout().on_bar(history, PARAMS) is None
+
+
+def test_min_bars_boundary_cross_at_len_41_buys_but_at_len_40_is_none():
     strategy = OpeningRangeBreakout()
-    # 25 minutes in (bar 24 is 09:54 ET): the 30-minute range has not closed yet.
-    assert strategy.on_bar(frame.iloc[:25], PARAMS) is None
+    buy = strategy.on_bar(_session(breakout_at=40).iloc[:41], PARAMS)
+    assert isinstance(buy, Decision) and buy.action == "BUY"
+    assert strategy.on_bar(_session(breakout_at=39).iloc[:40], PARAMS) is None
 
 
 def test_breakout_bar_is_a_buy():
@@ -69,3 +81,17 @@ def test_break_below_the_range_low_is_a_sell():
     strategy = OpeningRangeBreakout()
     decision = strategy.on_bar(low.iloc[: 81], PARAMS)
     assert isinstance(decision, Decision) and decision.action == "SELL"
+
+
+def test_a_nan_volume_in_the_average_window_silences_buy_and_sell():
+    strategy = OpeningRangeBreakout()
+    up = _session(breakout_at=80)
+    up.loc[up.index[70], "volume"] = np.nan
+    assert strategy.on_bar(up.iloc[:81], PARAMS) is None
+
+    down = _session(breakout_at=80)
+    down.loc[down.index[80:], "close"] = 97.0
+    down.loc[down.index[80:], "low"] = 96.0
+    assert strategy.on_bar(down.iloc[:81], PARAMS).action == "SELL"   # sane volume still sells
+    down.loc[down.index[70], "volume"] = np.nan
+    assert strategy.on_bar(down.iloc[:81], PARAMS) is None

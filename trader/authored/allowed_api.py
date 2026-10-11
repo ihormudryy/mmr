@@ -4,6 +4,7 @@ An authored file may import only ALLOWED_IMPORTS. An attribute read off an
 imported data module (np.x, pd.x, math.x, statistics.x) must be in
 ALLOWED_MODULE_ATTRIBUTES[module]; nothing listed is a module (the walk test
 in tests/authored/test_allowed_api.py proves it on the shipped build).
+A from-import may bind only the names in ALLOWED_FROM_IMPORT_NAMES[module].
 DENIED_CHAIN_NAMES are refused anywhere in an attribute chain. The lists
 extend the spec's (Plan 1 ruling 6); they never narrow it.
 """
@@ -17,6 +18,19 @@ ALLOWED_IMPORTS: frozenset[str] = frozenset(
 
 ALLOWED_FROM_IMPORTS: frozenset[str] = frozenset(
     {"typing", "dataclasses", "trader.authored.api"})
+
+# Names a from-import may bind, per module. ALLOWED_FROM_IMPORTS names the module
+# only; without this list `from typing import operator` or
+# `from trader.authored.api import pd` would bind a whole module.
+ALLOWED_FROM_IMPORT_NAMES: Mapping[str, frozenset[str]] = {
+    "typing": frozenset({
+        "Any", "ClassVar", "Dict", "Final", "Iterable", "List", "Literal",
+        "Mapping", "Optional", "Sequence", "Tuple", "Union"}),
+    "dataclasses": frozenset({"dataclass", "field"}),
+    "trader.authored.api": frozenset({
+        "AuthoredStrategy", "Decision", "ACTIONS", "MIN_LOOKBACK_BARS",
+        "MAX_LOOKBACK_BARS"}),
+}
 
 ALLOWED_MODULE_ATTRIBUTES: Mapping[str, frozenset[str]] = {
     "numpy": frozenset({

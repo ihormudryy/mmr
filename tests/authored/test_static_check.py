@@ -238,12 +238,6 @@ def test_a_from_import_of_an_allowed_name_passes(statement):
     assert check_source(statement + "\n" + CLEAN) == []
 
 
-def test_every_from_import_module_has_a_name_list():
-    from trader.authored.allowed_api import ALLOWED_FROM_IMPORTS
-    from trader.authored.static_check import ALLOWED_FROM_IMPORT_NAMES
-    assert set(ALLOWED_FROM_IMPORT_NAMES) == set(ALLOWED_FROM_IMPORTS)
-
-
 @pytest.mark.parametrize("statement, rule", [
     ("from typing import Mapping as _m", "dunder_name"),
     ("from typing import Mapping as os", "banned_name"),
@@ -318,3 +312,31 @@ def test_the_result_does_not_depend_on_the_warning_filter():
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         assert check_source(source) == []
+
+
+def test_parallel_checks_do_not_race_on_the_warning_filter():
+    import sys
+    import threading
+    import warnings
+    source = "x = '\\d'\n"  # SyntaxWarning; an error only if a thread sees the "error" filter
+    unparseable = []
+
+    def check_many():
+        for _ in range(2_000):
+            rules = {v.rule for v in check_source(source)}
+            if "unparseable" in rules:
+                unparseable.append(rules)
+
+    old_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)  # switch threads often so the race shows
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            threads = [threading.Thread(target=check_many) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+    finally:
+        sys.setswitchinterval(old_interval)
+    assert unparseable == []

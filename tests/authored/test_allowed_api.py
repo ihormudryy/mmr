@@ -7,7 +7,7 @@ import inspect
 import pytest
 
 from trader.authored.allowed_api import (
-    ALLOWED_FROM_IMPORTS, ALLOWED_IMPORTS, ALLOWED_MODULE_ATTRIBUTES, DENIED_CHAIN_NAMES,
+    ALLOWED_FROM_IMPORT_NAMES, ALLOWED_FROM_IMPORTS, ALLOWED_IMPORTS, ALLOWED_MODULE_ATTRIBUTES, DENIED_CHAIN_NAMES,
     DENIED_CHAIN_PREFIXES,
 )
 
@@ -21,6 +21,18 @@ def test_imports_are_the_spec_seven_modules():
 def test_from_imports_exclude_the_data_modules():
     assert "numpy" not in ALLOWED_FROM_IMPORTS and "pandas" not in ALLOWED_FROM_IMPORTS
     assert ALLOWED_FROM_IMPORTS == frozenset({"typing", "dataclasses", "trader.authored.api"})
+
+
+def test_every_from_import_module_has_a_name_list():
+    assert set(ALLOWED_FROM_IMPORT_NAMES) == set(ALLOWED_FROM_IMPORTS)
+
+
+@pytest.mark.parametrize("module_name, name", sorted(
+    (module_name, name)
+    for module_name, names in ALLOWED_FROM_IMPORT_NAMES.items() for name in names))
+def test_every_from_import_name_resolves_and_is_not_a_module(module_name, name):
+    value = getattr(importlib.import_module(module_name), name)
+    assert not inspect.ismodule(value), f"from {module_name} import {name} binds a module"
 
 
 SPEC_7_2_DENIED_NAMES = {

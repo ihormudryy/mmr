@@ -7,12 +7,13 @@ from __future__ import annotations
 
 import ast
 import re
+import threading
 import warnings
 from dataclasses import dataclass
 
 from trader.authored.allowed_api import (
-    ALLOWED_FROM_IMPORTS, ALLOWED_IMPORTS, ALLOWED_MODULE_ATTRIBUTES, DENIED_CHAIN_NAMES,
-    DENIED_CHAIN_PREFIXES,
+    ALLOWED_FROM_IMPORT_NAMES, ALLOWED_FROM_IMPORTS, ALLOWED_IMPORTS, ALLOWED_MODULE_ATTRIBUTES,
+    DENIED_CHAIN_NAMES, DENIED_CHAIN_PREFIXES,
 )
 
 MAX_SOURCE_BYTES = 20_480
@@ -27,18 +28,6 @@ BANNED_NAMES = frozenset({
     "vars", "getattr", "setattr", "delattr", "input", "breakpoint",
     "memoryview", "format"})
 BANNED_ATTRIBUTES = frozenset({"format", "format_map"})
-# Names a from-import may bind, per module. ALLOWED_FROM_IMPORTS names the module
-# only; without this list `from typing import operator` or
-# `from trader.authored.api import pd` would bind a whole module.
-ALLOWED_FROM_IMPORT_NAMES: dict[str, frozenset[str]] = {
-    "typing": frozenset({
-        "Any", "ClassVar", "Dict", "Final", "Iterable", "List", "Literal",
-        "Mapping", "Optional", "Sequence", "Tuple", "Union"}),
-    "dataclasses": frozenset({"dataclass", "field"}),
-    "trader.authored.api": frozenset({
-        "AuthoredStrategy", "Decision", "ACTIONS", "MIN_LOOKBACK_BARS",
-        "MAX_LOOKBACK_BARS"}),
-}
 _IO_PREFIX = re.compile(r"^(read_|to_)")
 _IO_NAMES = frozenset({"load", "save", "savez", "fromfile", "tofile", "eval",
                        "query", "ctypeslib", "pickle"})
@@ -282,10 +271,15 @@ def _unparseable(line: int, detail: str) -> list[StaticViolation]:
     return [StaticViolation("unparseable", line, detail)]
 
 
+# catch_warnings swaps the process-wide filter list; the trader checks files on
+# several RPC threads, so one thread's restore must not land inside another's parse.
+_PARSE_LOCK = threading.Lock()
+
+
 def _parse_quietly(source: str) -> ast.Module:
     # Under -W error the compiler turns a SyntaxWarning (e.g. '\d') into a
     # SyntaxError; the verdict must not depend on the host's warning filter.
-    with warnings.catch_warnings():
+    with _PARSE_LOCK, warnings.catch_warnings():
         warnings.simplefilter("ignore")
         return ast.parse(source)
 

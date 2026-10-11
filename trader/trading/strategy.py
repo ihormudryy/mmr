@@ -292,6 +292,11 @@ class Strategy(ABC):
         returned, computed on the full history: read only
         ``state[key][:index+1]`` — reading past ``index`` is lookahead bias.
 
+        ``prices`` is a view (no copy per bar), so a later-row index read fails,
+        but this is no barrier against code that digs into the underlying arrays;
+        ``state`` already holds the full history. Untrusted code runs only in the
+        SP3 sandbox, which is sent one bar at a time.
+
         Default implementation falls back to ``on_prices(prices.iloc[:index+1])``
         so strategies written against the legacy API keep working.
         """

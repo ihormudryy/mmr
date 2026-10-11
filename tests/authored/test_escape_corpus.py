@@ -22,6 +22,44 @@ SANDBOX_HOSTILE = (
     "escape_kill_other_child", "escape_sys_modules_lookup", "escape_open_socket",
 )
 
+# The rule that catches each file's HOSTILE ACT, not an incidental line.
+# None: the hostile act is legal Python the checker cannot judge (a resource
+# attack). Those files are refused only for their deliberate marker local, named in
+# RESOURCE_ATTACK_MARKER. The sandbox limits are their real test (Plan 2).
+EXPECTED_RULE: dict[str, str | None] = {
+    "escape_alias_rebind": "module_alias_misuse",
+    "escape_allocate_past_limit": None,
+    "escape_computed_getattr": "banned_builtin",
+    "escape_cython_func_globals": "banned_name",
+    "escape_decorator": "banned_statement",
+    "escape_df_query": "io_attribute",
+    "escape_fork_bomb": "module_attribute_not_allowed",
+    "escape_format_globals": "banned_name",
+    "escape_import_os": "import_not_allowed",
+    "escape_importlib_string": "banned_builtin",
+    "escape_kill_other_child": "module_attribute_not_allowed",
+    "escape_lambda_default": "banned_statement",
+    "escape_loop_forever": None,
+    "escape_match_class_pattern": "match_statement",
+    "escape_open_socket": "module_attribute_not_allowed",
+    "escape_pd_eval": "module_attribute_not_allowed",
+    "escape_pd_io_common_oskill": "module_attribute_not_allowed",
+    "escape_pickle": "banned_name",
+    "escape_read_config_keys": "module_attribute_not_allowed",
+    "escape_string_dispatch": "banned_name",
+    "escape_subclasses_walk": "dunder_name",
+    "escape_sys_modules_lookup": "module_attribute_not_allowed",
+    "escape_try_except": "banned_statement",
+    "escape_trystar": "node_type",
+    "escape_type_builtin": "banned_builtin",
+    "escape_type_params": "banned_statement",
+    "escape_write_outside_tmpfs": "io_attribute",
+}
+RESOURCE_ATTACK_MARKER = {
+    "escape_allocate_past_limit": "_hog",
+    "escape_loop_forever": "_spin",
+}
+
 
 def test_the_corpus_is_not_empty():
     assert len(ESCAPES) >= 27
@@ -37,6 +75,23 @@ def test_the_corpus_is_not_collected_or_importable_by_pytest():
 def test_every_escape_file_is_rejected(path):
     violations = check_source(path.read_text())
     assert violations, f"{path.name} was not rejected"
+
+
+def test_every_corpus_file_has_an_expected_rule():
+    assert {path.stem for path in ESCAPES} == set(EXPECTED_RULE)
+    assert {stem for stem, rule in EXPECTED_RULE.items() if rule is None} == set(RESOURCE_ATTACK_MARKER)
+
+
+@pytest.mark.parametrize("path", ESCAPES, ids=lambda p: p.name)
+def test_the_hostile_act_is_caught_by_its_expected_rule(path):
+    rule = EXPECTED_RULE[path.stem]
+    violations = check_source(path.read_text())
+    if rule is None:
+        marker_details = {f"name {RESOURCE_ATTACK_MARKER[path.stem]}"}
+        assert {v.rule for v in violations} == {"dunder_name"}
+        assert {v.detail for v in violations} == marker_details
+    else:
+        assert rule in {v.rule for v in violations}, [(v.rule, v.line) for v in violations]
 
 
 @pytest.mark.parametrize("stem", SANDBOX_HOSTILE)

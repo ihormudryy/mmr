@@ -287,13 +287,10 @@ class Strategy(ABC):
     ) -> Optional[Signal]:
         """Per-bar hook, fast path.
 
-        ``prices`` is the FULL OHLCV DataFrame (the same object for every
-        call — the backtester passes it through by reference, no slicing).
-        ``state`` is whatever ``precompute`` returned. ``index`` is the
-        0-based position of the current bar.
-
-        Only read ``prices.iloc[:index+1]`` and ``state[key][:index+1]`` —
-        reading past ``index`` is lookahead bias.
+        ``prices`` holds the bars up to and including the current one, so
+        ``len(prices) == index + 1``. ``state`` is whatever ``precompute``
+        returned, computed on the full history: read only
+        ``state[key][:index+1]`` — reading past ``index`` is lookahead bias.
 
         Default implementation falls back to ``on_prices(prices.iloc[:index+1])``
         so strategies written against the legacy API keep working.

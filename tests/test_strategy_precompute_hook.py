@@ -2,7 +2,7 @@
 
 Guarantees we care about:
 - precompute is called exactly once per conid, with the full OHLCV.
-- on_bar receives the correct (full_prices, state, index) triple.
+- on_bar receives (bars 0..index as a view, state, index).
 - Legacy strategies (on_prices only) still work via the default on_bar fallback.
 - A strategy implementing both APIs produces the same signals via either path.
 - The fast path materially reduces wall time on a vectorbt-heavy strategy.
@@ -96,19 +96,20 @@ class PrecomputeProbe(Strategy):
         self.precompute_calls = 0
         self.precompute_prices_lens = []
         self.on_bar_indices = []
-        self.on_bar_prices_ids = set()
+        self.on_bar_lengths = []
+        self.on_bar_shares_memory = []
 
     def precompute(self, prices):
         self.precompute_calls += 1
         self.precompute_prices_lens.append(len(prices))
+        self.full_close = prices['close'].to_numpy()
         return {'magic': len(prices)}
 
     def on_bar(self, prices, state, index):
         self.on_bar_indices.append(index)
-        # Track that the backtester passes the SAME DataFrame reference,
-        # not a copy-per-bar (copying would defeat the purpose).
-        self.on_bar_prices_ids.add(id(prices))
-        assert state['magic'] == len(prices), 'state must persist across calls'
+        self.on_bar_lengths.append(len(prices))
+        self.on_bar_shares_memory.append(np.shares_memory(prices['close'].to_numpy(), self.full_close))
+        assert state['magic'] == self.precompute_prices_lens[-1], 'state must persist across calls'
         return None
 
 
@@ -129,14 +130,15 @@ class TestPrecomputeHookSemantics:
         # Exactly one call per bar, indices 0 .. 59
         assert probe.on_bar_indices == list(range(60))
 
-    def test_on_bar_receives_stable_prices_reference(self, tmp_duckdb_path):
-        """The backtester must pass the same full-prices DataFrame object
-        every call — copying it would erase the O(N²) → O(N) win."""
+    def test_on_bar_receives_a_view_of_the_bars_so_far(self, tmp_duckdb_path):
+        """on_bar gets only bars 0..index (#150), as a view of the full frame:
+        a copy per bar would erase the O(N²) → O(N) win."""
         _write_bars(tmp_duckdb_path, n=60)
         bt = _backtester(tmp_duckdb_path)
         probe = _install(PrecomputeProbe(), tmp_duckdb_path)
         bt.run(probe, [4391])
-        assert len(probe.on_bar_prices_ids) == 1
+        assert probe.on_bar_lengths == [index + 1 for index in range(60)]
+        assert all(probe.on_bar_shares_memory)
 
     def test_precompute_exception_does_not_abort_run(self, tmp_duckdb_path):
         """A broken precompute should log and continue with empty state;

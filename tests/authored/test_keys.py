@@ -42,3 +42,30 @@ def test_parse_refuses_a_non_authored_key():
 def test_is_authored_key_is_false_for_a_catalogue_key():
     assert not is_authored_key("strategies/orb.py:OpeningRangeBreakout")
     assert not is_authored_key(f"authored:md5:{HEX}:X")
+
+
+DIGEST = f"sha256:{HEX}"
+
+
+@pytest.mark.parametrize("digest", [f"{DIGEST}\n", f" {DIGEST}"])
+def test_authored_key_refuses_a_digest_with_stray_whitespace(digest):
+    with pytest.raises(ValueError):
+        authored_key(digest, "X")
+
+
+@pytest.mark.parametrize("class_name", ["X\n", " X"])
+def test_authored_key_refuses_a_class_name_with_stray_whitespace(class_name):
+    with pytest.raises(ValueError):
+        authored_key(DIGEST, class_name)
+
+
+@pytest.mark.parametrize("key", [
+    f"authored:{DIGEST}:X\n",
+    f" authored:{DIGEST}:X",
+    f"authored:{DIGEST}: X",
+    f"authored:{DIGEST}\n:X",
+])
+def test_a_key_with_stray_whitespace_is_not_an_authored_key(key):
+    assert not is_authored_key(key)
+    with pytest.raises(ValueError):
+        parse_authored_key(key)

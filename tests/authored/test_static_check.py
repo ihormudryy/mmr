@@ -340,3 +340,83 @@ def test_parallel_checks_do_not_race_on_the_warning_filter():
     finally:
         sys.setswitchinterval(old_interval)
     assert unparseable == []
+
+
+
+# --- controller probe, fix round 1 ---------------------------------------------
+
+PROBE_HEAD = ("import numpy as np\nimport pandas as pd\n"
+              "from trader.authored.api import AuthoredStrategy, Decision\n\n\n"
+              "class S(AuthoredStrategy):\n    def on_bar(self, history, params):\n")
+
+
+def _probe(body):
+    lines = "".join("        " + line + "\n" for line in body.splitlines())
+    return PROBE_HEAD + lines + "        return None\n"
+
+
+@pytest.mark.parametrize("body, rule", [
+    ("match history:\n    case object(__class__=c):\n        pass", "match_statement"),
+    ("match self.on_bar:\n    case object(func_globals=g):\n        pass", "match_statement"),
+    ("match history:\n    case object(system=s):\n        pass", "match_statement"),
+    ("match history:\n    case 1:\n        pass", "match_statement"),
+    ("y = \uff45val('1')", "banned_name"),
+    ("y = history.\uff3f\uff3fclass\uff3f\uff3f", "unparseable"),
+    ("y = type(history)", "banned_builtin"),
+    ("y = type('X', (), {})", "banned_builtin"),
+    ("y = object()", "banned_builtin"),
+    ("y = isinstance(history, object)", "banned_builtin"),
+    ("y = super()", "banned_builtin"),
+    ("y = history.apply('sum')", "banned_name"),
+    ("y = history.agg('sum')", "banned_name"),
+    ("y = history.pipe(len)", "banned_name"),
+    ("y = history.aggregate('sum')", "banned_name"),
+    ("y = history.transform('sum')", "banned_name"),
+    ("y = history.applymap(abs)", "banned_name"),
+    ("y = b'__x'", "string_literal"),
+    ("y = next(iter(history))", "banned_builtin"),
+    ("y = dir(history)", "banned_builtin"),
+    ("y = id(history)", "banned_builtin"),
+    ("y = hasattr(history, 'close')", "banned_builtin"),
+    ("print(1)", "banned_builtin"),
+])
+def test_a_probe_case_is_refused(body, rule):
+    assert rule in _rules(_probe(body))
+
+
+@pytest.mark.parametrize("body", [
+    "x = 1",
+    # A string built at runtime is harmless on its own: nothing that takes a name
+    # string (getattr, format, operator, pandas apply/agg/pipe) is reachable.
+    "k = '_' + '_class_' + '_'",
+    "y = [v for v in history.close]",
+    "y = f'{history.close}'",
+    "y = (m := np.mean)",
+    "y = dict(a=1)",
+    "y = sorted(zip(range(3), reversed([1, 2, 3])))",
+])
+def test_a_harmless_probe_case_passes(body):
+    assert check_source(_probe(body)) == []
+
+
+@pytest.mark.parametrize("body", [
+    "len = 1",
+    "del len",
+    "for sum in history:\n    pass",
+    "y = [list for list in history]",
+    "y = (min := 1)",
+    "max += 1",
+    "y = lambda type: 0",
+])
+def test_binding_a_builtin_name_is_refused(body):
+    assert "banned_builtin" in _rules(_probe(body))
+
+
+@pytest.mark.parametrize("source", [
+    "import numpy as list\n" + CLEAN,
+    "from typing import Any as id\n" + CLEAN,
+    CLEAN.replace("def on_bar(self, history, params)", "def on_bar(self, history, max)"),
+    CLEAN.replace("    def on_bar", "    def print(self):\n        return None\n\n    def on_bar"),
+])
+def test_shadowing_a_builtin_by_definition_or_import_is_refused(source):
+    assert "banned_builtin" in _rules(source)

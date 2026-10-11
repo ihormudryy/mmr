@@ -6,13 +6,14 @@ rule; the caller maps it to AUTHORED_STATIC_REJECTED.
 from __future__ import annotations
 
 import ast
+import builtins
 import re
 import threading
 import warnings
 from dataclasses import dataclass
 
 from trader.authored.allowed_api import (
-    ALLOWED_FROM_IMPORT_NAMES, ALLOWED_FROM_IMPORTS, ALLOWED_IMPORTS, ALLOWED_MODULE_ATTRIBUTES,
+    ALLOWED_BUILTINS, ALLOWED_FROM_IMPORT_NAMES, ALLOWED_FROM_IMPORTS, ALLOWED_IMPORTS, ALLOWED_MODULE_ATTRIBUTES,
     DENIED_CHAIN_NAMES, DENIED_CHAIN_PREFIXES,
 )
 
@@ -22,6 +23,7 @@ API_MODULE = "trader.authored.api"
 # Names whose meaning the trader relies on; the file may import them, never rebind them.
 _PROTECTED_NAMES = frozenset({BASE_CLASS, "Decision"})
 _DATA_MODULES = frozenset(ALLOWED_MODULE_ATTRIBUTES)
+_BUILTIN_NAMES = frozenset(dir(builtins))
 
 BANNED_NAMES = frozenset({
     "eval", "exec", "compile", "open", "__import__", "globals", "locals",
@@ -76,7 +78,7 @@ class _Checker(ast.NodeVisitor):
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
             self._check_alias(node, alias)
-            self._check_not_protected(node, alias.asname or alias.name)
+            self._check_binding(node, alias.asname or alias.name.split(".")[0])
             if alias.name not in ALLOWED_IMPORTS or "." in alias.name:
                 self.add("import_not_allowed", node, f"import {alias.name}")
                 continue
@@ -106,19 +108,31 @@ class _Checker(ast.NodeVisitor):
             self._check_identifier(node, name)
 
     def _check_api_alias(self, node: ast.AST, module: str, alias: ast.alias) -> None:
-        imports_itself = module == API_MODULE and alias.asname in (None, alias.name)
+        bound_name = alias.asname or alias.name
+        imports_itself = module == API_MODULE and bound_name == alias.name
         if not imports_itself:
-            self._check_not_protected(node, alias.asname or alias.name)
+            self._check_not_protected(node, bound_name)
+        self._check_not_builtin(node, bound_name)
+
+    def _check_binding(self, node: ast.AST, bound_name: str) -> None:
+        self._check_not_protected(node, bound_name)
+        self._check_not_builtin(node, bound_name)
 
     def _check_not_protected(self, node: ast.AST, bound_name: str) -> None:
         if bound_name in _PROTECTED_NAMES:
             self.add("class_shape", node, f"{bound_name} re-bound")
 
+    def _check_not_builtin(self, node: ast.AST, bound_name: str) -> None:
+        if bound_name in _BUILTIN_NAMES:
+            self.add("banned_builtin", node, f"builtin {bound_name} re-bound")
+
     # --- names, attributes, strings -----------------------------------
     def visit_Name(self, node: ast.Name) -> None:
         self._check_identifier(node, node.id)
         if not isinstance(node.ctx, ast.Load):
-            self._check_not_protected(node, node.id)
+            self._check_binding(node, node.id)
+        elif node.id in _BUILTIN_NAMES and node.id not in ALLOWED_BUILTINS:
+            self.add("banned_builtin", node, f"builtin {node.id}")
         if node.id in self.module_aliases and not self._is_chain_root(node):
             self.add("module_alias_misuse", node, f"module alias {node.id} used outside a chain root")
         self.generic_visit(node)
@@ -169,6 +183,11 @@ class _Checker(ast.NodeVisitor):
         return isinstance(parent, ast.Attribute) and parent.value is name_node
 
     # --- banned statements --------------------------------------------
+    def visit_Match(self, node: ast.Match) -> None:
+        # Class patterns read attributes by keyword names that the AST holds as
+        # plain strings, out of reach of every attribute rule.
+        self.add("match_statement", node, "match statement")
+
     def visit_Global(self, node: ast.Global) -> None:
         self.add("banned_statement", node, "global")
 
@@ -200,19 +219,19 @@ class _Checker(ast.NodeVisitor):
 
     def visit_arg(self, node: ast.arg) -> None:
         self._check_identifier(node, node.arg)
-        self._check_not_protected(node, node.arg)
+        self._check_binding(node, node.arg)
         self.generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._check_identifier(node, node.name)
-        self._check_not_protected(node, node.name)
+        self._check_binding(node, node.name)
         if node.decorator_list:
             self.add("banned_statement", node, f"decorator on {node.name}")
         self.generic_visit(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self._check_identifier(node, node.name)
-        self._check_not_protected(node, node.name)
+        self._check_binding(node, node.name)
         if node.decorator_list:
             self.add("banned_statement", node, f"decorator on {node.name}")
         self.generic_visit(node)

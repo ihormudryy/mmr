@@ -7,7 +7,8 @@ import inspect
 import pytest
 
 from trader.authored.allowed_api import (
-    ALLOWED_FROM_IMPORT_NAMES, ALLOWED_FROM_IMPORTS, ALLOWED_IMPORTS, ALLOWED_MODULE_ATTRIBUTES, DENIED_CHAIN_NAMES,
+    ALLOWED_BUILTINS, ALLOWED_FROM_IMPORT_NAMES, ALLOWED_FROM_IMPORTS, ALLOWED_IMPORTS,
+    ALLOWED_MODULE_ATTRIBUTES, DENIED_CHAIN_NAMES,
     DENIED_CHAIN_PREFIXES,
 )
 
@@ -45,6 +46,20 @@ RULING_6_DENIED_NAMES = {"ctypes", "dump", "dumps", "loads", "frombuffer"}
 def test_deny_list_covers_every_spec_name_and_ruling():
     assert SPEC_7_2_DENIED_NAMES | RULING_6_DENIED_NAMES <= DENIED_CHAIN_NAMES
     assert {"ctypeslib", "pickle", "mro", "boxplot", "hist"} <= DENIED_CHAIN_NAMES
+
+
+def test_pandas_string_dispatch_methods_are_denied():
+    # They accept a method name, and a name built at runtime passes the literal rule.
+    assert {"apply", "agg", "aggregate", "transform", "applymap", "pipe"} <= DENIED_CHAIN_NAMES
+
+
+def test_builtins_are_a_small_allow_list_of_real_builtins():
+    import builtins
+    assert ALLOWED_BUILTINS == frozenset({
+        "abs", "all", "any", "bool", "dict", "enumerate", "float", "int", "isinstance",
+        "len", "list", "max", "min", "range", "reversed", "round", "set", "sorted", "str",
+        "sum", "tuple", "zip", "True", "False", "None"})
+    assert ALLOWED_BUILTINS <= set(dir(builtins))
 
 
 def test_prefixes_close_the_introspection_families():

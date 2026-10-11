@@ -5,6 +5,7 @@ imported data module (np.x, pd.x, math.x, statistics.x) must be in
 ALLOWED_MODULE_ATTRIBUTES[module]; nothing listed is a module (the walk test
 in tests/authored/test_allowed_api.py proves it on the shipped build).
 A from-import may bind only the names in ALLOWED_FROM_IMPORT_NAMES[module].
+A builtin may be named only if it is in ALLOWED_BUILTINS.
 DENIED_CHAIN_NAMES are refused anywhere in an attribute chain. The lists
 extend the spec's (Plan 1 ruling 6); they never narrow it.
 """
@@ -53,6 +54,14 @@ ALLOWED_MODULE_ATTRIBUTES: Mapping[str, frozenset[str]] = {
         "variance", "pvariance", "fmean", "quantiles"}),
 }
 
+# The only builtins an authored file may name. Every other name in dir(builtins)
+# (type, object, super, dir, iter, print, ...) is refused, and no builtin name may
+# be re-bound.
+ALLOWED_BUILTINS: frozenset[str] = frozenset({
+    "abs", "all", "any", "bool", "dict", "enumerate", "float", "int", "isinstance",
+    "len", "list", "max", "min", "range", "reversed", "round", "set", "sorted", "str",
+    "sum", "tuple", "zip", "True", "False", "None"})
+
 DENIED_CHAIN_NAMES: frozenset[str] = frozenset({
     # spec 7.2 deny-list of module and process names
     "os", "sys", "io", "common", "core", "compat", "api", "lib", "util",
@@ -61,7 +70,9 @@ DENIED_CHAIN_NAMES: frozenset[str] = frozenset({
     # Plan 1 ruling 6 additions
     "ctypeslib", "pickle", "ctypes", "dump", "dumps", "loads", "frombuffer",
     # reachable from allowed classes: class-chain walk and matplotlib entry points
-    "mro", "boxplot", "hist"})
+    "mro", "boxplot", "hist",
+    # pandas string dispatch: these take a method name, which can be built at runtime
+    "apply", "agg", "aggregate", "transform", "applymap", "pipe"})
 
 # Introspection attributes that Cython and Python objects expose without a leading
 # underscore (func_globals, func_code, gi_frame, tb_frame, ...). The checker must

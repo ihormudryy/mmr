@@ -9,6 +9,7 @@ import pytest
 from tests.automation.test_controller_epoch import Clock
 from tests.test_signal_proposer import _frame, _make_runtime
 from trader.data.duckdb_store import DuckDBConnection
+from trader.data.event_store import EventType
 from trader.data.strategy_signal_record import (
     RECORD_GENERATION, SOURCE_EVENT_ID, SignalCursorAhead, SignalEntry, StrategySignalRecord,
 )
@@ -109,6 +110,13 @@ def test_non_finite_probability_is_stored_as_null(record):
     assert record.read(0, 1).signals[0].to_json()["probability"] is None
 
 
+def test_the_record_says_which_signals_it_already_has(record):
+    held, absent = entry(1), entry(2)
+    record.append(held)
+    assert record.recorded_source_event_ids([held.source_event_id, absent.source_event_id]) == {held.source_event_id}
+    assert record.recorded_source_event_ids([]) == frozenset()
+
+
 @pytest.mark.parametrize("days", [0, 366, True, 7.0])
 def test_retention_days_are_checked(tmp_path, days):
     with pytest.raises(ValueError):
@@ -148,6 +156,9 @@ class FlakyRecord:
     def read(self, after_cursor, limit):
         return self.inner.read(after_cursor, limit)
 
+    def recorded_source_event_ids(self, source_event_ids):
+        return self.inner.recorded_source_event_ids(source_event_ids)
+
 
 def ticking_runtime(tmp_path, clock, strategy, *, fail_after_write):
     rt = _make_runtime(tmp_path)
@@ -180,16 +191,17 @@ def test_a_failed_append_is_retried_before_the_next_bar(tmp_path, installed_stra
     assert len(rt.event_store.events) == 2 and len(rt.zmq_messagebus_client.written) == 2
 
 
-def test_a_new_bar_waits_behind_a_failed_append(tmp_path, installed_strategy, clock):
+def test_a_new_bar_supersedes_a_signal_held_by_a_failed_append(tmp_path, installed_strategy, clock):   # issue #140
     rt, _ = ticking_runtime(tmp_path, clock, installed_strategy, fail_after_write=False)
     rt.signal_record.failures_left = 2
     rt._on_tick_for_strategy(installed_strategy, 4391)                      # 14:30 fails
     rt.current_frame = _frame(last_time="2026-10-07 14:31")
-    rt._on_tick_for_strategy(installed_strategy, 4391)                      # 14:30 fails again; 14:31 queued
+    rt._on_tick_for_strategy(installed_strategy, 4391)                      # 14:30 is STALE; 14:31 fails
     assert recorded(rt) == []
     rt._on_tick_for_strategy(installed_strategy, 4391)
-    assert recorded(rt) == [(1, "2026-10-07T14:30:00+00:00"), (2, "2026-10-07T14:31:00+00:00")]
-    assert len(rt.zmq_messagebus_client.written) == 2
+    assert recorded(rt) == [(1, "2026-10-07T14:31:00+00:00")]
+    assert len(rt.zmq_messagebus_client.written) == 1
+    assert [e.metadata["reason"] for e in rt.event_store.events if e.event_type == EventType.SIGNAL_GAP] == ["STALE"]
 
 
 def test_an_append_that_wrote_and_then_failed_is_not_duplicated(tmp_path, installed_strategy, clock):

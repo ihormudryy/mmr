@@ -6,10 +6,26 @@ signal whose strategy was disabled or unloaded after it fired is never dispatche
 the signal record feeds the AI controller, which may enter on it. It is written
 down as a ``SIGNAL_GAP`` event instead.
 
-The hold is bounded per (conId, strategy). Once full, each newer signal is dropped
-and counted; the count is written as one ``SIGNAL_GAP`` event as soon as any event
-can be written. A failing record logs one ERROR when the hold starts and one
-``SIGNAL_HOLD_FULL`` ERROR when it first drops a signal, not one per tick.
+A held signal is also never dispatched once it is ``STALE``: a newer bar of its
+(conId, bar size) has completed since the bar it was computed on. The runtime
+evaluates a strategy once per completed bar, so that newer bar has already
+superseded the signal (issue #140). The check reads the strategy's current frame,
+not the wall clock: a bar is the strategy's own clock. When the latest bar cannot
+be read, the signal stays held and is neither dispatched nor written down.
+
+An append that raised may still have committed the row (PR #78). Every gap row
+therefore says whether the signal record already holds the signal (``recorded``,
+or ``recorded_count`` for evicted signals); a recorded signal is visible to the AI
+intake, which judges it by its own age limit. When the record cannot be read, the
+signal stays held.
+
+The hold is bounded per (conId, strategy). Once full, the oldest held signal is
+evicted and counted, so the newest one (the only one that can still be current)
+is kept. The count is written as one ``SIGNAL_GAP`` event by the next retry that
+can write an event, and no held or newer signal acts before that gap is written,
+so the gap rows and the dispatches stay in signal-time order. A failing record logs one
+ERROR when the hold starts and one ``SIGNAL_HOLD_FULL`` ERROR when it first evicts
+a signal, not one per tick.
 
 Every dispatch, fresh or held, checks that its strategy may still act and then
 writes the record and runs its side effects under one lock. A disable or unload
@@ -34,6 +50,7 @@ MAX_HELD_SIGNALS = 8
 
 STRATEGY_DISABLED = 'STRATEGY_DISABLED'
 STRATEGY_UNLOADED = 'STRATEGY_UNLOADED'
+STALE = 'STALE'
 HOLD_FULL = 'HOLD_FULL'
 
 
@@ -49,6 +66,17 @@ class SignalGapWriteFailed(Exception):
     """A ``SIGNAL_GAP`` event could not be written; it is tried again on the next retry."""
 
 
+class LatestBarUnknown(Exception):
+    """The strategy's latest completed bar could not be read, so a held signal stays held."""
+
+
+class RecordLookupFailed(Exception):
+    """The signal record could not say whether a signal has a row, so its gap is not written yet."""
+
+
+_NOT_SETTLED = (SignalRecordWriteFailed, SignalGapWriteFailed, LatestBarUnknown, RecordLookupFailed)
+
+
 @dataclass
 class HeldSignal:
     strategy: Any
@@ -58,10 +86,20 @@ class HeldSignal:
     disables_when_held: int
     # Once set the signal is never dispatched, only written down as a gap.
     block_reason: Optional[str] = None
+    # The newer completed bar that made the signal STALE.
+    superseded_by: Optional[dt.datetime] = None
 
     @property
     def signal_time(self) -> dt.datetime:
         return completed_bar_time(self.frame)
+
+    @property
+    def action(self) -> str:
+        return str(self.signal.action)
+
+    @property
+    def source_event_id(self) -> str:
+        return source_event_id_for(self.strategy.name, self.conid, self.action, self.signal_time)
 
 
 @dataclass
@@ -69,6 +107,7 @@ class _DroppedSignals:
     count: int
     first_signal_time: dt.datetime
     last_signal_time: dt.datetime
+    source_event_ids: List[str]
 
 
 @dataclass
@@ -86,10 +125,14 @@ class SignalHold:
 
     def __init__(self, *, dispatch: Callable[[HeldSignal], None],
                  block_reason: Callable[[Any], Optional[str]],
+                 latest_bar_time: Callable[[HeldSignal], Optional[dt.datetime]],
+                 recorded_ids: Callable[[List[str]], frozenset],
                  write_gap: Callable[[str, int, dict], None],
                  capacity: int = MAX_HELD_SIGNALS):
         self._dispatch = dispatch            # raises SignalRecordWriteFailed when the record write failed
         self._block_reason = block_reason    # why a strategy may no longer act, or None
+        self._latest_bar_time = latest_bar_time   # newest completed bar of the signal's (conId, bar size), or None
+        self._recorded_ids = recorded_ids    # which source_event_ids the signal record already holds
         self._write_gap = write_gap
         self._capacity = capacity
         self._holds: Dict[tuple, _Hold] = {}
@@ -113,16 +156,16 @@ class SignalHold:
         return len(hold.signals) if hold else 0
 
     def dispatch(self, key: tuple, strategy: Any, signal: Any, conid: int, frame: pd.DataFrame) -> None:
-        """Dispatch a new signal now, or queue it behind the held ones so the record stays in signal order."""
+        """Dispatch a new signal now, or queue it behind the held (or evicted, not yet written) ones."""
         held = HeldSignal(strategy, signal, conid, frame, self._disables.get(strategy.name, 0))
         hold = self._holds.get(key)
-        if hold is not None and hold.signals:
+        if hold is not None:
             self._enqueue(key, hold, held)
             return
         try:
             self._settle(held)
-        except (SignalRecordWriteFailed, SignalGapWriteFailed) as ex:
-            logging.error('signal of %s conId %s could not be written; holding its signals (at most %d) and '
+        except _NOT_SETTLED as ex:
+            logging.error('signal of %s conId %s could not be settled; holding its signals (at most %d) and '
                           'retrying on each tick and reconcile: %s', key[1], key[0], self._capacity, ex)
             self._holds.setdefault(key, _Hold()).signals.append(held)
 
@@ -130,8 +173,9 @@ class SignalHold:
         hold = self._holds.get(key)
         if hold is None:
             return
+        if not self._flush_dropped(key, hold):
+            return                                  # the evicted signals are older: nothing acts before their gap
         self._settle_in_order(key, hold)
-        self._flush_dropped(key, hold)
         if not hold.signals and hold.dropped is None:
             del self._holds[key]
             logging.warning('signal hold for %s conId %s is clear', key[1], key[0])
@@ -141,23 +185,26 @@ class SignalHold:
             self.retry(key)
 
     def _enqueue(self, key: tuple, hold: _Hold, held: HeldSignal) -> None:
-        if len(hold.signals) < self._capacity:
-            hold.signals.append(held)
-            return
-        # Full: keep the oldest held signals, so the dropped ones are one contiguous run after them.
-        hold.dropped = _add_dropped(hold.dropped, held.signal_time)
-        if not hold.full_alarm_raised:
-            hold.full_alarm_raised = True
-            logging.error('SIGNAL_HOLD_FULL: %d signals of %s conId %s wait for the signal record; newer signals '
-                          'are dropped and written as one SIGNAL_GAP event once any event can be written',
-                          len(hold.signals), key[1], key[0])
-        self._flush_dropped(key, hold)
+        """Queue behind the held signals; when full, evict the oldest, which a newer bar has already superseded.
+
+        The evicted signals form one contiguous run before the held ones. They are not written here: the
+        retry that ran just before on this tick could not settle them, or the hold would be empty.
+        """
+        if len(hold.signals) >= self._capacity:
+            evicted = hold.signals.pop(0)
+            hold.dropped = _add_dropped(hold.dropped, evicted)
+            if not hold.full_alarm_raised:
+                hold.full_alarm_raised = True
+                logging.error('SIGNAL_HOLD_FULL: %d signals of %s conId %s wait for the signal record; the oldest '
+                              'are evicted and written as one SIGNAL_GAP event once any event can be written',
+                              len(hold.signals) + 1, key[1], key[0])
+        hold.signals.append(held)
 
     def _settle_in_order(self, key: tuple, hold: _Hold) -> None:
         while hold.signals:
             try:
                 self._settle(hold.signals[0])
-            except (SignalRecordWriteFailed, SignalGapWriteFailed) as ex:
+            except _NOT_SETTLED as ex:
                 logging.debug('held signal of %s conId %s still not settled: %s', key[1], key[0], ex)
                 return
             hold.signals.pop(0)
@@ -173,34 +220,61 @@ class SignalHold:
 
     def _write_blocked_gap(self, held: HeldSignal) -> None:
         signal_time = held.signal_time
-        action = str(held.signal.action)
-        self._write(held.strategy.name, held.conid, {
-            'reason': held.block_reason, 'action': action, 'signal_time': signal_time.isoformat(),
-            'source_event_id': source_event_id_for(held.strategy.name, held.conid, action, signal_time)})
-        logging.warning('%s signal of %s conId %s at %s was not dispatched (%s); written as SIGNAL_GAP',
-                        action, held.strategy.name, held.conid, signal_time.isoformat(), held.block_reason)
+        source_event_id = held.source_event_id
+        recorded = source_event_id in self._recorded([source_event_id])
+        metadata = {'reason': held.block_reason, 'action': held.action, 'signal_time': signal_time.isoformat(),
+                    'source_event_id': source_event_id, 'recorded': recorded}
+        if held.superseded_by is not None:
+            metadata['latest_bar_time'] = held.superseded_by.isoformat()
+        self._write(held.strategy.name, held.conid, metadata)
+        if recorded:
+            logging.warning('%s signal of %s conId %s at %s was already recorded and is visible to the AI intake, '
+                            'but was not published or proposed (%s); written as SIGNAL_GAP',
+                            held.action, held.strategy.name, held.conid, signal_time.isoformat(), held.block_reason)
+        else:
+            logging.warning('%s signal of %s conId %s at %s was not dispatched (%s); written as SIGNAL_GAP',
+                            held.action, held.strategy.name, held.conid, signal_time.isoformat(), held.block_reason)
+
+    def _recorded(self, source_event_ids: List[str]) -> frozenset:
+        try:
+            return frozenset(self._recorded_ids(source_event_ids))
+        except Exception as ex:
+            raise RecordLookupFailed(str(ex)) from ex
 
     def _why_blocked(self, held: HeldSignal) -> Optional[str]:
         if self._disables.get(held.strategy.name, 0) != held.disables_when_held:
             return STRATEGY_DISABLED
-        return self._block_reason(held.strategy)
+        return self._block_reason(held.strategy) or self._staleness(held)
 
-    def _flush_dropped(self, key: tuple, hold: _Hold) -> None:
+    def _staleness(self, held: HeldSignal) -> Optional[str]:
+        latest = self._latest_bar_time(held)
+        if latest is None:
+            raise LatestBarUnknown(f'no completed bar for conId {held.conid} {held.strategy.bar_size}')
+        if latest <= held.signal_time:
+            return None
+        held.superseded_by = latest
+        return STALE
+
+    def _flush_dropped(self, key: tuple, hold: _Hold) -> bool:
+        """Write the evicted signals as one gap; False while it is not written."""
         dropped = hold.dropped
         if dropped is None:
-            return
+            return True
         try:
+            recorded = self._recorded(dropped.source_event_ids)
             self._write(key[1], key[0], {
                 'reason': HOLD_FULL, 'count': dropped.count,
                 'first_signal_time': dropped.first_signal_time.isoformat(),
-                'last_signal_time': dropped.last_signal_time.isoformat()})
-        except SignalGapWriteFailed as ex:
+                'last_signal_time': dropped.last_signal_time.isoformat(),
+                'recorded_count': len(recorded)})
+        except (SignalGapWriteFailed, RecordLookupFailed) as ex:
             logging.debug('SIGNAL_GAP for %s conId %s not written yet: %s', key[1], key[0], ex)
-            return
+            return False
         hold.dropped = None
-        logging.warning('%d signals of %s conId %s from %s to %s were dropped by a full hold; written as SIGNAL_GAP',
+        logging.warning('%d signals of %s conId %s from %s to %s were evicted by a full hold; written as SIGNAL_GAP',
                         dropped.count, key[1], key[0], dropped.first_signal_time.isoformat(),
                         dropped.last_signal_time.isoformat())
+        return True
 
     def _write(self, strategy_name: str, conid: int, metadata: dict) -> None:
         try:
@@ -209,7 +283,8 @@ class SignalHold:
             raise SignalGapWriteFailed(str(ex)) from ex
 
 
-def _add_dropped(dropped: Optional[_DroppedSignals], signal_time: dt.datetime) -> _DroppedSignals:
+def _add_dropped(dropped: Optional[_DroppedSignals], evicted: HeldSignal) -> _DroppedSignals:
     if dropped is None:
-        return _DroppedSignals(1, signal_time, signal_time)
-    return _DroppedSignals(dropped.count + 1, dropped.first_signal_time, signal_time)
+        return _DroppedSignals(1, evicted.signal_time, evicted.signal_time, [evicted.source_event_id])
+    return _DroppedSignals(dropped.count + 1, dropped.first_signal_time, evicted.signal_time,
+                           dropped.source_event_ids + [evicted.source_event_id])

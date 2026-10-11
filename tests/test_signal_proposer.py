@@ -317,6 +317,9 @@ class _RecordingSignalRecord:
         self.entries.append(entry)
         return len(self.entries)
 
+    def recorded_source_event_ids(self, source_event_ids):
+        return frozenset(e.source_event_id for e in self.entries) & frozenset(source_event_ids)
+
 
 def _make_runtime(tmp_path, paper_trading=True) -> StrategyRuntime:
     rt = StrategyRuntime.__new__(StrategyRuntime)  # skip __init__

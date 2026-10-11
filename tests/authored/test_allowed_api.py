@@ -103,8 +103,9 @@ def _is_denied(name: str) -> bool:
 
 
 def _is_module_globals(value: object) -> bool:
+    # getattr, not vars(): a loader may leave an entry without __dict__ in sys.modules.
     return isinstance(value, dict) and any(
-        value is vars(module) for module in list(sys.modules.values()) if module is not None)
+        value is getattr(module, "__dict__", None) for module in list(sys.modules.values()))
 
 
 def _reaches_the_interpreter(value: object) -> bool:

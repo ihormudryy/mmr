@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from trader.authored import static_check
 from trader.authored.static_check import (
     AuthoredStaticRejected, check_source, require_clean,
 )
@@ -53,6 +54,12 @@ def test_an_import_outside_the_allow_list_is_refused():
 def test_a_plain_import_of_a_from_import_only_module_is_refused(module):
     # typing.operator.attrgetter reaches os.kill; these modules are from-import only.
     assert "import_not_allowed" in _rules(f"import {module}\n" + CLEAN)
+
+
+def test_a_listed_import_without_an_attribute_list_is_refused(monkeypatch):
+    # Fail closed: listing a module in ALLOWED_IMPORTS alone never leaves its attributes unchecked.
+    monkeypatch.setattr(static_check, "ALLOWED_IMPORTS", static_check.ALLOWED_IMPORTS | {"typing"})
+    assert "import_not_allowed" in _rules("import typing\n" + CLEAN)
 
 
 def test_abc_register_on_the_base_class_is_refused():

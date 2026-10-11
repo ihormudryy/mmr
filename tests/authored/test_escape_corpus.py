@@ -35,6 +35,7 @@ EXPECTED_RULE: dict[str, str | None] = {
     "escape_df_query": "io_attribute",
     "escape_fork_bomb": "module_attribute_not_allowed",
     "escape_format_globals": "banned_name",
+    "escape_generator_frame": "banned_name",
     "escape_import_os": "import_not_allowed",
     "escape_importlib_string": "banned_builtin",
     "escape_kill_other_child": "module_attribute_not_allowed",
@@ -53,6 +54,7 @@ EXPECTED_RULE: dict[str, str | None] = {
     "escape_trystar": "node_type",
     "escape_type_builtin": "banned_builtin",
     "escape_type_params": "banned_statement",
+    "escape_typing_operator_chain": "import_not_allowed",
     "escape_write_outside_tmpfs": "io_attribute",
 }
 RESOURCE_ATTACK_MARKER = {

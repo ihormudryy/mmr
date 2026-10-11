@@ -1,10 +1,12 @@
 """The static checker's allow-lists and deny-list, as data (spec 7.2).
 
-An authored file may import only ALLOWED_IMPORTS. An attribute read off an
-imported data module (np.x, pd.x, math.x, statistics.x) must be in
+`import X` is allowed only for the data modules in ALLOWED_IMPORTS, and every
+attribute read off one (np.x, pd.x, math.x, statistics.x) must be in
 ALLOWED_MODULE_ATTRIBUTES[module]; nothing listed is a module (the walk test
 in tests/authored/test_allowed_api.py proves it on the shipped build).
-A from-import may bind only the names in ALLOWED_FROM_IMPORT_NAMES[module].
+typing, dataclasses and trader.authored.api come only by from-import, and a
+from-import may bind only the names in ALLOWED_FROM_IMPORT_NAMES[module]
+(Plan 1 rulings 5 and 11).
 A builtin may be named only if it is in ALLOWED_BUILTINS, and every AST node
 must be one of ALLOWED_AST_NODES.
 DENIED_CHAIN_NAMES are refused anywhere in an attribute chain. The lists
@@ -14,9 +16,11 @@ from __future__ import annotations
 
 from typing import Mapping
 
+# Modules an authored file may import. typing and dataclasses are not here: they
+# come only by from-import. trader.authored.api is here and in ALLOWED_FROM_IMPORTS,
+# but a dotted `import` is always refused, so it too comes only by from-import.
 ALLOWED_IMPORTS: frozenset[str] = frozenset(
-    {"numpy", "pandas", "math", "statistics", "dataclasses", "typing",
-     "trader.authored.api"})
+    {"numpy", "pandas", "math", "statistics", "trader.authored.api"})
 
 ALLOWED_FROM_IMPORTS: frozenset[str] = frozenset(
     {"typing", "dataclasses", "trader.authored.api"})
@@ -90,8 +94,9 @@ DENIED_CHAIN_NAMES: frozenset[str] = frozenset({
     "getppid", "system", "popen", "plot", "style", "sql",
     # Plan 1 ruling 6 additions
     "ctypeslib", "pickle", "ctypes", "dump", "dumps", "loads", "frombuffer",
-    # reachable from allowed classes: class-chain walk and matplotlib entry points
-    "mro", "boxplot", "hist",
+    # reachable from allowed classes: class-chain walk, ABCMeta.register on
+    # AuthoredStrategy, and matplotlib entry points
+    "mro", "register", "boxplot", "hist",
     # pandas string dispatch: these take a method name, which can be built at runtime
     "apply", "agg", "aggregate", "transform", "applymap", "pipe"})
 

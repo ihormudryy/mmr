@@ -49,6 +49,17 @@ def test_an_import_outside_the_allow_list_is_refused():
     assert "import_not_allowed" in _rules("import os\n" + CLEAN)
 
 
+@pytest.mark.parametrize("module", ["typing", "dataclasses"])
+def test_a_plain_import_of_a_from_import_only_module_is_refused(module):
+    # typing.operator.attrgetter reaches os.kill; these modules are from-import only.
+    assert "import_not_allowed" in _rules(f"import {module}\n" + CLEAN)
+
+
+def test_abc_register_on_the_base_class_is_refused():
+    body = CLEAN.replace("return None", "AuthoredStrategy.register(Decision)\n        return None")
+    assert "banned_name" in _rules(body)
+
+
 def test_a_from_import_of_a_data_module_is_refused():
     assert "from_import_not_allowed" in _rules("from numpy import mean\n" + CLEAN)
 

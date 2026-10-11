@@ -22,7 +22,6 @@ BASE_CLASS = "AuthoredStrategy"
 API_MODULE = "trader.authored.api"
 # Names whose meaning the trader relies on; the file may import them, never rebind them.
 _PROTECTED_NAMES = frozenset({BASE_CLASS, "Decision"})
-_DATA_MODULES = frozenset(ALLOWED_MODULE_ATTRIBUTES)
 _BUILTIN_NAMES = frozenset(dir(builtins))
 
 BANNED_NAMES = frozenset({
@@ -46,6 +45,11 @@ class AuthoredStaticRejected(Exception):
     def __init__(self, violations: tuple[StaticViolation, ...]):
         self.violations = violations
         super().__init__(f"{len(violations)} static violation(s)")
+
+
+def _is_plain_importable(module: str) -> bool:
+    # A module without an attribute allow-list would leave its attributes unchecked.
+    return module in ALLOWED_IMPORTS and module in ALLOWED_MODULE_ATTRIBUTES and "." not in module
 
 
 def _is_io_attribute(name: str) -> bool:
@@ -79,11 +83,10 @@ class _Checker(ast.NodeVisitor):
         for alias in node.names:
             self._check_alias(node, alias)
             self._check_binding(node, alias.asname or alias.name.split(".")[0])
-            if alias.name not in ALLOWED_IMPORTS or "." in alias.name:
+            if not _is_plain_importable(alias.name):
                 self.add("import_not_allowed", node, f"import {alias.name}")
                 continue
-            if alias.name in _DATA_MODULES:
-                self.module_aliases[alias.asname or alias.name] = alias.name
+            self.module_aliases[alias.asname or alias.name] = alias.name
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:

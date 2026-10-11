@@ -7,8 +7,9 @@ import time
 
 import pytest
 
+import scripts.sp3_benchmark as sp3_benchmark
 from scripts.sp3_benchmark import (
-    BenchmarkTiming, extrapolate, parse_signal, ruling_text, stream_evaluation,
+    BenchmarkTiming, extrapolate, in_process_baseline, parse_signal, ruling_text, stream_evaluation,
     synthetic_session,
 )
 
@@ -72,25 +73,39 @@ def test_parse_signal_rejects_a_reply_that_does_not_match_the_bar(bad):
         parse_signal(_signal(**bad), session=0, t="T")
 
 
+@pytest.fixture
+def started_processes(monkeypatch):
+    """Every Process the benchmark creates, so a test checks its own children only."""
+    processes: list[multiprocessing.Process] = []
+
+    def recording_process(*args, **kwargs):
+        process = multiprocessing.Process(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(sp3_benchmark, "Process", recording_process)
+    return processes
+
+
 @pytest.mark.parametrize("module_name, class_name, params", [
     ("tests.authored.fixtures.orb_authored", "NoSuchStrategy", PARAMS),
     ("tests.authored.fixtures.no_such_module", "OpeningRangeBreakout", PARAMS),
     ("tests.authored.fixtures.orb_authored", "OpeningRangeBreakout", {}),
 ])
-def test_a_dying_child_fails_fast_and_leaves_no_process(module_name, class_name, params):
+def test_a_dying_child_fails_fast_and_leaves_no_process(module_name, class_name, params, started_processes):
     frame = synthetic_session(conid_seed=1, sessions=1, bars_per_session=60)
     started = time.monotonic()
     with pytest.raises(RuntimeError, match="child"):
         stream_evaluation(module_name, class_name, [frame], lookback=420, params=params)
     assert time.monotonic() - started < 10
-    assert multiprocessing.active_children() == []
+    assert len(started_processes) == 1 and not started_processes[0].is_alive()
 
 
-def test_a_normal_run_leaves_no_child_process():
+def test_a_normal_run_leaves_no_child_process(started_processes):
     frame = synthetic_session(conid_seed=1, sessions=1, bars_per_session=60)
     stream_evaluation("tests.authored.fixtures.orb_authored", "OpeningRangeBreakout",
                       [frame], lookback=420, params=PARAMS)
-    assert multiprocessing.active_children() == []
+    assert len(started_processes) == 1 and not started_processes[0].is_alive()
 
 
 def _estimate(per_bar_ms, **overrides):
@@ -133,3 +148,28 @@ def test_ruling_text_keeps_the_period_when_under_four_hours():
     estimate = _estimate(0.01)
     assert not estimate["over_four_hours"]
     assert "keep" in ruling_text(estimate) and "690" in ruling_text(estimate)
+
+
+def test_ruling_text_names_the_combined_upper_bound_not_a_streamed_cost():
+    text = ruling_text(_estimate(0.9))
+    assert "ms/bar streamed" not in text
+    assert "upper-bound combined cost" in text
+
+
+def test_main_labels_the_combined_line_as_an_upper_bound(monkeypatch, capsys):
+    monkeypatch.setattr(sp3_benchmark, "stream_evaluation",
+                        lambda *args, **kwargs: (BenchmarkTiming(bars=10, wall_seconds=0.005), ["BUY"]))
+    monkeypatch.setattr(sp3_benchmark, "in_process_baseline",
+                        lambda frames: (BenchmarkTiming(bars=10, wall_seconds=0.003), 1))
+    assert sp3_benchmark.main(["--sessions", "1", "--bars-per-session", "10", "--runs", "1"]) == 0
+    output = capsys.readouterr().out
+    assert "ms/bar streamed" not in output
+    assert "upper-bound combined cost per bar" in output
+
+
+def test_the_in_process_baseline_removes_its_database_folder(tmp_path, monkeypatch):
+    monkeypatch.setattr(sp3_benchmark.tempfile, "tempdir", str(tmp_path))
+    frame = synthetic_session(conid_seed=1, sessions=1, bars_per_session=60)
+    timing, _ = in_process_baseline([frame])
+    assert timing.bars == 60
+    assert list(tmp_path.iterdir()) == []

@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, importlib, json, logging, sys, time
+
+import argparse
+import importlib
+import json
+import logging
+import os
+import sys
+import tempfile
+import time
 from dataclasses import dataclass
 from multiprocessing import Pipe, Process
 from pathlib import Path
@@ -8,7 +16,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+# Run as `python scripts/sp3_benchmark.py`: the repo root must be importable first.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from trader.data.data_access import TickStorage  # noqa: E402
+from trader.data.duckdb_store import DuckDBDataStore  # noqa: E402
+from trader.objects import BarSize  # noqa: E402
+from trader.simulation.backtester import BacktestConfig, Backtester  # noqa: E402
 
 COST_MULTIPLIERS = 3
 NEIGHBOURS_PER_TUNABLE = 2
@@ -170,22 +184,19 @@ def stream_evaluation(module_name, class_name, frames, *, lookback, params):
 
 
 def in_process_baseline(frames, conid=4391):
-    from trader.data.data_access import TickStorage
-    from trader.data.duckdb_store import DuckDBDataStore
-    from trader.objects import BarSize
-    from trader.simulation.backtester import Backtester, BacktestConfig
-    import tempfile, os
     for name in QUIET_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
-    path = os.path.join(tempfile.mkdtemp(), "bench.duckdb")
-    combined = pd.concat(frames); combined.index.name = "date"
-    DuckDBDataStore(path).write(str(conid), combined)
+    combined = pd.concat(frames)
+    combined.index.name = "date"
     config = BacktestConfig(start_date=combined.index[0].to_pydatetime(),
                             end_date=combined.index[-1].to_pydatetime(), bar_size=BarSize.Mins1)
-    started = time.perf_counter()
-    result = Backtester(TickStorage(path), config).run_from_module(
-        "strategies/opening_range_breakout.py", "OpeningRangeBreakout", [conid])
-    elapsed = time.perf_counter() - started
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "bench.duckdb")
+        DuckDBDataStore(path).write(str(conid), combined)
+        started = time.perf_counter()
+        result = Backtester(TickStorage(path), config).run_from_module(
+            "strategies/opening_range_breakout.py", "OpeningRangeBreakout", [conid])
+        elapsed = time.perf_counter() - started
     return BenchmarkTiming(bars=len(combined), wall_seconds=elapsed), result.total_trades
 
 
@@ -264,7 +275,8 @@ def ruling_text(estimate):
             f"{estimate['tunables']} tunables, {NEIGHBOURS_PER_TUNABLE} neighbours each, "
             f"{estimate['folds']} folds, embargo {estimate['embargo_sessions']}, "
             f"+ {estimate['holdout_sessions']}-session holdout) is estimated at "
-            f"{hours:.2f} h at {estimate['per_bar_ms']:.4f} ms/bar streamed. "
+            f"{hours:.2f} h at an upper-bound combined cost of {estimate['per_bar_ms']:.4f} ms/bar "
+            f"(streamed + in-process backtest, strategy time counted twice). "
             f"Since {hours:.2f} h is {'over' if over else 'under'} 4 h: {_ruling_decision(estimate)}.")
 
 
@@ -290,8 +302,8 @@ def main(argv=None):
     estimate = extrapolate(per_bar_ms=combined, **FULL_SCALE)
     print(f"streamed per-bar (median of {args.runs}): {per_bar_ms:.4f} ms ({fired} signals fired)")
     print(f"in-process backtest per-bar: {base.per_bar_ms:.4f} ms ({trades} trades)")
-    print(f"combined per-bar (streamed + backtester loop): {combined:.4f} ms "
-          "(upper bound: strategy time counted twice)")
+    print(f"upper-bound combined cost per bar (streamed + in-process backtest, "
+          f"strategy time counted twice): {combined:.4f} ms")
     print(f"total bar sends (full scale): {estimate['total_bar_sends']:,}")
     print(f"estimated full evaluation: {estimate['hours']:.2f} h")
     print(ruling_text(estimate))

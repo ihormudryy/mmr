@@ -14,7 +14,7 @@ after the full SP2c gate (evaluation, holdout, Jev DEPLOY, attestation,
 registration). SP3 succeeds when an AI-written strategy reaches DEPLOY and its
 forward paper P&L beats the catalogue strategies on the same symbols.
 
-## 2. Owner decisions (2026-10-11, do not re-argue)
+## 2. Owner decisions (2026-10-11; reviewers may challenge any of them)
 
 - **What SP3 proves:** AI strategies from the AI's own ideas, compared with the
   catalogue on forward paper P&L ("beat the catalogue").

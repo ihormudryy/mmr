@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
+import time
 
 import pytest
 
@@ -68,3 +70,66 @@ def test_parse_signal_accepts_the_full_signal_shape():
 def test_parse_signal_rejects_a_reply_that_does_not_match_the_bar(bad):
     with pytest.raises(ValueError, match="bad SIGNAL reply"):
         parse_signal(_signal(**bad), session=0, t="T")
+
+
+@pytest.mark.parametrize("module_name, class_name, params", [
+    ("tests.authored.fixtures.orb_authored", "NoSuchStrategy", PARAMS),
+    ("tests.authored.fixtures.no_such_module", "OpeningRangeBreakout", PARAMS),
+    ("tests.authored.fixtures.orb_authored", "OpeningRangeBreakout", {}),
+])
+def test_a_dying_child_fails_fast_and_leaves_no_process(module_name, class_name, params):
+    frame = synthetic_session(conid_seed=1, sessions=1, bars_per_session=60)
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="child"):
+        stream_evaluation(module_name, class_name, [frame], lookback=420, params=params)
+    assert time.monotonic() - started < 10
+    assert multiprocessing.active_children() == []
+
+
+def test_a_normal_run_leaves_no_child_process():
+    frame = synthetic_session(conid_seed=1, sessions=1, bars_per_session=60)
+    stream_evaluation("tests.authored.fixtures.orb_authored", "OpeningRangeBreakout",
+                      [frame], lookback=420, params=PARAMS)
+    assert multiprocessing.active_children() == []
+
+
+def _estimate(per_bar_ms, **overrides):
+    arguments = dict(per_bar_ms=per_bar_ms, conids=10, period_sessions=690, holdout_sessions=90,
+                     cohort_points=3, tunables=2, bars_per_session=390, folds=6)
+    return extrapolate(**{**arguments, **overrides})
+
+
+def test_ruling_text_prints_the_actual_inputs():
+    text = ruling_text(_estimate(0.2, conids=7, period_sessions=500, holdout_sessions=60,
+                                 cohort_points=4, tunables=3, folds=5, embargo_sessions=9))
+    for expected in ("7 conids", "500 sessions", "4 cohort points", "3 tunables",
+                     "5 folds", "embargo 9", "60-session holdout"):
+        assert expected in text
+
+
+def test_extrapolate_and_extrapolate_seconds_agree():
+    from scripts.sp3_benchmark import extrapolate_seconds
+    estimate = _estimate(0.37)
+    assert estimate["seconds"] == pytest.approx(extrapolate_seconds(
+        per_bar_ms=0.37, conids=10, period_sessions=690, holdout_sessions=90,
+        cohort_points=3, tunables=2, bars_per_session=390, folds=6))
+
+
+def test_ruling_text_says_so_when_even_the_minimum_period_is_over_four_hours():
+    estimate = _estimate(50.0)
+    assert estimate["over_four_hours"] and not estimate["fits_four_hours_at_minimum"]
+    text = ruling_text(estimate)
+    assert "132" in text and "still over 4 h" in text and "N=132" not in text
+
+
+def test_ruling_text_proposes_a_shorter_period_when_one_fits():
+    estimate = _estimate(0.9)
+    assert estimate["over_four_hours"] and estimate["fits_four_hours_at_minimum"]
+    assert estimate["proposed_period_sessions"] < 690
+    assert f"N={estimate['proposed_period_sessions']}" in ruling_text(estimate)
+
+
+def test_ruling_text_keeps_the_period_when_under_four_hours():
+    estimate = _estimate(0.01)
+    assert not estimate["over_four_hours"]
+    assert "keep" in ruling_text(estimate) and "690" in ruling_text(estimate)

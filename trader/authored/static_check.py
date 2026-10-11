@@ -13,8 +13,8 @@ import warnings
 from dataclasses import dataclass
 
 from trader.authored.allowed_api import (
-    ALLOWED_BUILTINS, ALLOWED_FROM_IMPORT_NAMES, ALLOWED_FROM_IMPORTS, ALLOWED_IMPORTS, ALLOWED_MODULE_ATTRIBUTES,
-    DENIED_CHAIN_NAMES, DENIED_CHAIN_PREFIXES,
+    ALLOWED_AST_NODES, ALLOWED_BUILTINS, ALLOWED_FROM_IMPORT_NAMES, ALLOWED_FROM_IMPORTS,
+    ALLOWED_IMPORTS, ALLOWED_MODULE_ATTRIBUTES, DENIED_CHAIN_NAMES, DENIED_CHAIN_PREFIXES,
 )
 
 MAX_SOURCE_BYTES = 20_480
@@ -67,9 +67,10 @@ def _bad_string(text: str) -> bool:
 
 
 class _Checker(ast.NodeVisitor):
-    def __init__(self) -> None:
+    def __init__(self, bound_names: frozenset[str]) -> None:
         self.violations: list[StaticViolation] = []
         self.module_aliases: dict[str, str] = {}   # alias -> real module name
+        self.bound_names = bound_names
 
     def add(self, rule: str, node: ast.AST, detail: str) -> None:
         self.violations.append(StaticViolation(rule, getattr(node, "lineno", 0), detail))
@@ -133,6 +134,8 @@ class _Checker(ast.NodeVisitor):
             self._check_binding(node, node.id)
         elif node.id in _BUILTIN_NAMES and node.id not in ALLOWED_BUILTINS:
             self.add("banned_builtin", node, f"builtin {node.id}")
+        elif node.id not in ALLOWED_BUILTINS and node.id not in self.bound_names:
+            self.add("unknown_name", node, f"name {node.id} is never bound in the file")
         if node.id in self.module_aliases and not self._is_chain_root(node):
             self.add("module_alias_misuse", node, f"module alias {node.id} used outside a chain root")
         self.generic_visit(node)
@@ -225,22 +228,48 @@ class _Checker(ast.NodeVisitor):
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._check_identifier(node, node.name)
         self._check_binding(node, node.name)
-        if node.decorator_list:
-            self.add("banned_statement", node, f"decorator on {node.name}")
+        self._check_no_decorator_or_type_params(node)
         self.generic_visit(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self._check_identifier(node, node.name)
         self._check_binding(node, node.name)
+        self._check_no_decorator_or_type_params(node)
+        self.generic_visit(node)
+
+    def _check_no_decorator_or_type_params(self, node: ast.FunctionDef | ast.ClassDef) -> None:
         if node.decorator_list:
             self.add("banned_statement", node, f"decorator on {node.name}")
-        self.generic_visit(node)
+        # Type parameter names are plain strings, out of reach of the name rules.
+        if node.type_params:
+            self.add("banned_statement", node, f"type parameters on {node.name}")
 
 
 def _link_parents(tree: ast.AST) -> None:
     for parent in ast.walk(tree):
         for child in ast.iter_child_nodes(parent):
             child._parent = parent  # type: ignore[attr-defined]
+
+
+def _check_node_types(tree: ast.AST, checker: _Checker) -> None:
+    for node in ast.walk(tree):
+        if type(node).__name__ not in ALLOWED_AST_NODES:
+            checker.add("node_type", node, f"{type(node).__name__} is not allowed")
+
+
+def _bound_names(tree: ast.AST) -> frozenset[str]:
+    """Every name the file binds anywhere; scope is ignored on purpose (simpler, still closed)."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            names.add(node.id)
+        elif isinstance(node, ast.arg):
+            names.add(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.alias):
+            names.add(node.asname or node.name.split(".")[0])
+    return frozenset(names)
 
 
 def _imports_base_class(body: list[ast.stmt]) -> bool:
@@ -319,7 +348,8 @@ def check_source(source: str) -> list[StaticViolation]:
     except (ValueError, MemoryError, RecursionError) as error:
         return _unparseable(0, f"too complex to parse: {type(error).__name__}")
     _link_parents(tree)
-    checker = _Checker()
+    checker = _Checker(_bound_names(tree))
+    _check_node_types(tree, checker)
     _check_module_shape(tree, checker)
     try:
         checker.visit(tree)

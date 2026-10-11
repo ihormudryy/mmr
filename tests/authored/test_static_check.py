@@ -420,3 +420,101 @@ def test_binding_a_builtin_name_is_refused(body):
 ])
 def test_shadowing_a_builtin_by_definition_or_import_is_refused(source):
     assert "banned_builtin" in _rules(source)
+
+
+
+# --- fix round 2: node-type allow-list, type parameters, free names ------------
+
+@pytest.mark.parametrize("body", [
+    "try:\n    pass\nexcept* ValueError:\n    pass",
+    "global q",
+    "type X = int",
+    "type X[len] = int",
+    "with history as h:\n    pass",
+    "raise history",
+])
+def test_a_node_type_outside_the_allow_list_is_refused(body):
+    assert "node_type" in _rules(_probe(body))
+
+
+@pytest.mark.parametrize("definition", [
+    "    def helper[len](self):\n        return None\n",
+    "    def helper[__class__](self):\n        return None\n",
+    "    def helper[*shape](self):\n        return None\n",
+    "    def helper[**spec](self):\n        return None\n",
+])
+def test_type_parameters_on_a_function_are_refused(definition):
+    rules = _rules(CLEAN.replace("    def on_bar", definition + "\n    def on_bar"))
+    assert {"node_type", "banned_statement"} <= rules
+
+
+def test_type_parameters_on_the_class_are_refused():
+    rules = _rules(CLEAN.replace("class Good(AuthoredStrategy):", "class Good[list](AuthoredStrategy):"))
+    assert {"node_type", "banned_statement"} <= rules
+
+
+@pytest.mark.parametrize("body", [
+    "y = PythonFinalizationError",
+    "y = undefined_name + 1",
+    "y = \u1d3cpen",
+])
+def test_a_free_name_that_is_neither_bound_nor_an_allowed_builtin_is_refused(body):
+    assert "unknown_name" in _rules(_probe(body))
+
+
+PROBE2_HEAD = ("import numpy as np\nimport pandas as pd\nimport math\nimport statistics\n"
+               "from trader.authored.api import AuthoredStrategy, Decision\n\n\n"
+               "class S(AuthoredStrategy):\n    def on_bar(self, history, params):\n")
+
+# Controller probe round 2: None means the case passes.
+PROBE2_CASES = {
+    "rolling_apply_callable": ("y = history.close.rolling(5).apply(len)", "banned_name"),
+    "groupby_agg": ("y = history.groupby('close').agg('sum')", "banned_name"),
+    "resample_agg": ("y = history.resample('1D').agg('sum')", "banned_name"),
+    "series_map_str": ("y = history.close.map('{}'.upper)", None),
+    "str_accessor_cat": ("y = history.close.astype(str).str.cat()", None),
+    "isinstance_type_arg": ("y = isinstance(history, pd.DataFrame)", None),
+    "dict_items_iter": ("y = [k for k in dict(a=1).items()]", None),
+    "lambda_no_default": ("f = lambda v: v + 1", None),
+    "nested_def": ("def inner(v):\n    return v\ny = inner(1)", None),
+    "nested_class": ("class Inner:\n    pass", None),
+    "self_attr_store": ("self.state = 1", None),
+    "self_strategy_runtime": ("y = self.strategy_runtime", None),
+    "self_ctx": ("y = self.ctx", None),
+    "params_get": ("y = params.get('X')", None),
+    "np_vectorize": ("y = np.vectorize(len)", "module_attribute_not_allowed"),
+    "np_frompyfunc": ("y = np.frompyfunc(len, 1, 1)", "module_attribute_not_allowed"),
+    "np_array_tolist": ("y = np.asarray([1]).tolist()", None),
+    "np_array_tobytes": ("y = np.asarray([1]).tobytes()", None),
+    "np_array_view": ("y = np.asarray([1]).view()", None),
+    "df_to_dict": ("y = history.to_dict()", "io_attribute"),
+    "df_values": ("y = history.values", None),
+    "df_attrs": ("y = history.attrs", None),
+    "df_set_flags": ("y = history.set_flags()", None),
+    "series_name_assign": ("history.name = 'x'", None),
+    "math_prod": ("y = math.prod([1, 2])", "module_attribute_not_allowed"),
+    "statistics_mean": ("y = statistics.mean([1, 2])", None),
+    "yield_from": ("yield 1", "banned_statement"),
+    "global_stmt": ("global q", "banned_statement"),
+    "with_stmt": ("with open('x') as f:\n    pass", "node_type"),
+    "assert_stmt": ("assert True", None),
+    "raise_stmt": ("raise ValueError('x')", "node_type"),
+    "class_body_attr": ("y = self.LOOKBACK_BARS", None),
+    "unicode_name_nfkc_open": ("y = \u1d3cpen", "unknown_name"),
+    "starred_call": ("y = max(*[1, 2])", None),
+    "kwargs_dict": ("y = dict(**{'a': 1})", None),
+    "slice_step": ("y = history.close[::-1]", None),
+    "chained_cmp": ("y = 1 < 2 < 3", None),
+    "await_expr": ("y = await x", "banned_statement"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(PROBE2_CASES))
+def test_probe_round_two_verdicts(name):
+    body, rule = PROBE2_CASES[name]
+    lines = "".join("        " + line + "\n" for line in body.splitlines())
+    rules = _rules(PROBE2_HEAD + lines + "        return None\n")
+    if rule is None:
+        assert rules == set()
+    else:
+        assert rule in rules

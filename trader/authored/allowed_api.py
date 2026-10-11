@@ -5,7 +5,8 @@ imported data module (np.x, pd.x, math.x, statistics.x) must be in
 ALLOWED_MODULE_ATTRIBUTES[module]; nothing listed is a module (the walk test
 in tests/authored/test_allowed_api.py proves it on the shipped build).
 A from-import may bind only the names in ALLOWED_FROM_IMPORT_NAMES[module].
-A builtin may be named only if it is in ALLOWED_BUILTINS.
+A builtin may be named only if it is in ALLOWED_BUILTINS, and every AST node
+must be one of ALLOWED_AST_NODES.
 DENIED_CHAIN_NAMES are refused anywhere in an attribute chain. The lists
 extend the spec's (Plan 1 ruling 6); they never narrow it.
 """
@@ -61,6 +62,26 @@ ALLOWED_BUILTINS: frozenset[str] = frozenset({
     "abs", "all", "any", "bool", "dict", "enumerate", "float", "int", "isinstance",
     "len", "list", "max", "min", "range", "reversed", "round", "set", "sorted", "str",
     "sum", "tuple", "zip", "True", "False", "None"})
+
+# Every AST node in an authored file must have one of these type names. Anything
+# else (try, with, raise, match, async, yield, global, type parameters, and node
+# types added by a later Python) is refused, whatever the specific rules say.
+ALLOWED_AST_NODES: frozenset[str] = frozenset({
+    # structure and statements
+    "Module", "Import", "ImportFrom", "alias", "ClassDef", "FunctionDef",
+    "arguments", "arg", "Return", "Assign", "AnnAssign", "AugAssign", "Delete",
+    "If", "For", "While", "Break", "Continue", "Pass", "Expr", "Assert",
+    # expressions
+    "BoolOp", "BinOp", "UnaryOp", "Compare", "Call", "keyword", "IfExp",
+    "Attribute", "Subscript", "Slice", "Name", "Constant", "List", "Tuple",
+    "Dict", "Set", "ListComp", "SetComp", "DictComp", "GeneratorExp",
+    "comprehension", "NamedExpr", "Lambda", "Starred", "JoinedStr", "FormattedValue",
+    # contexts and operators
+    "Load", "Store", "Del", "And", "Or",
+    "Add", "Sub", "Mult", "MatMult", "Div", "Mod", "Pow", "LShift", "RShift",
+    "BitOr", "BitXor", "BitAnd", "FloorDiv",
+    "Invert", "Not", "UAdd", "USub",
+    "Eq", "NotEq", "Lt", "LtE", "Gt", "GtE", "Is", "IsNot", "In", "NotIn"})
 
 DENIED_CHAIN_NAMES: frozenset[str] = frozenset({
     # spec 7.2 deny-list of module and process names

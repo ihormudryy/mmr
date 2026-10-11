@@ -7,7 +7,7 @@ import inspect
 import pytest
 
 from trader.authored.allowed_api import (
-    ALLOWED_BUILTINS, ALLOWED_FROM_IMPORT_NAMES, ALLOWED_FROM_IMPORTS, ALLOWED_IMPORTS,
+    ALLOWED_AST_NODES, ALLOWED_BUILTINS, ALLOWED_FROM_IMPORT_NAMES, ALLOWED_FROM_IMPORTS, ALLOWED_IMPORTS,
     ALLOWED_MODULE_ATTRIBUTES, DENIED_CHAIN_NAMES,
     DENIED_CHAIN_PREFIXES,
 )
@@ -34,6 +34,19 @@ def test_every_from_import_module_has_a_name_list():
 def test_every_from_import_name_resolves_and_is_not_a_module(module_name, name):
     value = getattr(importlib.import_module(module_name), name)
     assert not inspect.ismodule(value), f"from {module_name} import {name} binds a module"
+
+
+def test_every_allowed_ast_node_is_a_real_node_type():
+    import ast
+    for name in ALLOWED_AST_NODES:
+        assert isinstance(getattr(ast, name, None), type) and issubclass(getattr(ast, name), ast.AST), name
+
+
+def test_the_ast_allow_list_leaves_out_control_flow_a_strategy_never_needs():
+    refused = {"Try", "TryStar", "ExceptHandler", "Raise", "With", "AsyncWith", "Match",
+               "Global", "Nonlocal", "Yield", "YieldFrom", "Await", "AsyncFunctionDef",
+               "AsyncFor", "TypeAlias", "TypeVar", "ParamSpec", "TypeVarTuple"}
+    assert not refused & ALLOWED_AST_NODES
 
 
 SPEC_7_2_DENIED_NAMES = {

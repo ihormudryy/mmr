@@ -267,3 +267,54 @@ def test_a_method_with_a_private_or_dunder_name_is_refused(definition):
 def test_a_parameter_with_a_dunder_name_is_refused():
     body = CLEAN.replace("def on_bar(self, history, params)", "def on_bar(self, history, params, __x=1)")
     assert "dunder_name" in _rules(body)
+
+
+# --- the base class must be the real AuthoredStrategy -------------------------
+
+MINIMAL_CLASS = "class Good(AuthoredStrategy):\n    def on_bar(self, history, params):\n        return None\n"
+
+
+@pytest.mark.parametrize("header", [
+    "AuthoredStrategy = object\n",
+    "from typing import Mapping as AuthoredStrategy\n",
+    "import numpy as AuthoredStrategy\n",
+    "from trader.authored.api import Decision as AuthoredStrategy\n",
+    "",
+])
+def test_a_base_not_imported_from_the_api_is_refused(header):
+    assert "class_shape" in _rules(header + MINIMAL_CLASS)
+
+
+@pytest.mark.parametrize("statement", [
+    "AuthoredStrategy = history",
+    "Decision = history",
+    "x = [1 for AuthoredStrategy in history]",
+])
+def test_rebinding_an_api_name_is_refused(statement):
+    assert "class_shape" in _rules(_with_statement(statement))
+
+
+def test_rebinding_an_api_name_as_a_parameter_is_refused():
+    body = CLEAN.replace("def on_bar(self, history, params)", "def on_bar(self, history, Decision)")
+    assert "class_shape" in _rules(body)
+
+
+@pytest.mark.parametrize("class_line", [
+    "class Good(AuthoredStrategy, Mapping):",
+    "class Good(AuthoredStrategy, metaclass=type):",
+])
+def test_a_class_with_extra_bases_or_keywords_is_refused(class_line):
+    assert "class_shape" in _rules(CLEAN.replace("class Good(AuthoredStrategy):", class_line))
+
+
+def test_a_relative_from_import_is_refused():
+    body = CLEAN.replace("from trader.authored.api import", "from .trader.authored.api import")
+    assert "from_import_not_allowed" in _rules(body)
+
+
+def test_the_result_does_not_depend_on_the_warning_filter():
+    import warnings
+    source = _with_statement("x = '\\d'")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert check_source(source) == []

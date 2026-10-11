@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ast
 import re
+import warnings
 from dataclasses import dataclass
 
 from trader.authored.allowed_api import (
@@ -16,6 +17,9 @@ from trader.authored.allowed_api import (
 
 MAX_SOURCE_BYTES = 20_480
 BASE_CLASS = "AuthoredStrategy"
+API_MODULE = "trader.authored.api"
+# Names whose meaning the trader relies on; the file may import them, never rebind them.
+_PROTECTED_NAMES = frozenset({BASE_CLASS, "Decision"})
 _DATA_MODULES = frozenset(ALLOWED_MODULE_ATTRIBUTES)
 
 BANNED_NAMES = frozenset({
@@ -83,6 +87,7 @@ class _Checker(ast.NodeVisitor):
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
             self._check_alias(node, alias)
+            self._check_not_protected(node, alias.asname or alias.name)
             if alias.name not in ALLOWED_IMPORTS or "." in alias.name:
                 self.add("import_not_allowed", node, f"import {alias.name}")
                 continue
@@ -94,11 +99,14 @@ class _Checker(ast.NodeVisitor):
         module = node.module or ""
         if any(a.name == "*" for a in node.names):
             self.add("import_star", node, f"from {module} import *")
+        elif node.level > 0:
+            self.add("from_import_not_allowed", node, f"relative import from {module}")
         elif module not in ALLOWED_FROM_IMPORTS:
             self.add("from_import_not_allowed", node, f"from {module} import ...")
         else:
             for alias in node.names:
                 self._check_alias(node, alias)
+                self._check_api_alias(node, module, alias)
                 if alias.name not in ALLOWED_FROM_IMPORT_NAMES.get(module, frozenset()):
                     self.add("from_import_not_allowed", node,
                              f"name {alias.name} not importable from {module}")
@@ -108,9 +116,20 @@ class _Checker(ast.NodeVisitor):
         for name in alias.name.split(".") + ([alias.asname] if alias.asname else []):
             self._check_identifier(node, name)
 
+    def _check_api_alias(self, node: ast.AST, module: str, alias: ast.alias) -> None:
+        imports_itself = module == API_MODULE and alias.asname in (None, alias.name)
+        if not imports_itself:
+            self._check_not_protected(node, alias.asname or alias.name)
+
+    def _check_not_protected(self, node: ast.AST, bound_name: str) -> None:
+        if bound_name in _PROTECTED_NAMES:
+            self.add("class_shape", node, f"{bound_name} re-bound")
+
     # --- names, attributes, strings -----------------------------------
     def visit_Name(self, node: ast.Name) -> None:
         self._check_identifier(node, node.id)
+        if not isinstance(node.ctx, ast.Load):
+            self._check_not_protected(node, node.id)
         if node.id in self.module_aliases and not self._is_chain_root(node):
             self.add("module_alias_misuse", node, f"module alias {node.id} used outside a chain root")
         self.generic_visit(node)
@@ -192,16 +211,19 @@ class _Checker(ast.NodeVisitor):
 
     def visit_arg(self, node: ast.arg) -> None:
         self._check_identifier(node, node.arg)
+        self._check_not_protected(node, node.arg)
         self.generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._check_identifier(node, node.name)
+        self._check_not_protected(node, node.name)
         if node.decorator_list:
             self.add("banned_statement", node, f"decorator on {node.name}")
         self.generic_visit(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self._check_identifier(node, node.name)
+        self._check_not_protected(node, node.name)
         if node.decorator_list:
             self.add("banned_statement", node, f"decorator on {node.name}")
         self.generic_visit(node)
@@ -213,9 +235,30 @@ def _link_parents(tree: ast.AST) -> None:
             child._parent = parent  # type: ignore[attr-defined]
 
 
+def _imports_base_class(body: list[ast.stmt]) -> bool:
+    return any(
+        isinstance(statement, ast.ImportFrom) and statement.level == 0
+        and statement.module == API_MODULE
+        and any(a.name == BASE_CLASS and a.asname in (None, BASE_CLASS) for a in statement.names)
+        for statement in body)
+
+
+def _check_class_shape(statement: ast.ClassDef, base_imported: bool, checker: _Checker) -> None:
+    only_the_base = (len(statement.bases) == 1 and not statement.keywords
+                     and isinstance(statement.bases[0], ast.Name)
+                     and statement.bases[0].id == BASE_CLASS)
+    if not only_the_base:
+        checker.add("class_shape", statement,
+                    f"class {statement.name} must subclass only {BASE_CLASS}, with no keywords")
+    elif not base_imported:
+        checker.add("class_shape", statement,
+                    f"{BASE_CLASS} is not imported from {API_MODULE}")
+
+
 def _check_module_shape(tree: ast.Module, checker: _Checker) -> None:
     classes = 0
     body = tree.body
+    base_imported = _imports_base_class(body)
     if (body and isinstance(body[0], ast.Expr)
             and isinstance(body[0].value, ast.Constant)
             and isinstance(body[0].value.value, str)):
@@ -227,10 +270,7 @@ def _check_module_shape(tree: ast.Module, checker: _Checker) -> None:
             continue
         if isinstance(statement, ast.ClassDef):
             classes += 1
-            bases = {b.id for b in statement.bases if isinstance(b, ast.Name)}
-            if BASE_CLASS not in bases:
-                checker.add("class_shape", statement,
-                            f"class {statement.name} does not subclass {BASE_CLASS}")
+            _check_class_shape(statement, base_imported, checker)
             continue
         checker.add("module_statement", statement,
                     f"module-level {type(statement).__name__}")
@@ -240,6 +280,14 @@ def _check_module_shape(tree: ast.Module, checker: _Checker) -> None:
 
 def _unparseable(line: int, detail: str) -> list[StaticViolation]:
     return [StaticViolation("unparseable", line, detail)]
+
+
+def _parse_quietly(source: str) -> ast.Module:
+    # Under -W error the compiler turns a SyntaxWarning (e.g. '\d') into a
+    # SyntaxError; the verdict must not depend on the host's warning filter.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return ast.parse(source)
 
 
 def check_source(source: str) -> list[StaticViolation]:
@@ -252,7 +300,7 @@ def check_source(source: str) -> list[StaticViolation]:
     if size > MAX_SOURCE_BYTES:
         return [StaticViolation("oversize", 0, f"over {MAX_SOURCE_BYTES} bytes")]
     try:
-        tree = ast.parse(source)
+        tree = _parse_quietly(source)
     except SyntaxError as error:
         return _unparseable(error.lineno or 0, str(error.msg))
     except (ValueError, MemoryError, RecursionError) as error:
@@ -271,7 +319,7 @@ def require_clean(source: str) -> str:
     violations = check_source(source)
     if violations:
         raise AuthoredStaticRejected(tuple(violations))
-    tree = ast.parse(source)
+    tree = _parse_quietly(source)
     for statement in tree.body:
         if isinstance(statement, ast.ClassDef):
             return statement.name

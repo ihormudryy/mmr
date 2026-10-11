@@ -173,3 +173,41 @@ def test_the_in_process_baseline_removes_its_database_folder(tmp_path, monkeypat
     timing, _ = in_process_baseline([frame])
     assert timing.bars == 60
     assert list(tmp_path.iterdir()) == []
+
+
+class _FakeProcess:
+    exitcode = -9
+
+    def join(self, timeout=None):
+        pass
+
+    def is_alive(self):
+        return True
+
+
+class _BrokenConnection:
+    def __init__(self, *, send_error=None, recv_error=None):
+        self.send_error, self.recv_error = send_error, recv_error
+
+    def send_bytes(self, frame):
+        if self.send_error:
+            raise self.send_error
+
+    def poll(self, timeout=0):
+        return True
+
+    def recv_bytes(self):
+        raise self.recv_error
+
+
+@pytest.mark.parametrize("connection", [
+    _BrokenConnection(recv_error=ConnectionResetError("reset")),
+    _BrokenConnection(recv_error=BrokenPipeError("pipe")),
+    _BrokenConnection(recv_error=EOFError()),
+    _BrokenConnection(send_error=BrokenPipeError("pipe")),
+    _BrokenConnection(send_error=ConnectionResetError("reset")),
+])
+def test_linux_style_pipe_errors_mean_the_child_died(connection):
+    from scripts.sp3_benchmark import _exchange
+    with pytest.raises(RuntimeError, match=r"child died \(exit code -9\)"):
+        _exchange(connection, _FakeProcess(), b"{}", session=0, iso="T", timeout_seconds=1)

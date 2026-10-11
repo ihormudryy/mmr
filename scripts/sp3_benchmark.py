@@ -35,6 +35,7 @@ COLUMNS = ("open", "high", "low", "close", "volume")
 PROTOCOL_VERSION = 1
 CHILD_POLL_SECONDS = 0.1
 CHILD_JOIN_SECONDS = 10
+CHILD_EXIT_WAIT_SECONDS = 1
 WARMUP_TIMEOUT_SECONDS = 60
 REPLY_TIMEOUT_SECONDS = 30
 EMBARGO_SESSIONS = 5
@@ -122,31 +123,39 @@ def _bar_frame(session: int, iso: str, values) -> bytes:
                        "close": values[3], "volume": values[4]}).encode()
 
 
+CHILD_DEATH_ERRORS = (EOFError, ConnectionResetError, BrokenPipeError)
+
+
+def _child_died(process, error: BaseException) -> RuntimeError:
+    process.join(timeout=CHILD_EXIT_WAIT_SECONDS)
+    return RuntimeError(f"benchmark child died (exit code {process.exitcode}): {type(error).__name__}")
+
+
 def _await_reply(parent, process, timeout_seconds: float) -> bytes:
     deadline = time.monotonic() + timeout_seconds
-    while not parent.poll(CHILD_POLL_SECONDS):
-        if not process.is_alive() and not parent.poll(0):
-            raise RuntimeError(f"benchmark child exited with code {process.exitcode} without replying")
-        if time.monotonic() > deadline:
-            raise TimeoutError(f"benchmark child sent no reply within {timeout_seconds:.0f} s")
     try:
+        while not parent.poll(CHILD_POLL_SECONDS):
+            if not process.is_alive() and not parent.poll(0):
+                raise RuntimeError(f"benchmark child exited with code {process.exitcode} without replying")
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"benchmark child sent no reply within {timeout_seconds:.0f} s")
         return parent.recv_bytes()
-    except EOFError:
-        raise RuntimeError(f"benchmark child closed its pipe (exit code {process.exitcode})") from None
+    except CHILD_DEATH_ERRORS as error:
+        raise _child_died(process, error) from error
 
 
 def _exchange(parent, process, frame: bytes, *, session: int, iso: str, timeout_seconds: float) -> dict:
     try:
         parent.send_bytes(frame)
-    except OSError as error:
-        raise RuntimeError(f"benchmark child is gone: {error}") from error
+    except CHILD_DEATH_ERRORS as error:
+        raise _child_died(process, error) from error
     return parse_signal(_await_reply(parent, process, timeout_seconds), session=session, t=iso)
 
 
 def _stop_child(parent, process) -> None:
     try:
         parent.send_bytes(json.dumps({"type": "close"}).encode())
-    except OSError:
+    except (OSError, ValueError):
         pass
     process.join(timeout=CHILD_JOIN_SECONDS)
     if process.is_alive():

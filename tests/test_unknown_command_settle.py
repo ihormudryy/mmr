@@ -271,11 +271,11 @@ def test_a_crashed_settle_settles_from_its_target_row(world):
 NEVER_SETTLED_BY_HAND = {
     "approve_proposal", "create_proposal", "cancel_order", "cancel_orders", "execute_automated_intent",
     "submit_ai_paper_decision", "liquidate_account", "acceptance_shrink_probe", "register_ai_deployment",
-    "withdraw_ai_deployment", "start_experiment", "pause_experiment", "resume_experiment", "stop_experiment",
+    "withdraw_ai_deployment", "publish_ai_risk_policy", "start_experiment", "pause_experiment", "resume_experiment", "stop_experiment",
     "enable_strategy", "disable_strategy", "update_strategy_params", SETTLE_ACTION,
 }
 
 
 def test_the_settle_allow_list_holds_no_broker_or_evidence_settled_action():
     assert not OPERATOR_SETTLEABLE_ACTIONS & NEVER_SETTLED_BY_HAND
-    assert OPERATOR_SETTLEABLE_ACTIONS & SAGA_ACTIONS == {"publish_ai_risk_policy"}   # journal only, no order
+    assert not OPERATOR_SETTLEABLE_ACTIONS & SAGA_ACTIONS     # every saga settles from its own evidence or never started

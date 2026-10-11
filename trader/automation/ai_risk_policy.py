@@ -129,6 +129,17 @@ class AiRiskPolicyService:
         return self._db.transaction(
             lambda conn: self._publish_in_tx(conn, limits, reason, principal, command_id, now, session_date))
 
+    def committed_outcome(self, command_id: str) -> Optional[dict]:
+        """What the publish command of this account wrote, or None when it wrote no revision (issue #142).
+
+        The revision row carries the command id and commits in the publish transaction, so a row is proof of
+        the commit. Only the revision number is rebuilt: ``applied_now`` and ``queued`` depend on the session
+        and ceiling of that moment, which the row does not keep, so a receipt rebuilt here omits them."""
+        row = self._db.transaction(lambda conn: conn.execute(
+            "SELECT revision FROM ai_risk_policy_revisions WHERE account_id = ? AND command_id = ?",
+            [self._account_id, command_id]).fetchone())
+        return None if row is None else {"revision": int(row[0]), "reconciled": "committed_revision"}
+
     def ensure_session(self, broker: Any) -> Optional[SessionView]:
         """Start the session of today's XNYS date if absent; commits before it returns (R7).
 

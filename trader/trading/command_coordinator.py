@@ -2581,7 +2581,7 @@ SAGA_ACTIONS_IDLE_WHILE_RECEIVED = frozenset({
     "execute_automated_intent", "submit_ai_paper_decision",
 })
 # These commit work while the row is still RECEIVED (the policy revision, the close claim), so a restart parks
-# them OUTCOME_UNKNOWN like a single-step command and their evidence or the operator settles them.
+# them OUTCOME_UNKNOWN like a single-step command and their evidence settles them.
 SAGA_ACTIONS_COMMITTING_WHILE_RECEIVED = frozenset({"publish_ai_risk_policy", "liquidate_account"})
 # A single-step command still RECEIVED at a restart: its handler died or its final write failed (issue #114).
 RECEIVED_AT_RESTART = "RECEIVED_AT_RESTART"
@@ -2601,6 +2601,9 @@ AI_DEPLOYMENT_REGISTER_ACTION = "register_ai_deployment"   # spelled out: import
 # The reconciler's proof that a registration's transaction never committed. Terminal, so it no longer holds
 # reconciliation_safe(); the register RPC handler sends the next attempt under a new command id.
 REGISTRATION_NOT_COMMITTED = "REGISTRATION_NOT_COMMITTED"
+AI_RISK_POLICY_PUBLISH_ACTION = "publish_ai_risk_policy"   # spelled out: importing it would be a cycle
+# The same proof for a policy publish; the operator or ai_supervisor then publishes again under a new command id.
+POLICY_NOT_COMMITTED = "POLICY_NOT_COMMITTED"
 AI_DEPLOYMENT_WITHDRAW_ACTION = "withdraw_ai_deployment"   # spelled out: importing it would be a cycle
 # The same proof for a withdrawal; the withdraw RPC handler then sends it again under a new command id.
 WITHDRAWAL_NOT_COMMITTED = "WITHDRAWAL_NOT_COMMITTED"
@@ -2611,14 +2614,14 @@ EXPERIMENT_COMMAND_NOT_COMMITTED = "EXPERIMENT_COMMAND_NOT_COMMITTED"
 
 # Issue #121: the operator settles an OUTCOME_UNKNOWN row that no evidence can settle. Only actions that write
 # the trader's own journal, config or arm state and never a broker order, and whose reconciler cannot prove
-# "never committed". Never an order, cancel, close, AI entry, judged deployment, experiment or strategy-control
-# command: those touch the broker or settle from their own evidence.
+# "never committed". Never an order, cancel, close, AI entry, policy publish, judged deployment, experiment or
+# strategy-control command: those touch the broker or settle from their own evidence.
 SETTLE_ACTION = "settle_unknown_command"
 OPERATOR_SETTLEABLE_ACTIONS = frozenset({
     "reject_proposal", "pause_trading", "resume_trading",
     "activate_live_canary", "deactivate_live_canary", "activate_allocation", "suspend_allocation",
     "activate_paper_automation", "deactivate_paper_automation",
-    "publish_ai_risk_policy", "register_discretionary_deployment", "acceptance_mark_start",
+    "register_discretionary_deployment", "acceptance_mark_start",
 })
 OPERATOR_SETTLED = "OPERATOR_SETTLED"
 # A settle command whose own transaction on its target never committed (it crashed before).
@@ -2635,6 +2638,12 @@ class WithdrawalEvidencePort(Protocol):
     """The trader's own journal: the outcome of the withdrawal row a command wrote, or None."""
 
     def committed_withdrawal(self, command_id: str) -> Optional[dict[str, Any]]: ...
+
+
+class PolicyEvidencePort(Protocol):
+    """The trader's own journal: the receipt of the risk-policy revision a command wrote, or None."""
+
+    def committed_outcome(self, command_id: str) -> Optional[dict[str, Any]]: ...
 
 
 class ExperimentEvidencePort(Protocol):
@@ -2705,6 +2714,9 @@ class OutcomeReconciler:
     - ``withdrawals``: ``WithdrawalEvidencePort`` -- the same for an
       ``OUTCOME_UNKNOWN`` ``withdraw_ai_deployment``, from the withdrawal row
       its transaction wrote. Optional: unwired it stays unknown.
+    - ``policies``: ``PolicyEvidencePort`` -- the same for an ``OUTCOME_UNKNOWN``
+      ``publish_ai_risk_policy``, from the revision row its transaction wrote
+      (issue #142). Optional: unwired (ai_paper off) it stays unknown.
     - ``experiments``: ``ExperimentEvidencePort`` -- the same for the four
       experiment commands, from the transition row each writes (issue #121).
       Optional: unwired (live account) they stay unknown.
@@ -2734,6 +2746,7 @@ class OutcomeReconciler:
         closes: Optional[Any] = None,
         registrations: Optional[RegistrationEvidencePort] = None,
         withdrawals: Optional[WithdrawalEvidencePort] = None,
+        policies: Optional[PolicyEvidencePort] = None,
         experiments: Optional[ExperimentEvidencePort] = None,
         received_at_start: Optional[list[LedgerRow]] = None,
     ):
@@ -2748,6 +2761,7 @@ class OutcomeReconciler:
         self._closes = closes
         self._registrations = registrations
         self._withdrawals = withdrawals
+        self._policies = policies
         self._experiments = experiments
         self._unreadable_evidence: set[str] = set()   # command ids logged once; the 15-minute alert follows
         self._unreadable_sagas: set[str] = set()      # logged once; the 15-minute alert follows
@@ -2935,6 +2949,8 @@ class OutcomeReconciler:
             return self._reconcile_registration(row, now)
         if action == AI_DEPLOYMENT_WITHDRAW_ACTION:
             return self._reconcile_withdrawal(row, now)
+        if action == AI_RISK_POLICY_PUBLISH_ACTION:
+            return self._reconcile_policy_publish(row, now)
         if action in EXPERIMENT_COMMAND_ACTIONS:
             return self._reconcile_experiment(row, now)
         if action == SETTLE_ACTION:
@@ -2968,6 +2984,12 @@ class OutcomeReconciler:
         """A withdrawal is one journal transaction that writes the command id with the withdrawal row."""
         evidence = None if self._withdrawals is None else self._withdrawals.committed_withdrawal
         return self._settle_from_own_commit(row, now, evidence, WITHDRAWAL_NOT_COMMITTED, {"withdrawn": False})
+
+    def _reconcile_policy_publish(self, row: LedgerRow, now: dt.datetime) -> bool:
+        """A policy publish writes its revision, with the command id, in one store transaction; nothing durable
+        is written before it while the row is RECEIVED."""
+        evidence = None if self._policies is None else self._policies.committed_outcome
+        return self._settle_from_own_commit(row, now, evidence, POLICY_NOT_COMMITTED, {"published": False})
 
     def _reconcile_experiment(self, row: LedgerRow, now: dt.datetime) -> bool:
         """An experiment command is one store transaction that writes the command id with the transition.

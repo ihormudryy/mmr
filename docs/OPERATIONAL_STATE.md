@@ -100,7 +100,8 @@ Armed paper automation cannot exit safely yet, and the evidence step has a gap i
   (`RECEIVED_AT_RESTART`) and settled from evidence it can read (registration,
   withdrawal, create, the four experiment commands from the transition row
   each writes, so a crashed no-op pause or resume is
-  `EXPERIMENT_COMMAND_NOT_COMMITTED` and is sent again; a `cancel_orders` root
+  `EXPERIMENT_COMMAND_NOT_COMMITTED` and is sent again; `publish_ai_risk_policy`
+  from the revision row it writes, see the next bullet; a `cancel_orders` root
   resolves once all its child cancels settled and is
   `CANCEL_FANOUT_NOT_STARTED` with none, so send the cancel again; reject and
   pause/resume only if they committed; a failed read is retried, never taken
@@ -118,8 +119,13 @@ Armed paper automation cannot exit safely yet, and the evidence step has a gap i
   decision write nothing before they move their row on, so the row is
   `REJECTED` `CRASH_ORPHANED` (nothing was sent; send it again if still
   wanted). `publish_ai_risk_policy` may have committed its revision, so it is
-  parked `OUTCOME_UNKNOWN`: check `mmr ai-policy show`, then `mmr reconcile
-  settle`. `liquidate_account` is parked too: with no close root its claim
+  parked `OUTCOME_UNKNOWN` and settled from the policy store (issue #142): the
+  revision row of this account with its command id resolves it (the receipt has
+  `revision` and `reconciled: committed_revision`, not `applied_now` or `queued`,
+  which the row does not keep; `mmr ai-policy show` has the effective limits),
+  and no such row rejects it `POLICY_NOT_COMMITTED` (publish again). A failed
+  read keeps it unknown and alerts after 15 minutes. No operator settle: the
+  evidence decides. `liquidate_account` is parked too: with no close root its claim
   never committed (`LIQUIDATION_NOT_STARTED`); with one it settles from that
   root.
 

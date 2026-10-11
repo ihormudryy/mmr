@@ -1,7 +1,7 @@
 """Issue #130: a saga command an earlier process left RECEIVED must not hold reconciliation_safe() false for ever.
 
 A saga that writes nothing while RECEIVED never started, so the restart rejects it. A saga that commits work while
-RECEIVED (the risk-policy revision, the liquidation claim) is parked and settled by its evidence or the operator.
+RECEIVED (the risk-policy revision, the liquidation claim) is parked and settled by its evidence.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from trader.data.duckdb_store import DuckDBConnection
 from trader.data.schema_migrations import SchemaMigrator
 from trader.messaging.production_api import _settle_unknown_command_action
 from trader.trading.command_coordinator import (
-    CRITICAL_AFTER_SECONDS, LIQUIDATION_NOT_STARTED, OPERATOR_SETTLED, RECEIVED_AT_RESTART, SAGA_ACTIONS,
+    CRITICAL_AFTER_SECONDS, LIQUIDATION_NOT_STARTED, RECEIVED_AT_RESTART, SAGA_ACTIONS,
     SAGA_ACTIONS_COMMITTING_WHILE_RECEIVED, SAGA_ACTIONS_IDLE_WHILE_RECEIVED, SETTLE_ACTION, CommandAudit,
     CommandLedger, CommandReceipt, CommandRequest, OutcomeReconciler, TradingCommandCoordinator,
     apply_command_ledger_migration,
@@ -154,18 +154,19 @@ def _settle(world, reconciler, target, outcome):
         source="cli", principal="cli"))
 
 
-def test_a_policy_publish_left_received_is_parked_and_the_operator_settles_it(world):
+def test_a_policy_publish_left_received_stays_unknown_without_its_evidence_port_and_no_operator_settles_it(world):
+    """Issue #142: the reconciler settles a publish from its revision row, so the operator never does. Without
+    the port (ai_paper off, where no publish exists) the row stays parked."""
     _received(world, "policy-1", "publish_ai_risk_policy")
     reconciler = world.reconciler()
     reconciler.rescan_on_startup()
     reconciler.run_due(NOW)
-    assert _state(world, "policy-1") == ("OUTCOME_UNKNOWN", RECEIVED_AT_RESTART)   # its revision may be live
+    assert _state(world, "policy-1") == ("OUTCOME_UNKNOWN", RECEIVED_AT_RESTART)
 
     receipt = _settle(world, reconciler, "policy-1", "rejected")
 
-    assert receipt.state == "RESOLVED"
-    assert _state(world, "policy-1") == ("REJECTED", OPERATOR_SETTLED)
-    assert world.ledger.unresolved_for_account(ACCOUNT) == []
+    assert (receipt.state, receipt.error_code) == ("REJECTED", "SETTLE_ACTION_FORBIDDEN")
+    assert _state(world, "policy-1") == ("OUTCOME_UNKNOWN", RECEIVED_AT_RESTART)
 
 
 def test_a_liquidation_left_received_without_a_close_root_never_started(world):

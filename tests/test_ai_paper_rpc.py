@@ -262,6 +262,24 @@ def test_publish_with_the_broker_down_is_a_retryable_refusal(served):
     assert (out["state"], out["error_code"], out["retryable"]) == ("REJECTED", "BROKER_SNAPSHOT_UNAVAILABLE", True)
 
 
+def test_the_stack_reconciler_settles_a_crash_left_publish_from_its_revision(served):
+    """Issue #142: the reconciler is wired to this stack's policy store."""
+    stack = served.stack
+    stack.ai_paper.policy.publish(PAPER_LIMITS, reason="start", principal="ai_supervisor",
+                                  command_id="pol-crashed", broker=served.broker.snapshot)
+    for command_id in ("pol-crashed", "pol-lost"):
+        stack.ledger.insert_for_test(command_id, state="OUTCOME_UNKNOWN", updated_at=NOW, created_at=NOW,
+                                     account_id=ACCOUNT, action="publish_ai_risk_policy", target_type="account",
+                                     target_id=ACCOUNT)
+
+    stack.reconciler.reconcile_once("pol-crashed", NOW)
+    stack.reconciler.reconcile_once("pol-lost", NOW)
+
+    kept, lost = stack.ledger.get("pol-crashed"), stack.ledger.get("pol-lost")
+    assert (kept.state, kept.outcome) == ("RESOLVED", {"revision": 1, "reconciled": "committed_revision"})
+    assert (lost.state, lost.error_code) == ("REJECTED", "POLICY_NOT_COMMITTED")
+
+
 def test_policy_above_the_owner_ceiling_is_refused(served):
     out = publish(served, "pol-2", replace(PAPER_LIMITS, gross_fraction=0.07))
     assert (out["state"], out["error_code"]) == ("REJECTED", "POLICY_ABOVE_CEILING")

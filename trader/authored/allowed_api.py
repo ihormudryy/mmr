@@ -45,4 +45,13 @@ DENIED_CHAIN_NAMES: frozenset[str] = frozenset({
     "testing", "builtins", "modules", "subprocess", "signal", "kill",
     "getppid", "system", "popen", "plot", "style", "sql",
     # Plan 1 ruling 6 additions
-    "ctypeslib", "pickle", "ctypes", "dump", "dumps", "loads", "frombuffer"})
+    "ctypeslib", "pickle", "ctypes", "dump", "dumps", "loads", "frombuffer",
+    # reachable from allowed classes: class-chain walk and matplotlib entry points
+    "mro", "boxplot", "hist"})
+
+# Introspection attributes that Cython and Python objects expose without a leading
+# underscore (func_globals, func_code, gi_frame, tb_frame, ...). The checker must
+# refuse any attribute in ANY chain whose name starts with one of these, in
+# addition to the exact names in DENIED_CHAIN_NAMES.
+DENIED_CHAIN_PREFIXES: tuple[str, ...] = (
+    "func_", "gi_", "cr_", "ag_", "f_", "tb_", "co_", "im_")

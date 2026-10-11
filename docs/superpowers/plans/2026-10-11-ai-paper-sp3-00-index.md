@@ -29,8 +29,14 @@ method owns its names and wire shape; the others use them exactly as written her
     `authored_key(digest: str, class_name: str) -> str` (returns
     `"authored:sha256:<hex>:<Class>"`), `parse_authored_key(key: str) -> tuple[str, str]`
     (returns `(digest, class_name)`, raises `ValueError`), `is_authored_key(key: str) -> bool`.
-  - `allowed_api.py`: `ALLOWED_IMPORTS: frozenset[str]`,
-    `ALLOWED_MODULE_ATTRIBUTES: Mapping[str, frozenset[str]]`, `DENIED_CHAIN_NAMES: frozenset[str]`.
+  - `allowed_api.py` (the checker's data; Plan 2's child guard is built from it, Plan 1 ruling 27):
+    `ALLOWED_IMPORTS: frozenset[str]` (`numpy`, `pandas`, `math`, `statistics`, `trader.authored.api`;
+    `typing` and `dataclasses` are from-import only, Plan 1 ruling 24),
+    `ALLOWED_FROM_IMPORTS: frozenset[str]`, `ALLOWED_FROM_IMPORT_NAMES: Mapping[str, frozenset[str]]`,
+    `ALLOWED_MODULE_ATTRIBUTES: Mapping[str, frozenset[str]]`, `ALLOWED_BUILTINS: frozenset[str]`,
+    `ALLOWED_AST_NODES: frozenset[str]`, `DENIED_CHAIN_NAMES: frozenset[str]`,
+    `DENIED_CHAIN_PREFIXES: tuple[str, ...]`, `BANNED_NAMES`, `BANNED_ATTRIBUTES`, `IO_NAMES`,
+    `IO_EXEMPT_NAMES`, `PROTECTED_NAMES` (each `frozenset[str]`), `IO_ATTRIBUTE_PREFIXES: tuple[str, ...]`.
   - `static_check.py`: `StaticViolation` (frozen dataclass: `rule: str`, `line: int`,
     `detail: str`), `check_source(source: str) -> list[StaticViolation]`,
     `AuthoredStaticRejected(Exception)` (attribute `violations`),
@@ -177,6 +183,7 @@ Security:
 - Plan 2 ruling 29 / owner ruling 2026-10-11: `OPENED` reports the session's build; `PONG` reports `live_open`; `prove-isolation` refuses (`LIVE_SESSIONS_OPEN`) while any live session is open.
 - Plan 2 ruling 30 (review r1 #8, r2 #2): the full-stack runner starts only `sandbox` and `fullstack-tests` (never ib-gateway), under `env -i` (no operator broker/provider variables), with a test-only image tag (never `mmr:latest`), project `mmr-sbxtest` and its own volumes, no published host port, a throwaway `HOME` with copied config and test-only keys, no `.env`. The render guard inspects every service's environment and image and refuses before `up` on any ib-gateway service, credential variable with a value, production image tag, published port, live-config bind or `.env`.
 - Plan 1 rulings 5-8: the checker refuses `from numpy import x`, extends the deny-list, refuses a bare module alias, and checks every string literal.
+- Plan 1 rulings 11-27: the stricter checker found in review (from-import only `typing`/`dataclasses`, builtin and AST-node allow-lists, chain prefixes, literal module-level values, no `match`) and Plan 2's child guard built from `allowed_api`.
 - Plan 3 ruling 2: an authored case must hash to the key's digest (`CASE_MALFORMED` otherwise).
 - Plan 3 ruling 12 / C1 (review r1 #5): registration needs a passing proof for both the build that evaluated the record and the build research reported last, rechecked inside the seal transaction; it does not prove the build running now. The binding gate is the strategy service's: no live session on a build without a passing proof (Plan 4 ruling 19).
 - Plan 3 ruling 15 / D3: `prove-isolation` runs inside `research` (research pool, no key) and the host records the result as `cli`.
@@ -213,7 +220,7 @@ confirmed).
 
 Benchmark:
 
-- Plan 1 ruling 1 (spec 14): owner confirmed 302 (2026-10-11). Measured 2026-10-12: a full authored evaluation (10 conids x 690 sessions x 3 cohort points, 2 tunables, 2 neighbours each, 6 folds, embargo 5, + 90-session holdout) is estimated at 10.57 h at 0.8872 ms/bar streamed. Since 10.57 h is over 4 h: reduce research_service.period_sessions for authored keys only to N=310 (>= 132: 6 folds, embargo 5, holdout 90); never weaken the sandbox. Owner kept 302 (not the script's 310): authored keys use the most recent 302 sessions (`research_service.authored_evaluation_sessions: 302`, SP2c's folds and embargo, holdout scaled to 39); catalogue strategies keep the full SP2c length. Built by Plan 4 Task 12 (Plan 4 ruling 25).
+- Plan 1 ruling 1 (spec 14): owner confirmed 302 (2026-10-11). Measured 2026-10-12: a full authored evaluation (10 conids x 690 sessions x 3 cohort points, 2 tunables, 2 neighbours each, 6 folds, embargo 5, + 90-session holdout) is estimated at 10.57 h at an upper-bound combined cost of 0.8872 ms/bar (streamed + in-process backtest, strategy time counted twice). Since 10.57 h is over 4 h: reduce research_service.period_sessions for authored keys only to N=310 (>= 132: 6 folds, embargo 5, holdout 90); never weaken the sandbox. Owner kept 302 (not the script's 310): authored keys use the most recent 302 sessions (`research_service.authored_evaluation_sessions: 302`, SP2c's folds and embargo, holdout scaled to 39); catalogue strategies keep the full SP2c length. Built by Plan 4 Task 12 (Plan 4 ruling 25).
 
 All other rulings:
 

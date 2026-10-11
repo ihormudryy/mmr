@@ -1,7 +1,7 @@
 # AI Paper Bot — SP3: AI-Written Strategies in a Sandbox — Design
 
 Status: design approved section by section by the owner on 2026-10-11; this file is
-the written spec for owner review. Revised after review round 1 on PR #149 (Grok).
+the written spec for owner review. Revised after review rounds 1 and 2 on PR #149 (Grok, OpenAI).
 Tickets: #37 (epic), #109 (this spec), #110 (plans). Builds on SP1
 (`2026-10-05-ai-paper-sp1-foundation-design.md`), SP2a+b
 (`2026-10-07-ai-paper-sp2ab-autonomous-loop-design.md`) and SP2c
@@ -28,6 +28,9 @@ The success measure is a scoreboard report; it never loosens the SP2c gate.
 - **Cap:** at most 3 AI-written strategies in the counted states (7.3).
 - **Authority:** automatic while the owner switch is on; only Jev DEPLOY plus
   attestation lets one trade. No per-strategy owner approval.
+- **Staged deploy (added after review round 2, OpenAI):** authoring and evaluation
+  may run, but no authored strategy is deployed until the isolation acceptance
+  (7.9) has passed on the exact sandbox image that is running.
 - **Sandbox:** one locked-down container (approach A). Not a restricted subprocess
   in an existing container, not a container per run.
 - **Storage:** a content-addressed store (sha256 digest), no git branch.
@@ -158,8 +161,25 @@ catalogue signals.
 ### 7.2 Static checker
 
 `trader/authored/static_check.py`, pure code, no execution. Runs at the author,
-at the trader (authority) and in the sandbox before load. Refuses with
-`AUTHORED_STATIC_REJECTED` plus the rule on:
+at the trader (authority) and in the sandbox before load. The checker is a
+second layer; the process boundary (7.5) is the isolation. Two allow-lists:
+
+- **Module attributes:** an attribute of an imported module (`np.x`, `pd.x`,
+  `math.x`, `statistics.x`) must be on an explicit list in
+  `trader/authored/allowed_api.py` (for example `pd.DataFrame`, `pd.Series`,
+  `pd.isna`, `pd.Timedelta`, `np.mean`, `np.where`, `np.nan`). Nothing below a
+  module attribute may be a module: `pd.io`, `pd.core`, `pd.api`, `pd.compat`,
+  `np.lib`, `np.random`, `np.ctypeslib`, `np.testing` and the like are refused.
+- **Attribute names anywhere in a chain:** refused if the name is on a deny-list of
+  module and process names (`os`, `sys`, `io`, `common`, `core`, `compat`, `api`,
+  `lib`, `util`, `testing`, `builtins`, `modules`, `subprocess`, `signal`,
+  `kill`, `getppid`, `system`, `popen`, `plot`, `style`, `sql`) in addition to the
+  rules below.
+
+A test walks the **shipped** pandas and numpy: for every allowed module attribute
+it asserts that the object is not a module and that none of its public attributes
+is `os`, `sys`, `subprocess` or `builtins`. Also refused, with
+`AUTHORED_STATIC_REJECTED` plus the rule:
 
 - an import other than `numpy`, `pandas`, `math`, `statistics`, `dataclasses`,
   `typing`, `trader.authored.api`;
@@ -204,6 +224,8 @@ Reasons on terminal states include `SANDBOX_ERROR` (code fault),
   digest returns the existing record (idempotent). Refusals:
   `AUTHORED_STRATEGIES_DISABLED`, `AUTHORED_CAP_FULL`,
   `AUTHORED_STATIC_REJECTED`, `AUTHORED_BAD_TUNABLES`, `AUTHORED_BAD_BAR_SIZE`.
+  Registration of an authored DEPLOY is refused `AUTHORED_ISOLATION_UNPROVEN`
+  while 7.9 has no passing record for the running image.
 
 ### 7.4 Author loop (ai service)
 
@@ -225,14 +247,28 @@ store.
 The `sandbox` stanza does **not** inherit `x-mmr-hardening` or
 `x-mmr-common-env`. It sets:
 
-- `network_mode: none`, `read_only: true`, `user: sandbox` (uid 1001, group
-  `sandbox` gid 1001, not in `sudo`; added in the Dockerfile),
-  `cap_drop: [ALL]`, `security_opt: [no-new-privileges:true]`, `pids_limit: 64`,
-  `cpus: 2`, `mem_limit: 4g`.
+- `network_mode: none`, `read_only: true`, `cap_drop: [ALL]`,
+  `cap_add: [SETUID, SETGID, KILL]`, `security_opt: [no-new-privileges:true,
+  seccomp=./config_defaults/sandbox-seccomp.json]`, `pids_limit: 64`, `cpus: 2`,
+  `mem_limit: 4g`.
+- **Process model.** The supervisor runs as uid 0 inside the container with only
+  those three capabilities (no other root power: read-only root, no network, no
+  mounts of value). Each session's child gets its **own** uid from a pool
+  (`20001..20013`, one per session slot, group `sbxchild` gid 20000, none in
+  `sudo` or `trader`), set with `setgid`/`setuid` after `fork` and before any
+  authored code loads; it keeps no capability. A child therefore cannot signal,
+  `ptrace` or read the memory of the supervisor (different uid, no `CAP_KILL`) or
+  of another child (different uid). The supervisor uses `CAP_KILL` only to stop
+  its own children. The seccomp profile is Docker's default plus a deny of
+  `ptrace`, `process_vm_readv`, `process_vm_writev`, `kcmp` and `pidfd_open`.
+- The Dockerfile adds group `sbxchild` and the uid range; image files stay owned
+  by `trader` and are world-readable only (no child-writable path but its own
+  tmpfs directory).
 - `environment:` only `TZ=UTC`, `PYTHONDONTWRITEBYTECODE=1`, `HOME=/tmp`,
   `TMPDIR=/tmp`, `NUMBA_CACHE_DIR=/tmp/numba`, `MPLCONFIGDIR=/tmp/mpl`. No provider
   key, IB account or path to any config.
-- `tmpfs: /tmp` (64 MB, `noexec`, owned by `sandbox`).
+- `tmpfs: /tmp` (64 MB, `noexec`); each child gets `/tmp/s<slot>` owned by its
+  uid, mode 0700; the supervisor wipes it when the session ends.
 - Volumes: `mmr_authored_strategies` read-only at `/store`, `mmr_sandbox_live` at
   `/run/sandbox-live`, `mmr_sandbox_research` at `/run/sandbox-research`. Nothing
   else: no `~/.config`, keys, `.env`, data or logs volume (it logs to stdout).
@@ -248,10 +284,9 @@ Sockets and pools (separate, so research cannot starve live trading):
 
 Each socket file is created with group `trader` (gid 1000, which `strategy` and
 `research` run as) and mode `0660`, so those callers connect and no other user
-can. To set that group, `sandbox` is a supplementary member of group `trader`;
-inside the sandbox container nothing writable or secret is owned by that group
-(the root filesystem is read-only and no `trader` volume is mounted). No other
-service mounts either volume.
+can. The supervisor (uid 0) creates the sockets and sets that group; children
+never see the socket (their only descriptor is the pipe to the supervisor). No
+other service mounts either volume.
 
 Protocol, frames of 4-byte length plus JSON, `"v": 1`:
 
@@ -263,7 +298,8 @@ Protocol, frames of 4-byte length plus JSON, `"v": 1`:
 | `PING` | `PONG` |
 
 `OPEN` re-hashes the stored file (`SANDBOX_DIGEST_MISMATCH`), runs the static
-check, then starts one child that loads the class. A session holds only bars it
+check, then forks one child, drops it to its slot uid, and only then loads the
+class. A session holds only bars it
 was sent, trimmed to `LOOKBACK_BARS`; `BAR` times must strictly increase. A full
 pool answers `SANDBOX_BUSY` at once (no queue). Limits per child: 2 s wall per
 bar, `RLIMIT_CPU`, `RLIMIT_AS` 256 MB, `RLIMIT_NPROC` blocking new processes,
@@ -319,6 +355,17 @@ closed trips on each side; `no` when both sides have 20 trips and that fails;
 otherwise `not enough data`. Read-only, paper labelled. A report: it never
 changes a gate.
 
+### 7.9 Isolation acceptance (staged deploy)
+
+`mmr ai-author prove-isolation` (operator, host only) runs the section 10
+"production service" and "hostile session" checks against the **running**
+`sandbox` service and records the result in the trader: the sandbox image digest,
+the time, pass or fail, and each check. While no passing record exists for the
+image digest the sandbox reports in `PONG`, the trader refuses an authored
+registration (`AUTHORED_ISOLATION_UNPROVEN`) and the strategy service refuses to
+load an authored deployment. Evaluation, Jev judgment and SHADOW still run. A
+rebuilt image needs a new run. The record holds no secret and no strategy code.
+
 ## 8. Failure handling
 
 | Event | Result (state) |
@@ -333,6 +380,8 @@ changes a gate.
 | Digest mismatch (store, load or dispatch) | Refused; alarm; live strategy `RETIRED SANDBOX_ERROR`. |
 | Trader crash between file write and record | Orphan file only; a later submit of the same digest records it. |
 | Switch turned off | No authoring, evaluation or authored entries; closes allowed; states unchanged. |
+| No passing isolation record for the running image | Authored DEPLOY verdict recorded, registration refused `AUTHORED_ISOLATION_UNPROVEN`; the record stays `EVALUATING` → `SHADOW` until a run passes, then registers. |
+| A child signals or traces the supervisor or another child | `EPERM`; the session ends `SANDBOX_ERROR` on its next bad output; other sessions unaffected. |
 
 ## 9. Limits
 
@@ -348,6 +397,7 @@ changes a gate.
 | Per-bar time / child memory | 2 s / 256 MB | code |
 | Live / research sessions | 9 / 4 | code |
 | Unavailable-sandbox attempts | 3 nights | code |
+| Child uids | 20001..20013 (one per slot) | image |
 
 ## 10. Testing
 
@@ -358,16 +408,28 @@ changes a gate.
   `importlib` and `__import__` in strings, computed `getattr`, decorators, lambda
   defaults, `try/except` swallowing a kill.
 - **Production service** (full-stack test profile, the real `sandbox` stanza from
-  `docker-compose.yml`, not an override): the process runs as uid 1001 with no
-  `sudo` group and `network_mode: none`; its environment contains no
+  `docker-compose.yml`, not an override): the supervisor's effective
+  capabilities are exactly SETUID, SETGID and KILL, each child runs as its slot
+  uid with no capability and no `sudo`/`trader` group, `network_mode: none`, the
+  seccomp profile is loaded; its environment contains no
   `ALPACA_*`, `MASSIVE_*`, `TWELVEDATA_*`, `IB_*` or `OPENROUTER_*` name; `research`
   connects to the research socket and `strategy` to the live socket; a third
   service cannot open either.
 - **Benign session** on that service: an ORB port runs 1 bar and 1 full session
   and returns decisions (catches a read-only `HOME` or a failing import).
 - **Hostile session** on that service: open a socket, read `/home/trader/.config`
-  or keys, write outside `/tmp`, fork-bomb, allocate past the limit, loop
-  forever. Each ends `SANDBOX_ERROR` while a parallel benign session completes.
+  or keys, write outside its `/tmp/s<slot>`, fork-bomb, allocate past the limit,
+  loop forever, and the exact OpenAI path
+  `pd.io.common.os.kill(pd.io.common.os.getppid(), 9)` (and `os.kill` of another
+  session's child, `os.sys.modules` lookups) loaded with the static check skipped
+  on purpose. Each fails (`EPERM` or `SANDBOX_ERROR`); the supervisor and a
+  parallel benign session keep running; `PING` still answers.
+- **Static check:** the same `pd.io.common.os...` file and every `pd.<module>` /
+  `np.<module>` chain are refused `AUTHORED_STATIC_REJECTED`; the shipped
+  pandas/numpy walk (7.2) passes.
+- **Staged deploy:** with no isolation record for the running image digest, an
+  authored DEPLOY registers nothing and the load is refused; after a passing
+  `prove-isolation` it registers; a different image digest needs a new run.
 - **Pools:** research holding all 4 research sessions does not delay a live
   `OPEN`; a full pool answers `SANDBOX_BUSY` at once; live `SANDBOX_BUSY` leaves
   the strategy `DEPLOYED` with an alarm.
@@ -400,9 +462,10 @@ changes a gate.
 2. Implementation plans (#110), one plan per PR, with an index of owner rulings
    and migration numbers.
 3. Built and merged with the switch off and the author model empty.
-4. Paper acceptance: the owner sets the author model and turns the switch on;
-   over one night a strategy is stored, evaluated and judged; on DEPLOY, live
-   signals flow through the sandbox.
+4. Paper acceptance: the owner runs `mmr ai-author prove-isolation` on the
+   running stack, sets the author model and turns the switch on; over one night a
+   strategy is stored, evaluated and judged; on DEPLOY, live signals flow through
+   the sandbox.
 5. Runs as part of the paper soak.
 
 ## 12. Out of scope

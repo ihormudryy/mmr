@@ -293,11 +293,11 @@ Protocol, frames of 4-byte length plus JSON, `"v": 1`:
 
 | Request | Reply |
 |---|---|
-| `OPEN {digest, class, params, bar_size, conids}` | `OPENED {session}` or `ERROR {code}` |
-| `OPEN_PROBE {kind, name, conids}` (isolation checks only, 14) | `OPENED {session}` or `ERROR {code}` |
+| `OPEN {digest, class, params, bar_size, conids}` | `OPENED {session, image_digest}` or `ERROR {code}` |
+| `OPEN_PROBE {kind, name, conids}` (isolation checks only, 14) | `OPENED {session, image_digest}` or `ERROR {code}` |
 | `BAR {session, conid, t, open, high, low, close, volume}` | `SIGNAL {session, conid, t, action, probability}` (action may be null) |
 | `CLOSE {session}` | `CLOSED` |
-| `PING` | `PONG {image_digest (the build id), posture, ...}` |
+| `PING` | `PONG {image_digest (the build id), posture, live_open, ...}` |
 
 `OPEN` re-hashes the stored file (`SANDBOX_DIGEST_MISMATCH`), runs the static
 check, then forks one child, drops it to its slot uid, and only then loads the
@@ -364,11 +364,13 @@ changes a gate.
 `mmr ai-author prove-isolation` (operator, host only) runs the section 10
 "production service" and "hostile session" checks against the **running**
 `sandbox` service and records the result in the trader: the sandbox build id
-(the image identity, 14), the time, pass or fail, and each check. While no passing
-record exists for the build id the sandbox reports in `PONG`, the trader refuses an authored
-registration (`AUTHORED_ISOLATION_UNPROVEN`) and the strategy service refuses to
-load an authored deployment. Evaluation, Jev judgment and SHADOW still run. A
-rebuilt image needs a new run. The record holds no secret and no strategy code.
+(the image identity, 14), the time, pass or fail, and each check. It runs only
+while no live session is open (14). While no passing record exists for the
+builds research reported (14), the trader refuses an authored registration
+(`AUTHORED_ISOLATION_UNPROVEN`); and the strategy service sends no bar to a
+build that has no passing record, whatever the registration said (the binding
+check, 14). Evaluation, Jev judgment and SHADOW still run. A rebuilt image needs
+a new run. The record holds no secret and no strategy code.
 
 ## 8. Failure handling
 
@@ -505,18 +507,33 @@ with the plan rulings.
   the registration gate and the strategy service's load check all key on it. No
   `docker inspect`: `PONG` also reports the posture (capabilities, seccomp,
   no-new-privileges, network, environment, read-only root, pids limit). The
-  trader learns the running build id from research's `STARTED` report; the
-  strategy service checks its own `PONG` before it loads.
+  trader learns the running build id from research's `STARTED` report.
+  Registration needs a passing proof for the build that evaluated the strategy
+  and for the build research reported last, checked again inside the seal
+  transaction; it does not prove the build running now. The binding check is
+  the strategy service's: it refreshes the proof at every reconcile, opens no
+  live session on a build without a passing proof (it reads the build from
+  `PING` before `OPEN` and from `OPENED`), and checks it on every bar.
 - **Isolation run.** `mmr ai-author prove-isolation` runs
   `mmr ai-author prove-isolation --in-container` inside `research` (research
   socket, no key). Hostile files load through `OPEN_PROBE` from the read-only
   image (`trader/sandbox/probes/`, `tests/authored/escapes/`); only probes skip
-  the static check. The host records the printed result as `cli`.
+  the static check. A hostile check passes only if the escape opened, failed at
+  `BAR` for its own reason, and a neighbouring session and `PING` still answer.
+  The run refuses while a live session is open (`PONG.live_open`, owner ruling),
+  so a probe never runs next to a live strategy's child. The host records the
+  printed result as `cli`.
 - **Startup CAP_CHOWN.** The supervisor needs CHOWN once, to give each slot its
   own `/tmp/s<uid>` (mode 0700); it drops CHOWN before it serves. The serving
-  set stays SETUID, SETGID and KILL.
+  set stays SETUID, SETGID and KILL. After a session a short helper running as
+  the slot uid empties the slot; a slot it cannot empty is never reused.
 - **Child memory.** A forked pandas process already maps more than 256 MB, so
   `RLIMIT_AS` is the address space at fork plus 256 MiB.
+- **Entries stop at the send.** A retired or switched-off authored strategy is
+  also refused on the order saga's SUBMITTING transaction, so a retirement
+  between the last gate and the broker send stops the entry.
+- **Author spend has its own role.** The trader's `ai_costs.role` accepts
+  `author` (journal migration 132 rebuilds the table, rows and seals unchanged).
 - **Tunables carry a default.** `submit_authored_strategy` sends
   `{low, high, default}` per tunable; the default must equal the class
   constant. The sandbox accepts any finite number for a tunable (research

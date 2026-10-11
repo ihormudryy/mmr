@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - **Base:** master at `d69fdcf2` or later, **with SP3 Plan 1 merged** (`trader/authored/keys.py`, `trader/authored/static_check.py`). Task 10 also needs **SP3 Plan 2 merged** (`trader/authored/sandbox_client.py`, `trader/sandbox/isolation_checks.py`, `trader/sandbox/protocol.py`); Tasks 1-9 do not.
-- **Journal migrations:** this plan uses **130** (`authored_strategies`) and **131** (`authored_isolation_proofs`). 132-134 stay free. Check both are free on the base (`grep -rn "13[01]" trader/automation trader/data/schema_migrations.py`). New tables only, no ALTER.
+- **Journal migrations:** this plan uses **130** (`authored_strategies`) and **131** (`authored_isolation_proofs`). 132 is Plan 5's (`ai_costs.role` gains `author`, owner ruling 2026-10-11); 133-134 stay free. Check both are free on the base (`grep -rn "13[01]" trader/automation trader/data/schema_migrations.py`). New tables only, no ALTER.
 - **Words** from spec section 3, exactly: authored strategy, catalogue strategy, store, digest, session, authored key (`authored:sha256:<hex>:<Class>`).
 - **Names owned here (index rule R0):** principal `ai_author`; methods `submit_authored_strategy`, `get_authored_strategies` (`ai_author`), `report_authored_evaluation` (`research`), `retire_authored_strategy` (`strategy`), `record_isolation_proof` (`cli`), `get_isolation_proof` (`cli`, `strategy`), `list_authored_strategies` (`cli`, `dashboard`); `AuthoredState`, `COUNTED_STATES`, `AuthoredStrategyStore` in `trader/automation/authored_strategies.py`; config `ai_paper.authored_strategies`; refusal codes `AUTHORED_STRATEGIES_DISABLED`, `AUTHORED_CAP_FULL`, `AUTHORED_STATIC_REJECTED`, `AUTHORED_BAD_TUNABLES`, `AUTHORED_BAD_BAR_SIZE`, `AUTHORED_ISOLATION_UNPROVEN`, plus `AUTHORED_STATE_CONFLICT` and `AUTHORED_STRATEGY_UNKNOWN`; CLI `mmr ai-author list` and `mmr ai-author prove-isolation`.
 - **Names used from Plan 1, exactly:** `trader.authored.keys.source_digest(source: bytes) -> str`, `authored_key(digest, class_name) -> str`, `parse_authored_key(key) -> tuple[str, str]` (raises `ValueError`), `is_authored_key(key) -> bool`; `trader.authored.static_check.require_clean(source: str) -> str`, `AuthoredStaticRejected` (attribute `violations`: `StaticViolation(rule, line, detail)`).
@@ -45,11 +45,11 @@ Each ruling is one line; the owner confirms them in the index under "Owner rulin
 9. **Plan 3 ruling 9:** An INITIAL judgment of an authored key moves the record in the judgment's transaction: REJECT → `REJECTED JEV_REJECT`, SHADOW → `SHADOW JEV_SHADOW`, DEPLOY → `SHADOW AWAITING_REGISTRATION`, NO_VERDICT → `FAILED JEV_NO_VERDICT`; a judgment for a record that is not `EVALUATING` on that request is refused `AUTHORED_STATE_CONFLICT`.
 10. **Plan 3 ruling 10:** `SHADOW → DEPLOYED` is allowed only for a DEPLOY verdict, at registration, in the seal transaction; spec 8 needs it although the 7.3 table lists only `RETIRED` and `EXPIRED` after `SHADOW`.
 11. **Plan 3 ruling 11:** Expiry is computed lazily on every submit and list: `SHADOW` expires after `backtest_judge.deploy_expiry_sessions` XNYS sessions; `DEPLOYED` follows its version line (WITHDRAWN → `RETIRED OWNER_RETIRED`, EXPIRED → `EXPIRED DEPLOY_EXPIRED`, judgment ended → `EXPIRED RENEWAL_ENDED`); a calendar error leaves the record counted.
-12. **Plan 3 ruling 12 (controller decision C1):** The identity is Plan 2's build id (decision D2). The trader cannot reach the sandbox, so "the image the sandbox reports" is the build id in research's latest `STARTED` report (research reads it from its own `PING`); registration needs the latest proof for that build id to pass. Decision D2 asked not to key on the `STARTED` report, but the trader has no other view of the running sandbox and spec 10 "staged deploy" needs a rebuild to block registration, so the channel stays. The strategy service's load check on its own live `PONG` build id (`get_isolation_proof`, Plan 4) is the final gate: no live session opens on an unproven build.
+12. **Plan 3 ruling 12 (controller decision C1; review r1 #5):** The identity is Plan 2's build id (decision D2). The trader cannot reach the sandbox, so "the image the sandbox reports" is the build id in research's latest `STARTED` report (research reads it from its own `PING`); registration needs the latest proof for that build id to pass. Decision D2 asked not to key on the `STARTED` report, but the trader has no other view of the running sandbox and spec 10 "staged deploy" needs a rebuild to block registration, so the channel stays. Registration needs a passing newest proof for both the build that evaluated the record (its own `STARTED`) and the build research reported last, checked before the seal and again inside the seal transaction, so a failed run recorded meanwhile stops it. Registration does not claim the build running now is proven: the binding check is the strategy service's, which opens no live session unless the build that session reports in `OPENED` has a passing proof (Plan 4 ruling 19). A sandbox rebuilt after the last `STARTED` therefore registers on old evidence but never trades until proven.
 13. **Plan 3 ruling 13:** `get_isolation_proof` is readable by `cli` and `strategy` (the index said `cli`), because spec 7.9 makes the strategy service refuse to load without a proof.
 14. **Plan 3 ruling 14:** `mmr ai-author list` reads a new `list_authored_strategies` (`cli`, `dashboard`) with the same reply as `get_authored_strategies`, which stays `ai_author` only as spec 5 says.
-15. **Plan 3 ruling 15 (decision D3):** `prove-isolation` runs `<compose> exec -T research mmr ai-author prove-isolation --in-container` (research socket and pool, never a live slot). The in-container step builds no SDK and needs no key: it runs Plan 2's `run_isolation_checks` (posture from `PONG` incl. caps, seccomp, no-new-privileges, network, env, read-only root and pids 64; a benign session; every hostile escape) and prints the proof JSON. The host step checks it with `RecordIsolationProofRequest` and records it as `cli`. No `docker inspect` (decision D2).
-16. **Plan 3 ruling 16:** The entry gate is in `DeploymentActivity.entry_refusal`, which both admission and final dispatch call: switch off → `AUTHORED_STRATEGIES_DISABLED`, record not `DEPLOYED` → `DEPLOYMENT_NOT_ACTIVE`; `CLOSE` and `PARTIAL_CLOSE` never reach it; `DeploymentActivity.active()` (what `get_active_ai_deployments` gives the strategy service) leaves out an authored deployment the gate would refuse, so a retired one is not reloaded even before its withdrawal lands (ruling 18).
+15. **Plan 3 ruling 15 (decision D3; owner ruling 2026-10-11):** The in-container step refuses (`LIVE_SESSIONS_OPEN`, exit 3, nothing printed) while the sandbox reports an open live session before or after the run, so no hostile probe runs next to a live strategy's child (Plan 2 rulings 21, 29). `prove-isolation` runs `<compose> exec -T research mmr ai-author prove-isolation --in-container` (research socket and pool, never a live slot). The in-container step builds no SDK and needs no key: it runs Plan 2's `run_isolation_checks` (posture from `PONG` incl. caps, seccomp, no-new-privileges, network, env, read-only root and pids 64; a benign session; every hostile escape) and prints the proof JSON. The host step checks it with `RecordIsolationProofRequest` and records it as `cli`. No `docker inspect` (decision D2).
+16. **Plan 3 ruling 16 (review r1 #4):** The entry gate is in `DeploymentActivity.entry_refusal`, which both admission and final dispatch call: switch off → `AUTHORED_STRATEGIES_DISABLED`, record not `DEPLOYED` → `DEPLOYMENT_NOT_ACTIVE`; `CLOSE` and `PARTIAL_CLOSE` never reach it; `DeploymentActivity.active()` (what `get_active_ai_deployments` gives the strategy service) leaves out an authored deployment the gate would refuse, so a retired one is not reloaded even before its withdrawal lands (ruling 18). The last check is `send_gate_in_tx` on the saga's SUBMITTING transaction (added to `_ai_paper_send_gate_in_tx`): a retirement or switch-off that commits before the SUBMITTING row refuses the send; one that commits after it finds the entry already in flight, as an SP2c withdrawal does.
 17. **Plan 3 ruling 17:** A research report must name the record's current request id; a repeat of the same event and request id is `UNCHANGED`, so a retried `SANDBOX_UNAVAILABLE` counts one attempt; the third attempt is `FAILED SANDBOX_UNAVAILABLE`.
 18. **Plan 3 ruling 18 (decision D4):** `retire_authored_strategy {digest, code: SANDBOX_ERROR|SANDBOX_DIGEST_MISMATCH, detail}` moves `DEPLOYED → RETIRED` with reason `SANDBOX_ERROR` (spec 8 row "digest mismatch"; the code stays in the history), then withdraws the deployment version through the SP2c path (`AiDeploymentVersionStore.withdraw`, reason `AUTHORED_SANDBOX_ERROR`, principal `strategy`, command id `authored-retire:<version>`). A withdrawal refused `WITHDRAWAL_ENTRY_IN_FLIGHT` replies `REFUSED` with `retryable: true` and the record already `RETIRED`; a repeat re-checks the withdrawal and is `UNCHANGED`.
 19. **Plan 3 ruling 19:** For spec 7.7, `judged_count` is the number of authored records with a recorded judgment (any verdict), returned by `report_authored_evaluation` and both list reads; Plan 4 adds the file's own trials.
@@ -1239,7 +1239,7 @@ class AuthoredRefused(Exception):
 - [ ] **Step 5: Write the tables** (`trader/automation/authored_schema.py`)
 
 ```python
-"""Journal tables of SP3 authored strategies (migrations 130 and 131; 132-134 stay free)."""
+"""Journal tables of SP3 authored strategies (migrations 130 and 131; 132 is SP3 Plan 5's, 133-134 stay free)."""
 from __future__ import annotations
 
 from typing import Any
@@ -1596,7 +1596,7 @@ def note_in_tx(conn: Any, record: AuthoredRecord, *, event: str, now: dt.datetim
 `trader/data/schema_migrations.py`, in the module docstring after the SP2c Plan 5 line, add:
 
 ```
-SP3 Plan 3 uses **130** (``authored_strategies``) and **131** (``authored_isolation_proofs``); 132–134 stay free.
+SP3 Plan 3 uses **130** (``authored_strategies``) and **131** (``authored_isolation_proofs``); SP3 Plan 5 uses **132** (``ai_costs.role`` gains ``author``); 133–134 stay free.
 ```
 
 - [ ] **Step 9: Mount the store in the trader**
@@ -3113,14 +3113,14 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Files:**
 - Create: `trader/automation/authored_isolation.py`
-- Modify: `trader/automation/ai_deployment_registration.py`, `trader/automation/ai_deployment_activity.py`, `trader/automation/authored_strategies.py` (add `running_image`, `registration_refusal`, `mark_deployed_in_tx`, `entry_refusal`), `tests/automation/authored_fixtures.py`
-- Test: `tests/automation/test_authored_isolation_gate.py`
+- Modify: `trader/automation/ai_deployment_registration.py`, `trader/automation/ai_deployment_activity.py`, `trader/automation/authored_strategies.py` (add `running_image`, `require_proven_in_tx`, `registration_refusal`, `mark_deployed_in_tx`, `entry_refusal`, `send_gate_in_tx`), `tests/automation/authored_fixtures.py`, `tests/automation/ai_paper_world.py` (`arm_authored`)
+- Test: `tests/automation/test_authored_isolation_gate.py`, `tests/automation/test_authored_send_gate.py`
 
 **Interfaces:**
 - Consumes: `RecordIsolationProofRequest`; `AiDeploymentRegistrar`, `DeploymentActivity`, `deployment_version_gate`, `DeploymentRefused`, `AiDeployment`; `is_authored_path`, `authored_digest_of_path`, `authored_strategy_path`; `AI_PAPER_ACTION` (`trader/automation/ai_paper_evidence.py`); test helpers `SeededJudgments`, `Cooldowns`, `deploy_facts` (`tests/automation/judged_deployment.py`) and `FakeBundles` (`tests/automation/test_ai_deployment_registration.py`).
 - Produces:
-  - `IsolationProof` (`.to_json()`), `IsolationProofs(db, *, now)` with `.record(request, *, principal) -> dict`, `.latest(image_digest: str | None) -> IsolationProof | None`, `.passing_for(image_digest: str | None) -> bool`; `PROOF_DOMAIN`.
-  - `AuthoredStrategyStore.running_image() -> str | None`, `.registration_refusal(deployment, judgment_id, *, kind) -> None` (raises `DeploymentRefused`), `.mark_deployed_in_tx(conn, deployment, judgment_id, version_digest, now) -> None`, `.entry_refusal(deployment) -> str | None`.
+  - `IsolationProof` (`.to_json()`), `IsolationProofs(db, *, now)` with `.record(request, *, principal) -> dict`, `.latest(image_digest)`, `.latest_in_tx(conn, image_digest)`, `.passing_for(image_digest) -> bool`, `.passing_for_in_tx(conn, image_digest) -> bool`; `PROOF_DOMAIN`.
+  - `AuthoredStrategyStore.running_image() -> str | None`, `.require_proven_in_tx(conn, deployment) -> None` (both the build that evaluated the record and the build research reported last must have a passing proof; raises `DeploymentRefused`), `.registration_refusal(deployment, judgment_id, *, kind) -> None` (raises `DeploymentRefused`), `.mark_deployed_in_tx(conn, deployment, judgment_id, version_digest, now) -> None`, `.entry_refusal(deployment) -> str | None`, `.send_gate_in_tx(conn, request) -> str | None` (the SUBMITTING-transaction check, review r1 #4).
   - `AiDeploymentRegistrar(..., authored=None)` and `DeploymentActivity(..., authored=None)`; `DeploymentActivity.active()` leaves out an authored deployment that `entry_refusal` would refuse.
   - Fixture `proof_request(image=IMAGE, *, passed=True, ran_at=NOW) -> RecordIsolationProofRequest`.
 
@@ -3328,6 +3328,33 @@ def test_a_rebuilt_image_needs_a_new_run(tmp_path):                             
     assert s.register("jdg-00000002", second_record)["created"] is True
 
 
+def test_a_failed_run_recorded_after_the_preflight_stops_the_seal(tmp_path):              # review r1 #5
+    s = Stack(tmp_path)
+    s.proofs.record(proof_request(IMAGE), principal="cli")
+    digest, record = s.awaiting()
+    preflight = s.store.registration_refusal
+
+    def preflight_then_a_failed_run(*args, **kwargs):
+        preflight(*args, **kwargs)                       # the preflight passed on the old proof
+        s.now = s.now + dt.timedelta(minutes=1)
+        s.proofs.record(proof_request(IMAGE, passed=False, ran_at=s.now), principal="cli")
+    s.store.registration_refusal = preflight_then_a_failed_run
+    assert s.refused("jdg-00000001", record) == "AUTHORED_ISOLATION_UNPROVEN"
+    assert s.versions.sealed() == () and s.store.get(digest).state == SHADOW
+
+
+def test_the_evaluated_build_and_the_latest_reported_build_must_both_be_proven(tmp_path):  # review r1 #5
+    s = Stack(tmp_path)
+    s.proofs.record(proof_request(IMAGE), principal="cli")
+    _first, first_record = s.awaiting(range_bars=15, judgment_id="jdg-00000001", image=IMAGE)
+    s.now = NOW + dt.timedelta(minutes=5)
+    s.awaiting(range_bars=16, judgment_id="jdg-00000002", image=OTHER_IMAGE)   # research now sees a rebuilt sandbox
+    assert s.store.running_image() == OTHER_IMAGE
+    assert s.refused("jdg-00000001", first_record) == "AUTHORED_ISOLATION_UNPROVEN"
+    s.proofs.record(proof_request(OTHER_IMAGE), principal="cli")
+    assert s.register("jdg-00000001", first_record)["created"] is True
+
+
 def test_registration_is_refused_while_the_switch_is_off(tmp_path):                           # ruling 8
     s = Stack(tmp_path)
     s.proofs.record(proof_request(IMAGE), principal="cli")
@@ -3474,22 +3501,29 @@ class IsolationProofs:
             return {"status": "RECORDED", "proof": proof.to_json()}
         return self._db.transaction(write)
 
-    def latest(self, image_digest: Optional[str]) -> Optional[IsolationProof]:
+    def latest_in_tx(self, conn: Any, image_digest: Optional[str]) -> Optional[IsolationProof]:
         """The newest proof of ``image_digest`` (by recording time), or the newest of all when None."""
         if image_digest is None:
-            row = self._db.execute(f"SELECT {_COLUMNS} FROM authored_isolation_proofs "
-                                   "ORDER BY recorded_at DESC, proof_id DESC LIMIT 1", fetch="one")
+            row = conn.execute(f"SELECT {_COLUMNS} FROM authored_isolation_proofs "
+                               "ORDER BY recorded_at DESC, proof_id DESC LIMIT 1").fetchone()
         else:
-            row = self._db.execute(f"SELECT {_COLUMNS} FROM authored_isolation_proofs WHERE image_digest = ? "
-                                   "ORDER BY recorded_at DESC, proof_id DESC LIMIT 1", [image_digest], fetch="one")
+            row = conn.execute(f"SELECT {_COLUMNS} FROM authored_isolation_proofs WHERE image_digest = ? "
+                               "ORDER BY recorded_at DESC, proof_id DESC LIMIT 1", [image_digest]).fetchone()
         return None if row is None else _proof(row)
 
-    def passing_for(self, image_digest: Optional[str]) -> bool:
-        """True only when the newest run of exactly this image passed: a later failing run withdraws it."""
+    def latest(self, image_digest: Optional[str]) -> Optional[IsolationProof]:
+        return self._db.transaction(lambda conn: self.latest_in_tx(conn, image_digest))
+
+    def passing_for_in_tx(self, conn: Any, image_digest: Optional[str]) -> bool:
+        """True only when the newest run of exactly this image passed: a later failing run withdraws it. Read
+        inside the registration's seal transaction too (review r1 #5)."""
         if image_digest is None:
             return False
-        latest = self.latest(image_digest)
+        latest = self.latest_in_tx(conn, image_digest)
         return latest is not None and latest.passed
+
+    def passing_for(self, image_digest: Optional[str]) -> bool:
+        return self._db.transaction(lambda conn: self.passing_for_in_tx(conn, image_digest))
 ```
 
 - [ ] **Step 5: Add the gates to the store** (`trader/automation/authored_strategies.py`)
@@ -3505,6 +3539,12 @@ from trader.research.strategy_key import authored_digest_of_path
 Add above `class AuthoredStrategyStore`:
 
 ```python
+def _running_image_in_tx(conn: Any) -> Optional[str]:
+    row = conn.execute("SELECT sandbox_image_digest FROM authored_strategies WHERE sandbox_image_seen_at "
+                       "IS NOT NULL ORDER BY sandbox_image_seen_at DESC, digest LIMIT 1").fetchone()
+    return None if row is None else row[0]
+
+
 def _may_register(record: AuthoredRecord, judgment_id: str, class_name: str, kind: str) -> bool:
     """Ruling 10: an INITIAL DEPLOY waits in SHADOW for its own judgment; a renewal keeps a DEPLOYED record."""
     if record.class_name != class_name:
@@ -3519,9 +3559,40 @@ Add these methods to `AuthoredStrategyStore`:
 ```python
     def running_image(self) -> Optional[str]:
         """Ruling 12: the trader cannot reach the sandbox; the image is the one in research's latest STARTED."""
-        row = self._db.execute("SELECT sandbox_image_digest FROM authored_strategies WHERE sandbox_image_seen_at "
-                               "IS NOT NULL ORDER BY sandbox_image_seen_at DESC, digest LIMIT 1", fetch="one")
-        return None if row is None else row[0]
+        return self._db.transaction(_running_image_in_tx)
+
+    def require_proven_in_tx(self, conn: Any, deployment: AiDeployment) -> None:
+        """Ruling 12 (review r1 #5): the build that evaluated this record (its own STARTED) and the build research
+        reported last must both have a passing newest proof. Run before the seal and again inside it, so a
+        failed run recorded after the preflight stops the seal. The binding check of the build that will run the
+        code live is the strategy service's, at every new live session (Plan 4 ruling 19)."""
+        record = record_in_tx(conn, authored_digest_of_path(deployment.strategy_path))
+        builds = (None if record is None else record.sandbox_image_digest, _running_image_in_tx(conn))
+        unproven = [build or "(none reported)" for build in dict.fromkeys(builds)
+                    if self._proofs is None or not self._proofs.passing_for_in_tx(conn, build)]
+        if unproven:
+            raise DeploymentRefused(AUTHORED_ISOLATION_UNPROVEN,
+                                    f"no passing isolation proof for the sandbox build {', '.join(unproven)}; "
+                                    "run mmr ai-author prove-isolation")
+
+    def send_gate_in_tx(self, conn: Any, request: Any) -> Optional[str]:
+        """Review r1 #4: the last check of an authored ENTER, on the saga's SUBMITTING transaction. A retirement
+        or a switch-off commits either before this read (the send is refused) or after the SUBMITTING row
+        (the entry was already in flight, as with an SP2c withdrawal)."""
+        from trader.automation.ai_paper_evidence import AI_PAPER_ACTION
+
+        body = getattr(request, "body", None) or {}
+        if getattr(request, "action", None) != AI_PAPER_ACTION or body.get("action") != "ENTER":
+            return None
+        version = body.get("deployment_version")
+        if version is None:
+            return None
+        row = conn.execute("SELECT state FROM authored_strategies WHERE deployment_version = ?", [version]).fetchone()
+        if row is None:
+            return None                                   # a catalogue version
+        if not self._config.enabled:
+            return AUTHORED_STRATEGIES_DISABLED
+        return None if row[0] == DEPLOYED.value else "DEPLOYMENT_NOT_ACTIVE"
 
     def registration_refusal(self, deployment: AiDeployment, judgment_id: str, *, kind: str) -> None:
         """Spec 7.3, 7.9 and 8 before an authored deployment registers; raises DeploymentRefused."""
@@ -3537,11 +3608,7 @@ Add these methods to `AuthoredStrategyStore`:
             raise DeploymentRefused(AUTHORED_STATE_CONFLICT,
                                     f"the record is {record.state.value}, verdict {record.verdict} of "
                                     f"{record.judgment_id}; this is a {kind} registration of {judgment_id}")
-        image = self.running_image()
-        if self._proofs is None or not self._proofs.passing_for(image):
-            raise DeploymentRefused(AUTHORED_ISOLATION_UNPROVEN,
-                                    f"no passing isolation proof for the sandbox image {image or '(none reported)'}; "
-                                    "run mmr ai-author prove-isolation")
+        self._db.transaction(lambda conn: self.require_proven_in_tx(conn, deployment))
 
     def mark_deployed_in_tx(self, conn: Any, deployment: AiDeployment, judgment_id: str, version_digest: str,
                             now: dt.datetime) -> None:
@@ -3598,6 +3665,8 @@ Inside `write(conn)`, replace
 with
 
 ```python
+            if authored:                           # review r1 #5: a failed run recorded after the preflight wins
+                self._authored.require_proven_in_tx(conn, deployment)
             digest, created = self._versions.seal_in_tx(conn, version, request_digest=digest_of_request,
                                                         principal=principal, command_id=command_id)
             if authored and created and judgment.kind == INITIAL:
@@ -3671,17 +3740,118 @@ and add the method:
         return self._authored.entry_refusal(deployment)
 ```
 
-- [ ] **Step 8: Run the tests to verify they pass**
+- [ ] **Step 8: Fence retirement at the broker-send boundary** (review r1 #4)
 
-Run: `.venv/bin/python -m pytest tests/automation/test_authored_isolation_gate.py tests/automation/test_ai_deployment_registration.py tests/automation/test_ai_deployment_activity.py tests/automation/test_ai_deployment_rpc.py tests/automation/test_authored_lifecycle.py -q --timeout=60`
+The entry gate of Step 7 reads outside the saga's SUBMITTING transaction, so a retirement could commit between it and the send. `send_gate_in_tx` (Step 5) reads the record on that transaction; the command stack adds it to the saga's send gate in Task 9. Give the AI paper test world the same gate. In `tests/automation/ai_paper_world.py`, set `self._authored_gate = None` in `__init__` next to `self._experiment_gate`, make `_send_gate_in_tx` end with
+
+```python
+        return self._withdrawal_gate(conn, request) or (
+            None if self._experiment_gate is None else self._experiment_gate(conn, request)) or (
+            None if self._authored_gate is None else self._authored_gate(conn, request))
+```
+
+and add:
+
+```python
+    def arm_authored(self, store_dir):
+        """SP3 Plan 3: a DEPLOYED authored record bound to this world's version, and its SUBMITTING gate."""
+        from tests.automation.authored_fixtures import submit_request
+        from trader.automation.authored_config import AuthoredStrategiesConfig
+        from trader.automation.authored_files import AuthoredFileStore
+        from trader.automation.authored_schema import apply_authored_migrations
+        from trader.automation.authored_strategies import (
+            DEPLOYED, EVALUATING, SHADOW, AuthoredStrategyStore, move_in_tx, record_in_tx,
+        )
+        apply_authored_migrations(SchemaMigrator(self.db))
+        store = AuthoredStrategyStore(self.db, config=AuthoredStrategiesConfig(enabled=True),
+                                      files=AuthoredFileStore(store_dir), now=self.clock)
+        digest = store.submit(submit_request())["record"]["digest"]
+        steps = ((EVALUATING, {"evaluation_request_id": "sha256:" + "1" * 64}),
+                 (SHADOW, {"verdict": "DEPLOY", "judgment_id": "jdg-00000001", "evaluation_request_id": None}),
+                 (DEPLOYED, {"deployment_version": self.version_digest}))
+        for target, changes in steps:
+            self.db.transaction(lambda conn, target=target, changes=changes: move_in_tx(
+                conn, record_in_tx(conn, digest), target, event="TEST", reason=None, now=self.clock(), **changes))
+        self._authored_gate = store.send_gate_in_tx
+        return store, digest
+```
+
+Write `tests/automation/test_authored_send_gate.py`:
+
+```python
+"""Review r1 #4: an authored retirement or switch-off after the final gate and before the send stops the entry."""
+from __future__ import annotations
+
+from dataclasses import replace
+
+import pytest
+
+from tests.automation.ai_paper_world import World
+from trader.automation.authored_wire import RetireAuthoredStrategyRequest
+
+
+@pytest.fixture
+def world(tmp_path):
+    return World(tmp_path, real_liquidation=True)
+
+
+def retire(store, digest):
+    return store.retire(RetireAuthoredStrategyRequest.model_validate(
+        {"digest": digest, "code": "SANDBOX_ERROR", "detail": "live fault"}))
+
+
+def test_a_deployed_authored_version_still_enters(world, tmp_path):
+    world.arm_authored(tmp_path / "store")
+    assert world.submit().state == "SUBMITTED" and len(world.dispatch.plans) == 1
+
+
+def test_a_retirement_after_the_final_gate_and_before_the_send_stops_the_entry(world, tmp_path):
+    store, digest = world.arm_authored(tmp_path / "store")
+    real = world.guard.revalidate
+
+    def gate_then_retire(*args, **kwargs):
+        permit = real(*args, **kwargs)                  # the final gate passed: the record was DEPLOYED
+        assert retire(store, digest)["record"]["state"] == "RETIRED"
+        return permit
+    world.guard.revalidate = gate_then_retire
+    receipt = world.submit()
+    assert (receipt.state, receipt.error_code) == ("REJECTED", "DEPLOYMENT_NOT_ACTIVE")
+    assert world.dispatch.plans == []                     # no broker send
+
+
+def test_a_switch_off_after_the_final_gate_and_before_the_send_stops_the_entry(world, tmp_path):
+    store, _digest = world.arm_authored(tmp_path / "store")
+    real = world.guard.revalidate
+
+    def gate_then_switch_off(*args, **kwargs):
+        permit = real(*args, **kwargs)
+        store._config = replace(store.config, enabled=False)   # what a restart with the switch off reads
+        return permit
+    world.guard.revalidate = gate_then_switch_off
+    receipt = world.submit()
+    assert (receipt.state, receipt.error_code) == ("REJECTED", "AUTHORED_STRATEGIES_DISABLED")
+    assert world.dispatch.plans == []
+
+
+def test_a_catalogue_version_is_not_touched_by_the_authored_gate(world, tmp_path):
+    store, _digest = world.arm_authored(tmp_path / "other-store")
+    world.db.execute("UPDATE authored_strategies SET deployment_version = NULL")   # no authored row binds it
+    store._config = replace(store.config, enabled=False)
+    assert world.submit().state == "SUBMITTED"
+```
+
+- [ ] **Step 9: Run the tests to verify they pass**
+
+Run: `.venv/bin/python -m pytest tests/automation/test_authored_isolation_gate.py tests/automation/test_authored_send_gate.py tests/automation/test_ai_paper_version_recheck.py tests/automation/test_ai_deployment_registration.py tests/automation/test_ai_deployment_activity.py tests/automation/test_ai_deployment_rpc.py tests/automation/test_authored_lifecycle.py -q --timeout=60`
 Expected: PASS.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add trader/automation/authored_isolation.py trader/automation/authored_strategies.py \
   trader/automation/ai_deployment_registration.py trader/automation/ai_deployment_activity.py \
-  tests/automation/authored_fixtures.py tests/automation/test_authored_isolation_gate.py
+  tests/automation/authored_fixtures.py tests/automation/test_authored_isolation_gate.py \
+  tests/automation/ai_paper_world.py tests/automation/test_authored_send_gate.py
 git commit -m "feat: hold authored registrations until the running sandbox image is proven
 
 The switch also refuses authored entries at admission and dispatch; closes never ask it.
@@ -4074,16 +4244,44 @@ In `_build_ai_paper_services`, build the claims with the store and pass both on:
 
 and end the `AiPaperServices(...)` return with `activity=parts.activity, registrar=parts.registrar, authored=parts.authored, proofs=parts.proofs)`.
 
+In `_ai_paper_send_gate_in_tx` (review r1 #4), after `gates = [deployment_withdrawal_gate_in_tx(versions=parts.versions)]`:
+
+```python
+    if getattr(parts, "authored", None) is not None:
+        gates.append(parts.authored.send_gate_in_tx)    # SP3: a retired or switched-off authored version
+```
+
+and append to `tests/automation/test_authored_send_gate.py`:
+
+```python
+def test_the_command_stack_hands_the_saga_the_authored_check(world, tmp_path):
+    from types import SimpleNamespace
+
+    from trader.automation.ai_paper_decision import AI_PAPER_ACTION
+    from trader.trading.command_stack import _AiPaperParts, _ai_paper_send_gate_in_tx
+
+    store, digest = world.arm_authored(tmp_path / "store")
+    parts = _AiPaperParts(config=None, policy=world.policy, entry_filter=world.entry_filter,
+                          deployments=world.deployments, scope_checks=None, filter_refusal=None,
+                          versions=world.versions, activity=world.activity, authored=store)
+    gate = _ai_paper_send_gate_in_tx(parts)
+    request = SimpleNamespace(action=AI_PAPER_ACTION, body=world.body())
+    assert world.db.transaction(lambda conn: gate(conn, request)) is None
+    retire(store, digest)
+    assert world.db.transaction(lambda conn: gate(conn, request)) == "DEPLOYMENT_NOT_ACTIVE"
+```
+
 - [ ] **Step 6: Run the tests to verify they pass**
 
-Run: `.venv/bin/python -m pytest tests/automation/test_authored_surface.py tests/automation/test_authored_wiring.py tests/automation/test_renewal_wiring.py tests/automation/test_backtest_judge_surface.py tests/test_rpc_acl.py -q --timeout=120`
+Run: `.venv/bin/python -m pytest tests/automation/test_authored_surface.py tests/automation/test_authored_wiring.py tests/automation/test_authored_send_gate.py tests/automation/test_ai_paper_version_recheck.py tests/automation/test_renewal_wiring.py tests/automation/test_backtest_judge_surface.py tests/test_rpc_acl.py -q --timeout=120`
 Expected: PASS.
 
 - [ ] **Step 7: Commit**
 
 ```bash
 git add trader/messaging/authored_surface.py trader/messaging/production_api.py trader/trading/command_stack.py \
-  tests/automation/test_authored_surface.py tests/automation/test_authored_wiring.py
+  tests/automation/test_authored_surface.py tests/automation/test_authored_wiring.py \
+  tests/automation/test_authored_send_gate.py
 git commit -m "feat: serve the authored-strategy methods and wire one store through sp2c
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -4103,7 +4301,7 @@ The flow (SP3 decision D3): the host command runs `<compose> exec -T research mm
 
 **Interfaces:**
 - Consumes: Plan 2 `SandboxClient`, `SandboxUnavailable`, `run_isolation_checks`, `RESEARCH_SOCKET`, `BUILD_ID_RE`; `RecordIsolationProofRequest`, `IMAGE_ID` (Task 5); `running_in_container` (`trader/messaging/keys_cli.py`); `repo_root` (`trader/research/strategy_paths.py`).
-- Produces: `prove_isolation.run_in_container(socket_path=RESEARCH_SOCKET, out=sys.stdout, now=...) -> int`, `prove_isolation.result_body(result, ran_at) -> dict`; `isolation_host.ProveIsolationError`, `compose_command(text: str) -> list[str]`, `in_container_command(compose: list[str]) -> list[str]`, `parse_proof(stdout: str) -> dict`, `prove_isolation(compose: list[str], run=run_command) -> dict`; `MMR.authored_strategies() -> dict`, `MMR.record_isolation_proof(proof: dict) -> dict`, `MMR.isolation_proof(image_digest=None) -> dict`; CLI `ai-author list|prove-isolation [--compose TEXT] [--in-container]`.
+- Produces: `prove_isolation.run_in_container(socket_path=RESEARCH_SOCKET, out=sys.stdout, now=...) -> int` (exit 3 `LIVE_SESSIONS_OPEN` while `PONG.live_open` is not 0 before or after the run; owner ruling 2026-10-11), `LIVE_SESSIONS_OPEN`, `EXIT_LIVE_SESSIONS_OPEN`, `prove_isolation.result_body(result, ran_at) -> dict`; `isolation_host.ProveIsolationError`, `compose_command(text: str) -> list[str]`, `in_container_command(compose: list[str]) -> list[str]`, `parse_proof(stdout: str) -> dict`, `prove_isolation(compose: list[str], run=run_command) -> dict`; `MMR.authored_strategies() -> dict`, `MMR.record_isolation_proof(proof: dict) -> dict`, `MMR.isolation_proof(image_digest=None) -> dict`; CLI `ai-author list|prove-isolation [--compose TEXT] [--in-container]`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -4146,11 +4344,22 @@ def test_the_authored_cap_never_exceeds_the_live_sandbox_pool():
     assert MAX_ACTIVE_RANGE[1] == LIVE_POOL_SIZE                    # controller decision C2
 
 
+class FakeSandbox:
+    """PING answers with ``live_open`` from the list, one value per call (the last repeats)."""
+
+    def __init__(self, *live_open):
+        self.live_open = list(live_open or (0,))
+
+    def ping(self):
+        value = self.live_open.pop(0) if len(self.live_open) > 1 else self.live_open[0]
+        return SimpleNamespace(image_digest=IMAGE, live_open=value)
+
+
 def test_the_runner_prints_one_proof_body(monkeypatch):
     result = SimpleNamespace(passed=True, image_digest=IMAGE, checks=(
         SimpleNamespace(name="escape_fork_bomb", passed=True, detail="contained: SANDBOX_ERROR"),))
     seen = []
-    monkeypatch.setattr(runner, "SandboxClient", lambda path: seen.append(path) or "client")
+    monkeypatch.setattr(runner, "SandboxClient", lambda path: seen.append(path) or FakeSandbox(0))
     monkeypatch.setattr(runner, "run_isolation_checks", lambda client: result)
     out = io.StringIO()
     assert runner.run_in_container(out=out, now=lambda: RAN_AT) == 0
@@ -4160,10 +4369,22 @@ def test_the_runner_prints_one_proof_body(monkeypatch):
         "checks": [{"name": "escape_fork_bomb", "passed": True, "detail": "contained: SANDBOX_ERROR"}]}
 
 
+@pytest.mark.parametrize("live_open", [(1,), (None,), (0, 2)])          # before, unknown, opened during the run
+def test_the_run_refuses_while_a_live_session_is_open(monkeypatch, capsys, live_open):   # owner ruling 2026-10-11
+    ran = []
+    monkeypatch.setattr(runner, "SandboxClient", lambda path: FakeSandbox(*live_open))
+    monkeypatch.setattr(runner, "run_isolation_checks", lambda client: ran.append(1) or SimpleNamespace(
+        passed=True, image_digest=IMAGE, checks=()))
+    out = io.StringIO()
+    assert runner.run_in_container(out=out) == runner.EXIT_LIVE_SESSIONS_OPEN
+    assert out.getvalue() == "" and "LIVE_SESSIONS_OPEN" in capsys.readouterr().err
+    assert ran == ([] if live_open[0] != 0 else [1])
+
+
 def test_an_unreachable_sandbox_exits_2_and_prints_nothing(monkeypatch):
-    def down(path):
+    def down(client):
         raise SandboxUnavailable("no socket")
-    monkeypatch.setattr(runner, "SandboxClient", lambda path: "client")
+    monkeypatch.setattr(runner, "SandboxClient", lambda path: FakeSandbox(0))
     monkeypatch.setattr(runner, "run_isolation_checks", down)
     out = io.StringIO()
     assert runner.run_in_container(out=out) == 2
@@ -4366,6 +4587,8 @@ from trader.sandbox.isolation_checks import run_isolation_checks
 from trader.sandbox.protocol import RESEARCH_SOCKET
 
 MAX_DETAIL_CHARS = 500
+LIVE_SESSIONS_OPEN = "LIVE_SESSIONS_OPEN"
+EXIT_LIVE_SESSIONS_OPEN = 3
 
 
 def result_body(result: Any, ran_at: dt.datetime) -> dict:
@@ -4378,13 +4601,29 @@ def result_body(result: Any, ran_at: dt.datetime) -> dict:
 def run_in_container(socket_path: str = RESEARCH_SOCKET, out: TextIO = sys.stdout,
                      now: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.timezone.utc)) -> int:
     ran_at = now()
+    client = SandboxClient(socket_path)
     try:
-        result = run_isolation_checks(SandboxClient(socket_path))
+        if _live_sessions_open(client):
+            return EXIT_LIVE_SESSIONS_OPEN
+        result = run_isolation_checks(client)
+        if _live_sessions_open(client):           # one opened during the run: the run proves nothing
+            return EXIT_LIVE_SESSIONS_OPEN
     except SandboxUnavailable as exc:
         print(f"the sandbox at {socket_path} is unavailable: {exc}", file=sys.stderr)
         return 2
     out.write(json.dumps(result_body(result, ran_at)) + "\n")
     return 0
+
+
+def _live_sessions_open(client: SandboxClient) -> bool:
+    """Owner ruling 2026-10-11 (Plan 2 rulings 21, 29): no hostile probe runs next to a live strategy's child."""
+    live_open = client.ping().live_open
+    if live_open == 0:
+        return False
+    print(f"{LIVE_SESSIONS_OPEN}: the sandbox reports {live_open!r} open live session(s); turn "
+          "ai_paper.authored_strategies.enabled off (or stop the strategy service), wait for the sessions to "
+          "close and run again", file=sys.stderr)
+    return True
 ```
 
 - [ ] **Step 4: Write the host step** (`trader/authored/isolation_host.py`)

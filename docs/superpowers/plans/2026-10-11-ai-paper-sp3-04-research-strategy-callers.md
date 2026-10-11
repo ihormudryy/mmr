@@ -16,7 +16,7 @@
 - **No migrations.** Trader journal, `ai.duckdb` and the research DB get no table and no `ALTER` (index). The authored end is kept in the existing `research_requests.code` / `detail` / `pending_report` columns.
 - **No new RPC method.** Plan 4 calls Plan 3's `report_authored_evaluation` (`research`), `retire_authored_strategy` (`strategy`) and `get_isolation_proof` (`strategy`, Plan 3 ruling 13). Plan 3's wire shape wins; each shape is built or read in one function: `started_body`, `AuthoredEnd.report_body`, `AuthoredEvaluator._start`, `EvaluationService._authored_outcome_delivered`, `AuthoredDeployments._send_retirement`, `proof_passes`.
 - **Names from Plan 1, exactly:** `trader.authored.api.Decision`; `trader.authored.keys.{source_digest, authored_key, parse_authored_key, is_authored_key}`; `trader.authored.static_check.require_clean`.
-- **Names from Plan 2, exactly:** `trader.authored.sandbox_client.{SandboxClient, SandboxInfo, SandboxUnavailable, SandboxFault, SandboxProtocolError}` (`SandboxFault(detail, *, code)`, attribute `code`; `SandboxInfo(image_digest, boot_id, pool, free, size, posture)`); `SandboxClient.ping()`, `SandboxClient.open_session(digest, class_name, params, bar_size, conids)`, `SandboxSession.bar(conid, t, open, high, low, close, volume) -> Decision | None`, `SandboxSession.conids`, `SandboxSession.close()` (Plan 2 ruling 26: a live session holds one deployment's conids, a research session one conid); `trader.sandbox.protocol.{LIVE_SOCKET, RESEARCH_SOCKET, SANDBOX_ERROR, SANDBOX_BUSY, SANDBOX_DIGEST_MISMATCH, MAX_SESSION_CONIDS, parse_request}`; `trader.sandbox.supervisor.{Supervisor, LIVE_POOL_SIZE, RESEARCH_POOL_SIZE}`, `tests.sandbox.fakes.InProcessSpawner` (Task 11 only).
+- **Names from Plan 2, exactly:** `trader.authored.sandbox_client.{SandboxClient, SandboxInfo, SandboxUnavailable, SandboxFault, SandboxProtocolError}` (`SandboxFault(detail, *, code)`, attribute `code`; `SandboxInfo(image_digest, boot_id, pool, free, size, posture, live_open)`; `SandboxSession.image_digest`, the build `OPENED` reported, Plan 2 ruling 29); `SandboxClient.ping()`, `SandboxClient.open_session(digest, class_name, params, bar_size, conids)`, `SandboxSession.bar(conid, t, open, high, low, close, volume) -> Decision | None`, `SandboxSession.conids`, `SandboxSession.close()` (Plan 2 ruling 26: a live session holds one deployment's conids, a research session one conid); `trader.sandbox.protocol.{LIVE_SOCKET, RESEARCH_SOCKET, SANDBOX_ERROR, SANDBOX_BUSY, SANDBOX_DIGEST_MISMATCH, MAX_SESSION_CONIDS, parse_request}`; `trader.sandbox.supervisor.{Supervisor, LIVE_POOL_SIZE, RESEARCH_POOL_SIZE}`, `tests.sandbox.fakes.InProcessSpawner` (Task 11 only).
 - **Names from Plan 3, exactly:** `trader.research.strategy_key.{AUTHORED_PATH, is_authored_path, authored_strategy_path, authored_digest_of_path, split_evaluation_key}` (an authored strategy path is `authored:sha256:<hex>`); `trader.messaging.ai_deployment_wire.ACTIVE_STRATEGY_PATH` (Plan 3 Task 3 Step 7); the wire shapes of `report_authored_evaluation`, `retire_authored_strategy` and `get_isolation_proof` in Plan 3 "Cross-plan additions".
 - **Names from Plan 1, test fixture:** `tests/authored/fixtures/orb_authored.py` (`OpeningRangeBreakout`, with `MIN_BARS = 40`, Plan 1 ruling 10) for the equivalence test (decision D8).
 - **No authored code in `research`, `strategy`, `trader` or `ai` processes** (spec 4). No `exec`, `import` or read of an authored file outside the sandbox. Tests run fixture sources only through `tests/authored/fake_sandbox.py` or Plan 2's in-process spawner.
@@ -40,7 +40,7 @@ Task 13 checks these lines against the index.
 7. **Plan 4 ruling 7:** The smoke stage is one sandbox session over the first 20 XNYS sessions of the evaluation period (all before the holdout), on the cohort's smallest conid at cohort point 0, through the normal window job, before any family, trial or holdout exists.
 8. **Plan 4 ruling 8:** Any `SANDBOX_ERROR` or `SANDBOX_DIGEST_MISMATCH` in an authored evaluation (smoke, folds or holdout) is reported `SANDBOX_ERROR` (`REJECTED`) with no case; a holdout opened before the fault stays revealed.
 9. **Plan 4 ruling 9:** An availability error is reported `SANDBOX_UNAVAILABLE` (back to `STORED`; the trader counts attempts) when no holdout of this file opened during the run; after one opened it passes through and SP2c signs a FAILED case (spec 8).
-10. **Plan 4 ruling 10:** The end is written to `research_requests.code = 'AUTHORED_ENDED'` / `detail` before anything is sent; the report goes before the claim's FAILED update, both resent every tick through `pending_report`; a restart with the marker never evaluates again.
+10. **Plan 4 ruling 10:** The end is written to `research_requests.code = 'AUTHORED_ENDED'` / `detail` before anything is sent; the report goes before the claim's FAILED update, both resent every tick through `pending_report`; a restart with the marker never evaluates again. A final (non-retryable) refusal of the end is not delivery (review r1 #7): the request stays RUNNING with its claim open, an `AUTHORED_REPORT_REFUSED` ERROR names the request and digest, and the end is resent hourly and at every restart until the trader accepts it (the reconciliation path: repair or move the trader record, see `mmr ai-author list`).
 11. **Plan 4 ruling 11:** An authored end has no case: `get_evaluation` reads FAILED with no case, the SP2c controller closes the candidate `EVALUATION_FAILED_NO_CASE`, and Jev is never asked.
 12. **Plan 4 ruling 12:** For an authored key `strategy_trials` = the `judged_count` in the `STARTED` reply (Plan 3 ruling 19) + this file's finished trials. The same number is the deflated statistic's `n_trials`; the Sharpe spread comes from this file's trials. A catalogue key keeps today's count; a non-zero count with a catalogue spec is refused.
 13. **Plan 4 ruling 13:** The research socket path is `EvaluationPaths.sandbox_socket` (default `RESEARCH_SOCKET`), so tests and Plan 5's world set one field and every caller that holds `paths` uses it.
@@ -49,7 +49,7 @@ Task 13 checks these lines against the index.
 16. **Plan 4 ruling 16:** A bar with a missing or non-finite field, or a time not after the last sent bar, is not sent and decides nothing. `BarStream` is the only guard against Plan 2's `SandboxProtocolError`, so every send goes through it.
 17. **Plan 4 ruling 17:** An alarm is an ERROR log line that starts with a stable code: `AUTHORED_SANDBOX_UNAVAILABLE` (once per outage per instance, an INFO line on recovery), `AUTHORED_SANDBOX_FAULT`, `AUTHORED_ISOLATION_UNPROVEN`, `AUTHORED_DIGEST_MISMATCH`. The strategy service has no other alarm channel.
 18. **Plan 4 ruling 18:** A fault disables the instance at once and sends nothing on the tick thread; the reconcile thread sends `retire_authored_strategy` until `UPDATED`/`UNCHANGED` (a `REFUSED` with `retryable: true`, such as `WITHDRAWAL_ENTRY_IN_FLIGHT`, is sent again; a non-retryable refusal stops the resend, logged). This process never reloads a retired digest. Plan 3 moves the record to `RETIRED` and withdraws the deployment version (Plan 3 ruling 18, decision D4), so `get_active_ai_deployments` stops listing it at once and a restart does not load it again.
-19. **Plan 4 ruling 19:** At load the strategy service pings the live socket and reads `get_isolation_proof` for that image; no passing proof, an unreachable sandbox or an unreachable trader means not loaded, retried next reconcile, nothing retired.
+19. **Plan 4 ruling 19 (review r1 #6):** At load and at every reconcile the strategy service pings the live socket and reads `get_isolation_proof` for that build; the result is the one proven build (none on any failure). A live proxy pings before every new session (first OPEN, reconnect, day rollover) and opens nothing on an unproven build, and on every bar it checks the build its session's `OPENED` reported (Plan 2 ruling 29): an unproven or withdrawn build ends the session with an `AUTHORED_ISOLATION_UNPROVEN` alarm and no signal; the strategy stays deployed and nothing is retired. No passing proof at load, an unreachable sandbox or an unreachable trader means not loaded, retried next reconcile.
 20. **Plan 4 ruling 20:** At load the path's digest must equal the deployment's `strategy_digest` (else refused, alarm, retired `SANDBOX_DIGEST_MISMATCH`); on every dispatch `source_unchanged` asks the instance (not faulted, still the bound digest); the sandbox re-hashes the stored file at every OPEN.
 21. **Plan 4 ruling 21:** An authored line is not renewed: SP2c renewal refuses a key off the allowlist (an authored key never is on it) and the file's one holdout is spent; the line ends `EXPIRED`.
 22. **Plan 4 ruling 22 (resolved by decision D1, spec section 14):** Spec 7.5 sized the live pool at 9 as "3 deploys × up to 3 conids", but `max_cohort_points` counts parameter points and a deployment binds 8–20 conids. The spec is amended: one live session per deployment holds all its conids (Plan 2 ruling 26), the live pool is 3 and the trader caps `max_active` at 3 (controller decision C2). `SANDBOX_BUSY` live stays an availability error.
@@ -73,7 +73,7 @@ All six were settled at integration (2026-10-11); kept here so a reviewer can tr
 1. **One authored row in `get_active_ai_deployments` must not stop catalogue deployments.** → Plan 3 `test_the_reply_carries_a_catalogue_and_an_authored_row` (run in Task 1); Task 10 `test_a_catalogue_and_an_authored_deployment_load_side_by_side`.
 2. **A live frame with a NaN field or a repeated bar time must not reach the sandbox or end the session.** → Task 2 `test_a_bar_with_a_missing_value_is_not_sent`, `test_a_bar_not_after_the_last_sent_is_not_sent`; Task 9 `test_a_nan_newest_bar_gives_no_signal_and_keeps_the_session`.
 3. **A window over 8–20 conids never holds more than one research session.** → Task 3 `test_an_authored_window_trades_like_the_catalogue_strategy`; Task 6 `test_an_authored_cohort_scores_like_the_catalogue_strategy` (`most_open == 1`).
-4. **A fault on the tick thread never blocks on a trader call, and the faulted file never reloads in this process.** → Task 9 `test_a_fault_retires_through_the_callback_and_stops`; Task 10 `test_a_fault_retires_once_and_the_file_never_reloads`, `test_reconcile_sends_pending_retirements`.
+4. **A fault on the tick thread never blocks on a trader call, and the faulted file never reloads in this process.** → Task 9 `test_a_fault_retires_through_the_callback_and_stops`; Task 10 `test_a_fault_retires_once_and_the_file_never_reloads`, `test_reconcile_refreshes_the_proof_and_sends_pending_retirements`.
 5. **A crash between deciding an authored end and telling the trader never runs the evaluation again and never closes the claim before the record moved.** → Task 7 `test_an_end_decided_before_a_crash_is_never_evaluated_again`, `test_a_lost_report_holds_the_claim_open_until_the_next_tick`.
 
 ## File map
@@ -123,7 +123,7 @@ Expected: PASS. If `tests/strategy/test_authored_wire.py` does not exist, Plan 3
 - Consumes: Plan 1 `Decision`, `source_digest(bytes) -> str`, `require_clean(source) -> str`, the ORB fixture file; Plan 2 `SandboxFault(detail, *, code)`, `SandboxUnavailable`, `SandboxProtocolError`, `SandboxInfo`, protocol codes, `MAX_SESSION_CONIDS`.
 - Produces:
   - `trader.authored.streaming`: `OHLCV`, `AUTHORED_SIGNAL_RISK = 0.0`, `utc_time(stamp) -> datetime`, `bar_fields(stamp, values) -> Optional[dict]`, `BarStream(session, conid)` (one conid of a session) with `conid`, `last_sent`, `send(stamp, values) -> Optional[Decision]`, `send_frame(frame) -> tuple[Optional[Decision], ...]`, `close()`; `decision_signal(decision, source_name) -> Optional[Signal]`.
-  - `tests.authored.fake_sandbox`: `FakeSandbox(pool=4, image_digest=IMAGE_DIGEST, max_conids=MAX_SESSION_CONIDS)` with `add(source) -> digest`, `ping() -> SandboxInfo`, `open_session(digest, class_name, params, bar_size, conids)`, knobs `unavailable`, `refuse_opens_after`, `tampered`, records `sessions`, `open_sessions`, `most_open`; `FakeSession.conids`, `.stamps` (every bar sent, in order), `.stamps_of(conid)`, `.first_close`, `.closed`; `caller_source(name) -> str`, `orb_fixture_source() -> str`, `fault(code)`, `IMAGE_DIGEST`.
+  - `tests.authored.fake_sandbox`: `FakeSandbox(pool=4, image_digest=IMAGE_DIGEST, max_conids=MAX_SESSION_CONIDS)` with `add(source) -> digest`, `ping() -> SandboxInfo`, `open_session(digest, class_name, params, bar_size, conids)`, knobs `unavailable`, `refuse_opens_after`, `tampered`, records `sessions`, `open_sessions`, `most_open`; `FakeSession.conids`, `.image_digest` (the sandbox's build at OPEN), `.stamps` (every bar sent, in order), `.stamps_of(conid)`, `.first_close`, `.closed`; `caller_source(name) -> str`, `orb_fixture_source() -> str`, `fault(code)`, `IMAGE_DIGEST`.
 
 - [ ] **Step 1: Write the fixture sources**
 
@@ -238,6 +238,7 @@ class FakeSession:
     def __init__(self, sandbox: "FakeSandbox", strategy_class: type, params: Mapping[str, float], digest: str,
                  conids: tuple[int, ...]):
         self._sandbox, self.digest, self.conids = sandbox, digest, conids
+        self.image_digest = sandbox.image_digest          # the build OPENED reported (Plan 2 ruling 29)
         self._params = dict(params)
         self._lookback = int(strategy_class.LOOKBACK_BARS)
         self._books = {conid: _ConidBook(strategy_class()) for conid in conids}
@@ -299,7 +300,8 @@ class FakeSandbox:
         if self.unavailable:
             raise SandboxUnavailable("fake: socket unreachable")
         return SandboxInfo(image_digest=self.image_digest, boot_id="fake", pool="fake",
-                           free=self.pool - len(self.open_sessions), size=self.pool, posture={})
+                           free=self.pool - len(self.open_sessions), size=self.pool, posture={},
+                           live_open=len(self.open_sessions))
 
     def open_session(self, digest: str, class_name: str, params: Mapping[str, float], bar_size: str,
                      conids) -> FakeSession:
@@ -1864,15 +1866,23 @@ def test_an_end_decided_before_a_crash_is_never_evaluated_again(world):
     assert trader.claims[request_id]["state"] == "FAILED"
 
 
-def test_a_refused_report_is_logged_and_the_claim_still_closes(world, caplog):
+def test_a_final_refusal_parks_the_claim_visibly_and_reconciles_later(world, caplog, monkeypatch):  # review r1 #7
     trader = FakeTrader()
     trader.refuse_authored_report = ("AUTHORED_STATE_CONFLICT", False)
     svc = service(world, trader, raising(AuthoredEvaluationEnded(ERROR_END)))
     request_id = submit(svc)
     with caplog.at_level(logging.ERROR):
         svc.run_next()
+        svc.run_next()                                        # parked: not resent on every tick
+    assert trader.claims[request_id]["state"] != "FAILED"     # the claim is not closed on a refusal
+    assert svc.get(request_id, AI)["state"] == "RUNNING"      # visible: the request stays open, no case
+    assert caplog.text.count("AUTHORED_REPORT_REFUSED") == 1 and "AUTHORED_STATE_CONFLICT" in caplog.text
+    assert no_case_signed(world)
+    monkeypatch.setattr("trader.research.evaluation_service.PARKED_RESEND_SECONDS", 0)
+    trader.refuse_authored_report = None                      # the operator repaired the trader record
+    svc.run_next()
+    assert [r["event"] for r in trader.authored_reports] == ["SANDBOX_ERROR"]
     assert trader.claims[request_id]["state"] == "FAILED"
-    assert "AUTHORED_STATE_CONFLICT" in caplog.text
 
 
 def test_a_retryable_refusal_is_sent_again(world):
@@ -1915,6 +1925,16 @@ In `trader/research/evaluation_service.py` add:
 ```python
 from trader.authored.keys import parse_authored_key
 from trader.research.authored_outcome import AUTHORED_END_CODE, AuthoredEnd, AuthoredEvaluationEnded
+
+# Review r1 #7: an authored end the trader refused for good is parked, resent hourly (and at a restart), and the
+# claim stays open; refusal is never delivery.
+PARKED_RESEND_SECONDS = 3600
+```
+
+(add `import datetime as dt` if the module lacks it), and at the end of `EvaluationService.__init__`:
+
+```python
+        self._refused_at: dict[str, dt.datetime] = {}         # request id -> when the trader last refused its end
 ```
 
 Replace `_run_row`:
@@ -1977,11 +1997,15 @@ In `_evaluate_and_sign`, the first handler of the `try` becomes:
 ```python
     def _authored_outcome_delivered(self, request_id: str) -> bool:
         """Plan 4 ruling 10: an authored end reaches the trader before its claim closes, so the record never
-        stays EVALUATING behind a closed claim. Resent every tick until the trader answers."""
+        stays EVALUATING behind a closed claim. Resent every tick until the trader answers; a final refusal parks
+        the request (ruling 10, review r1 #7): never treated as delivered."""
         row = self._store.get(request_id)
         end = AuthoredEnd.from_row(row)
         if end is None:
             return True
+        refused_at = self._refused_at.get(request_id)
+        if refused_at is not None and self._now() < refused_at + dt.timedelta(seconds=PARKED_RESEND_SECONDS):
+            return False
         digest, _ = parse_authored_key(row["strategy_key"])
         try:
             reply = self._trader.report_authored_evaluation(end.report_body(request_id, digest))
@@ -1994,9 +2018,12 @@ In `_evaluate_and_sign`, the first handler of the `try` becomes:
             logger.warning("authored evaluation %s: the trader asks to resend (%s); sent again next tick",
                            request_id, reply.get("code"))
             return False
-        logger.error("authored evaluation %s: the trader refused %s (%s: %s); the claim closes anyway",
-                     request_id, end.event, reply.get("code"), reply.get("detail"))
-        return True
+        self._refused_at[request_id] = self._now()
+        logger.error("AUTHORED_REPORT_REFUSED: authored evaluation %s: the trader refused %s (%s: %s); the claim "
+                     "stays open and the end is sent again in %s s (after a restart: at once); check "
+                     "`mmr ai-author list` for digest %s", request_id, end.event, reply.get("code"),
+                     reply.get("detail"), PARKED_RESEND_SECONDS, digest)
+        return False
 ```
 
 In `trader/research/service_store.py` the signature of `hold_report` becomes `def hold_report(self, request_id: str, final: str, *, now: dt.datetime, case_digest: Optional[str], summary: Optional[dict]) -> None:` (an authored end holds neither; `json.dumps(None)` stores `null`, which `_row` reads back as `None`).
@@ -2233,7 +2260,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: Task 2 `BarStream`, `decision_signal`, `utc_time`; Plan 2 `SandboxClient.open_session(..., conids)`, `SandboxFault.code`, `SandboxUnavailable`. The runtime stamps `_dispatch_conid` before `on_prices` and calls it once per new completed bar (`_on_tick_for_strategy`), on one tick thread.
-- Produces: `trader.strategy.authored_runtime`: `WARMUP_BARS = 2000`, alarm codes `SANDBOX_UNAVAILABLE_ALARM`, `SANDBOX_FAULT_ALARM`, `ISOLATION_ALARM`, `DIGEST_ALARM`; `AuthoredLiveStrategy(*, client, digest, class_name, params, bar_size, conids, on_fault: Callable[[str, str], None])` with `digest`, `conids`, `on_prices(prices) -> Optional[Signal]`, `authored_binding_intact() -> bool`, `close_sessions()`. One live session per instance (one deployment) per New York day, serving all its conids (ruling 14, decision D1).
+- Produces: `trader.strategy.authored_runtime`: `WARMUP_BARS = 2000`, alarm codes `SANDBOX_UNAVAILABLE_ALARM`, `SANDBOX_FAULT_ALARM`, `ISOLATION_ALARM`, `DIGEST_ALARM`; `AuthoredLiveStrategy(*, client, digest, class_name, params, bar_size, conids, on_fault: Callable[[str, str], None], proof_gate: Callable[[str], bool])` with `digest`, `conids`, `on_prices(prices) -> Optional[Signal]`, `authored_binding_intact() -> bool`, `close_sessions()`. One live session per instance (one deployment) per New York day, serving all its conids (ruling 14, decision D1).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2249,7 +2276,8 @@ import pandas as pd
 from tests.authored.fake_sandbox import FakeSandbox, caller_source
 from trader.objects import Action, BarSize
 from trader.sandbox.protocol import SANDBOX_DIGEST_MISMATCH, SANDBOX_ERROR
-from trader.strategy.authored_runtime import SANDBOX_FAULT_ALARM, SANDBOX_UNAVAILABLE_ALARM, AuthoredLiveStrategy
+from trader.strategy.authored_runtime import (ISOLATION_ALARM, SANDBOX_FAULT_ALARM, SANDBOX_UNAVAILABLE_ALARM,
+                                              AuthoredLiveStrategy)
 from trader.trading.strategy import StrategyContext, StrategyState
 
 CONID, OTHER = 265598, 76792991
@@ -2262,11 +2290,14 @@ def bars(count, start="2024-03-04 14:30"):
                         index=index)
 
 
-def live(sandbox, faults, name="counts_bars", class_name="CountsBars", params=None, conids=(CONID,)):
+def live(sandbox, faults, name="counts_bars", class_name="CountsBars", params=None, conids=(CONID,),
+         proven=None):
     digest = sandbox.add(caller_source(name))
+    proven = {sandbox.image_digest} if proven is None else proven     # the builds with a passing proof
     strategy = AuthoredLiveStrategy(client=sandbox, digest=digest, class_name=class_name, params=params or {},
                                     bar_size="1 min", conids=conids,
-                                    on_fault=lambda d, code: faults.append((d, code)))
+                                    on_fault=lambda d, code: faults.append((d, code)),
+                                    proof_gate=lambda build: build in proven)
     strategy.install(StrategyContext(name="aidv-test", bar_size=BarSize.Mins1, conids=list(conids), universe=None,
                                      historical_days_prior=5, paper_only=True, storage=None, universe_accessor=None,
                                      logger=logging))
@@ -2305,6 +2336,54 @@ def test_a_conid_the_deployment_does_not_bind_gets_no_signal_and_sends_nothing()
     strategy._dispatch_conid = OTHER
     assert strategy.on_prices(bars(5)) is None
     assert sandbox.sessions == [] and faults == []
+
+
+def test_no_signal_from_a_session_on_an_unproven_build_and_the_strategy_stays(caplog):     # review r1 #6
+    sandbox, faults, proven = FakeSandbox(), [], set()
+    strategy = live(sandbox, faults, proven=proven)
+    with caplog.at_level(logging.ERROR):
+        assert strategy.on_prices(bars(5)) is None                         # the first OPEN: build not proven
+    assert ISOLATION_ALARM in caplog.text and sandbox.sessions == [] and faults == []   # never OPENED
+    proven.add(sandbox.image_digest)
+    assert strategy.on_prices(bars(6)).probability == 6 / 10000           # proven now: a fresh warmed session
+    assert strategy.state == StrategyState.RUNNING
+
+
+def test_a_reconnect_to_a_rebuilt_unproven_sandbox_gives_no_signal(caplog):              # review r1 #6
+    sandbox, faults = FakeSandbox(), []
+    proven = {sandbox.image_digest}
+    strategy = live(sandbox, faults, proven=proven)
+    assert strategy.on_prices(bars(3)).probability == 3 / 10000
+    sandbox.unavailable = True
+    assert strategy.on_prices(bars(4)) is None
+    sandbox.unavailable, sandbox.image_digest = False, "e4f5a6b-20261012T090000Z"   # restarted on build B
+    with caplog.at_level(logging.ERROR):
+        assert strategy.on_prices(bars(5)) is None
+    assert ISOLATION_ALARM in caplog.text and len(sandbox.sessions) == 1 and sandbox.open_sessions == []
+    proven.add(sandbox.image_digest)
+    assert strategy.on_prices(bars(6)).probability == 6 / 10000 and len(sandbox.sessions) == 2
+
+
+def test_a_restart_between_ping_and_open_is_caught_by_the_opened_build():
+    sandbox, faults = FakeSandbox(), []
+    proven = {sandbox.image_digest}
+    strategy = live(sandbox, faults, proven=proven)
+    real_open = sandbox.open_session
+
+    def restart_then_open(*args, **kwargs):
+        sandbox.image_digest = "e4f5a6b-20261012T090000Z"                # the supervisor restarted on build B
+        return real_open(*args, **kwargs)
+    sandbox.open_session = restart_then_open
+    assert strategy.on_prices(bars(5)) is None and sandbox.open_sessions == []
+
+
+def test_a_proof_withdrawn_mid_session_stops_the_signals_at_the_next_bar():
+    sandbox, faults = FakeSandbox(), []
+    proven = {sandbox.image_digest}
+    strategy = live(sandbox, faults, proven=proven)
+    assert strategy.on_prices(bars(3)) is not None
+    proven.clear()                                                          # a later failing run of that build
+    assert strategy.on_prices(bars(4)) is None and sandbox.open_sessions == []
 
 
 def test_each_signal_saw_exactly_the_bars_sent_capped_at_lookback():
@@ -2472,6 +2551,12 @@ ISOLATION_ALARM = "AUTHORED_ISOLATION_UNPROVEN"
 DIGEST_ALARM = "AUTHORED_DIGEST_MISMATCH"
 
 
+class _UnprovenBuild(Exception):
+    def __init__(self, build: str):
+        super().__init__(build)
+        self.build = build
+
+
 @dataclass
 class _DaySession:
     """One live session for one New York day: one BarStream per conid of the deployment, all on one session."""
@@ -2492,8 +2577,13 @@ def _unsent(prices: pd.DataFrame, last_sent: Optional[dt.datetime]) -> pd.DataFr
 
 class AuthoredLiveStrategy(Strategy):
     def __init__(self, *, client: Any, digest: str, class_name: str, params: Mapping[str, float], bar_size: str,
-                 conids: Sequence[int], on_fault: Callable[[str, str], None]):
+                 conids: Sequence[int], on_fault: Callable[[str, str], None], proof_gate: Callable[[str], bool]):
         super().__init__()
+        # Plan 4 ruling 19 (review r1 #6): True only for a build with a passing isolation proof. Asked on every
+        # bar for the build the session's OPENED reported, so a first OPEN, a reconnect, a day rollover or a
+        # proof withdrawn mid-session never sends a bar to an unproven build.
+        self._proof_gate = proof_gate
+        self._in_unproven = False
         self.digest = digest
         self.conids = tuple(int(conid) for conid in conids)
         self._client, self._class_name, self._params, self._bar_size = client, class_name, dict(params), bar_size
@@ -2521,10 +2611,15 @@ class AuthoredLiveStrategy(Strategy):
                 self._end_session()
                 self._raise_outage_alarm(exc)
                 return None
+            except _UnprovenBuild as unproven:
+                self._end_session()
+                self._raise_unproven_alarm(unproven.build)
+                return None
             except SandboxFault as fault:
                 self._fault(fault)
                 return None
             self._clear_outage_alarm()
+            self._in_unproven = False
         return decision_signal(decision, self.name)
 
     def authored_binding_intact(self) -> bool:
@@ -2540,9 +2635,16 @@ class AuthoredLiveStrategy(Strategy):
         if self._current is not None and day > self._current.day:      # a conid still on yesterday never rolls back
             self._end_session()
         if self._current is None:
+            build = self._client.ping().image_digest          # no OPEN (no class load) on an unproven build
+            if not self._proof_gate(build):
+                raise _UnprovenBuild(build)
             session = self._client.open_session(self.digest, self._class_name, self._params, self._bar_size,
                                                 list(self.conids))
             self._current = _DaySession(session, {c: BarStream(session, c) for c in self.conids}, day)
+        # The OPENED build, checked on every bar: a restart between PING and OPEN, or a proof withdrawn
+        # mid-session, sends nothing (fail closed).
+        if not self._proof_gate(self._current.session.image_digest):
+            raise _UnprovenBuild(self._current.session.image_digest)
         stream = self._current.streams[conid]
         decisions = stream.send_frame(_unsent(prices, stream.last_sent))
         return decisions[-1] if decisions else None
@@ -2551,6 +2653,13 @@ class AuthoredLiveStrategy(Strategy):
         current, self._current = self._current, None
         if current is not None:
             next(iter(current.streams.values())).close()                   # closes the session for every conid
+
+    def _raise_unproven_alarm(self, build: str) -> None:
+        if not self._in_unproven:
+            self._in_unproven = True
+            logging.error("%s: authored strategy %s: the live sandbox runs build %s, which has no passing isolation "
+                          "proof; no signal until `mmr ai-author prove-isolation` passes for it", ISOLATION_ALARM,
+                          self.name, build)
 
     def _raise_outage_alarm(self, exc: Exception) -> None:
         if not self._in_outage:
@@ -2596,7 +2705,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: Plan 3's widened `ActiveAiDeployment` (checked in Task 1); Task 9 `AuthoredLiveStrategy`; Plan 3 `is_authored_path`, `authored_digest_of_path`, `authored_strategy_path`, `get_isolation_proof` (`{image_digest}` → `{found, proof: {image_digest, passed, ...}}`), `retire_authored_strategy` (`{digest, code, detail}` → `{status: UPDATED|UNCHANGED|REFUSED, code, detail, retryable, record}`); Plan 2 `SandboxClient(LIVE_SOCKET)`, `ping().image_digest`.
-- Produces: `AuthoredDeployments(*, client, trader_query, trader_command)` with `build(name, deployment, *, storage, universe_accessor) -> Optional[AuthoredLiveStrategy]`, `request_retirement(digest, code)`, `send_retirements()`; `proof_passes(reply, image_digest) -> bool`; `source_unchanged(instance)` asks an authored instance; `StrategyRuntime._authored_deployments`.
+- Produces: `AuthoredDeployments(*, client, trader_query, trader_command)` with `build(name, deployment, *, storage, universe_accessor) -> Optional[AuthoredLiveStrategy]`, `refresh_proof() -> bool`, `is_proven(build) -> bool` (the live proxies' `proof_gate`), `request_retirement(digest, code)`, `send_retirements()`; `proof_passes(reply, image_digest) -> bool`; `source_unchanged(instance)` asks an authored instance; `StrategyRuntime._authored_deployments`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2740,6 +2849,31 @@ def test_no_passing_proof_for_the_running_image_loads_nothing_and_retires_nothin
     assert retirements(world) == []
 
 
+def test_a_sandbox_rebuilt_after_the_load_gives_no_signal_until_its_build_is_proven(world):   # review r1 #6
+    reconcile(world, [authored_active(world.sandbox)])
+    instance = instance_of(world)
+    instance._dispatch_conid = CONID
+    world.sandbox.image_digest = "e4f5a6b-20261012T090000Z"              # build B replaced the proven build
+    frame = bars(3)
+    assert instance.on_prices(frame) is None and world.sandbox.sessions == []
+    assert world.rt.signal_record.read(0, 10).signals == []
+    world.query.answer("get_isolation_proof", proof(image="e4f5a6b-20261012T090000Z"))
+    world.rt._authored_deployments.refresh_proof()                       # what every reconcile does
+    signal = instance.on_prices(frame)
+    world.rt._dispatch_once(instance, signal, CONID, frame)
+    assert len(world.rt.signal_record.read(0, 10).signals) == 1
+
+
+def test_a_later_failing_proof_stops_the_running_instance(world):
+    reconcile(world, [authored_active(world.sandbox)])
+    instance = instance_of(world)
+    instance._dispatch_conid = CONID
+    assert instance.on_prices(bars(3)) is not None
+    world.query.answer("get_isolation_proof", proof(passed=False))
+    world.rt._authored_deployments.refresh_proof()
+    assert instance.on_prices(bars(4)) is None and world.sandbox.open_sessions == []
+
+
 def test_a_trader_that_refuses_the_proof_read_loads_nothing(world, caplog):
     world.query.answer("get_isolation_proof", TypedRpcRemoteError("PERMISSION_DENIED", "cli only"))
     with caplog.at_level(logging.ERROR):
@@ -2791,11 +2925,13 @@ def test_a_final_refusal_stops_the_resend(world, caplog):
     assert len(retirements(world)) == 1 and "AUTHORED_STATE_CONFLICT" in caplog.text
 
 
-def test_reconcile_sends_pending_retirements(world):
+def test_reconcile_refreshes_the_proof_and_sends_pending_retirements(world):
     world.rt._config_mtime = None
     world.rt._authored_deployments.request_retirement("sha256:" + "a" * 64, "SANDBOX_ERROR")
     world.rt._reconcile_sync()
     assert len(retirements(world)) == 1
+    assert ("get_isolation_proof", {"image_digest": IMAGE_DIGEST}) in world.query.calls
+    assert world.rt._authored_deployments.is_proven(IMAGE_DIGEST)
 
 
 def test_unloading_closes_its_sessions(world):
@@ -2866,6 +3002,7 @@ class AuthoredDeployments:
         self._lock = threading.Lock()
         self._retiring: dict[str, str] = {}           # digest -> fault code, until the trader answers
         self._retired: set[str] = set()
+        self._proven_build: Optional[str] = None      # the live build with a passing proof, at the last refresh
 
     def build(self, name: str, deployment: Any, *, storage: Any,
               universe_accessor: Any) -> Optional[AuthoredLiveStrategy]:
@@ -2879,11 +3016,12 @@ class AuthoredDeployments:
                           deployment.version_digest, deployment.strategy_digest, deployment.strategy_path)
             self.request_retirement(digest, "SANDBOX_DIGEST_MISMATCH")
             return None
-        if not self._isolation_proven():
+        if not self.refresh_proof():
             return None
         instance = AuthoredLiveStrategy(client=self._client, digest=digest, class_name=deployment.class_name,
                                         params=deployment.params, bar_size=deployment.bar_size,
-                                        conids=deployment.conids, on_fault=self.request_retirement)
+                                        conids=deployment.conids, on_fault=self.request_retirement,
+                                        proof_gate=self.is_proven)
         instance.install(StrategyContext(
             name=name, bar_size=BarSize.parse_str(deployment.bar_size), conids=list(deployment.conids),
             universe=None, historical_days_prior=AI_HISTORY_DAYS, paper_only=True, storage=storage,
@@ -2939,30 +3077,43 @@ class AuthoredDeployments:
                       digest, reply.get("code"), reply.get("detail"))
         return True
 
-    def _isolation_proven(self) -> bool:
-        """Spec 7.9 and Plan 4 ruling 19: a passing proof for the build id the live sandbox reports now (D2)."""
+    def is_proven(self, build: Optional[str]) -> bool:
+        """The live proxies' proof gate (review r1 #6): only the build the last refresh proved."""
+        with self._lock:
+            return build is not None and build == self._proven_build
+
+    def refresh_proof(self) -> bool:
+        """At every load and every reconcile: the build the live sandbox reports now, and whether its newest
+        proof passed. Any failure leaves no proven build, so live sessions stop (fail closed)."""
+        proven = self._isolation_proven()
+        with self._lock:
+            self._proven_build = proven
+        return proven is not None
+
+    def _isolation_proven(self) -> Optional[str]:
+        """Spec 7.9 and Plan 4 ruling 19: the live build id when it has a passing proof (D2), else None."""
         try:
             image_digest = self._client.ping().image_digest
         except SandboxUnavailable as exc:
             logging.error("%s: the live sandbox does not answer (%s); authored deployments wait",
                           SANDBOX_UNAVAILABLE_ALARM, exc)
-            return False
+            return None
         try:
             reply = self._query.call("get_isolation_proof", {"image_digest": image_digest}, dict,
                                      timeout=TRADER_TIMEOUT_SECONDS)
         except TypedRpcRemoteError as remote:
             logging.error("%s: get_isolation_proof refused (%s: %s); authored deployments are not loaded",
                           ISOLATION_ALARM, remote.code, remote.message)
-            return False
+            return None
         except TRANSPORT_ERRORS as exc:
             logging.warning("isolation proof not readable (%s); authored deployments wait for the next reconcile",
                             type(exc).__name__)
-            return False
+            return None
         if not proof_passes(reply, image_digest):
             logging.error("%s: no passing isolation proof for sandbox build %s; run `mmr ai-author "
                           "prove-isolation`", ISOLATION_ALARM, image_digest)
-            return False
-        return True
+            return None
+        return image_digest
 ```
 
 - [ ] **Step 4: Ask the instance in `source_unchanged`**
@@ -3052,15 +3203,16 @@ In `_reconcile_sync`, right after the `source.reconcile()` block:
         authored = getattr(self, '_authored_deployments', None)
         if authored is not None:
             try:
+                authored.refresh_proof()          # Plan 4 ruling 19: the live proxies read it on every bar
                 authored.send_retirements()
             except Exception as ex:
-                logging.warning('authored retirements not sent (will retry next cycle): %s', ex)
+                logging.warning('authored proof refresh or retirements failed (will retry next cycle): %s', ex)
 ```
 
 - [ ] **Step 6: Run the tests and the SP2c strategy tests**
 
 Run: `.venv/bin/python -m pytest tests/strategy/test_authored_deployments.py tests/strategy/test_authored_live.py tests/test_strategy_ai_deployments.py tests/test_strategy_artifact_soft_load.py tests/test_strategy_runtime.py -q`
-Expected: PASS. If `test_reconcile_sends_pending_retirements` fails on a runtime attribute the test runtime lacks, set it in that test the way `tests/test_strategy_runtime.py` builds its runtime; do not change `_reconcile_sync` for the test.
+Expected: PASS. If `test_reconcile_refreshes_the_proof_and_sends_pending_retirements` fails on a runtime attribute the test runtime lacks, set it in that test the way `tests/test_strategy_runtime.py` builds its runtime; do not change `_reconcile_sync` for the test.
 
 - [ ] **Step 7: Commit**
 
@@ -3221,7 +3373,7 @@ def test_the_live_proxy_matches_the_catalogue_orb_bar_for_bar():
     frame, sandbox = orb_session_bars(), FakeSandbox()
     live = AuthoredLiveStrategy(client=sandbox, digest=sandbox.add(orb_fixture_source()), class_name=PORT_CLASS,
                                 params=ORB_PARAMS, bar_size="1 min", conids=[CONID],
-                                on_fault=lambda digest, code: None)
+                                on_fault=lambda digest, code: None, proof_gate=lambda build: True)
     live.install(StrategyContext(name="aidv-orb", bar_size=BarSize.Mins1, conids=[CONID], universe=None,
                                  historical_days_prior=5, paper_only=True, storage=None, universe_accessor=None,
                                  logger=logging))
@@ -3266,7 +3418,14 @@ The owner confirmed on 2026-10-11 (Plan 1 ruling 1, spec section 14): an authore
 - Consumes: Task 4 `build_cohort_spec` authored branch and `tests/research/authored_fixtures.py`; SP2c `evaluation_period`, `generate_walk_forward`, `_require_buildable_walk_forward`.
 - Produces: `ResearchServiceConfig.authored_evaluation_sessions: int = 302` (1..`period_sessions`); `authored_walk_forward(config) -> ResearchServiceConfig` (the same config with `period_sessions = authored_evaluation_sessions` and `holdout_sessions = max(1, round(holdout_sessions × authored / period))`); an authored `CohortSpec.base` whose period and holdout come from it.
 
-- [ ] **Step 1: Let the fixture take a config.** In `tests/research/authored_fixtures.py`, change the signature to `def research_world(tmp_path, tmp_duckdb_path, *, drift: float = 0.0006, config=CONFIG) -> SimpleNamespace:` and in `build_body` pass `config=config` instead of `config=CONFIG`.
+- [ ] **Step 1: Pin a valid authored length in the fixture and let it take a config** (review r1: the 302 default would not fit the fixture's 38-session period). In `tests/research/authored_fixtures.py` change `CONFIG` to
+
+```python
+CONFIG = ResearchServiceConfig(period_sessions=38, folds=2, embargo_sessions=1, holdout_sessions=5,
+                               authored_evaluation_sessions=38)   # equal to the period: Tasks 3-8 keep their windows
+```
+
+change the signature to `def research_world(tmp_path, tmp_duckdb_path, *, drift: float = 0.0006, config=CONFIG) -> SimpleNamespace:` and in `build_body` pass `config=config` instead of `config=CONFIG`.
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -3298,6 +3457,13 @@ def test_the_default_is_302_with_sp2c_proportions():
     short = authored_walk_forward(config)
     assert (short.period_sessions, short.holdout_sessions, short.folds, short.embargo_sessions) == (302, 39, 6, 5)
     assert authored_walk_forward(replace(config, authored_evaluation_sessions=690)) == config
+
+
+def test_a_config_built_in_code_with_a_shorter_period_keeps_its_period():
+    # A test or SP2c world that builds ResearchServiceConfig directly (period 38 or 40) keeps the 302 default;
+    # the authored length never exceeds the period.
+    short = ResearchServiceConfig(period_sessions=38, folds=2, embargo_sessions=1, holdout_sessions=5)
+    assert authored_walk_forward(short) == short
 
 
 @pytest.mark.parametrize("value", [0, True, 691, "302"])
@@ -3352,7 +3518,7 @@ Add below `_require_buildable_walk_forward`:
 def authored_walk_forward(config: ResearchServiceConfig) -> ResearchServiceConfig:
     """The research config an authored evaluation uses: the most recent ``authored_evaluation_sessions`` sessions,
     the same folds and embargo, and the holdout scaled in proportion (SP2c's 90 of 690 becomes 39 of 302)."""
-    sessions = config.authored_evaluation_sessions
+    sessions = min(config.authored_evaluation_sessions, config.period_sessions)
     if sessions == config.period_sessions:
         return config
     holdout = max(1, round(config.holdout_sessions * sessions / config.period_sessions))
@@ -3390,7 +3556,7 @@ Everything after it (the period, the walk-forward plan, the fresh-holdout check,
 
 - [ ] **Step 7: Run the tests and the SP2c config, cohort and Task 4 tests**
 
-Run: `.venv/bin/python -m pytest tests/research/test_authored_evaluation_length.py tests/research/test_authored_spec.py tests/research/test_service_config.py tests/research/test_cohort.py -q` (skip a listed SP2c file that does not exist on the base; `grep -rln research_service tests/research` finds the config tests).
+Run: `.venv/bin/python -m pytest tests/research/test_authored_evaluation_length.py tests/research/test_authored_spec.py tests/research/test_authored_backtest.py tests/research/test_authored_trials.py tests/research/test_authored_evaluation.py tests/research/test_authored_evaluation_service.py tests/research/test_authored_attest_shadow.py tests/research/test_service_config.py tests/research/test_cohort.py -q` (the authored smoke, cohort and service tests of Tasks 3-8 must still reach their assertions with the pinned length) (skip a listed SP2c file that does not exist on the base; `grep -rln research_service tests/research` finds the config tests).
 Expected: PASS. A shipped `trader.yaml` without the key loads with 302.
 
 - [ ] **Step 8: Commit**

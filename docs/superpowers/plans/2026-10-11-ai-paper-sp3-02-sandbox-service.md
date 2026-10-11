@@ -14,7 +14,7 @@
 
 - Base: master after SP3 Plan 1 (`trader/authored/api.py`, `keys.py`, `allowed_api.py`, `static_check.py`). This plan imports `AuthoredStrategy`, `Decision`, `source_digest`, `ALLOWED_IMPORTS`, `require_clean`, `AuthoredStaticRejected` exactly as the index names them.
 - Python 3.12. No new dependency. Load YAML with `yaml.safe_load` only.
-- Spec values (as amended by SP3 decision D1, spec section 14): live pool 3, research pool 4; child uids `20001..20007`, group `sbxchild` gid 20000; per-bar wall 2 s; child memory 256 MB; `pids_limit: 64`, `cpus: 2`, `mem_limit: 4g`; `network_mode: none`, `read_only: true`, `cap_drop: [ALL]`, `cap_add: [SETUID, SETGID, KILL]`, `no-new-privileges:true`; tmpfs `/tmp` 64 MB `noexec`; environment `TZ=UTC`, `PYTHONDONTWRITEBYTECODE=1`, `HOME=/tmp`, `TMPDIR=/tmp`, `NUMBA_CACHE_DIR=/tmp/numba`, `MPLCONFIGDIR=/tmp/mpl` (plus the build id, ruling 1).
+- Spec values (as amended by SP3 decision D1, spec section 14): live pool 3, research pool 4; child uids `20001..20007`, group `sbxchild` gid 20000; per-bar wall 2 s; child memory = the address space mapped at fork + 256 MiB (ruling 3); `pids_limit: 64`, `cpus: 2`, `mem_limit: 4g`; `network_mode: none`, `read_only: true`, `cap_drop: [ALL]`, `cap_add: [CHOWN, SETUID, SETGID, KILL]` where CHOWN is used only at startup to create the slot directories and is dropped before serving (ruling 2; the slot wipe needs no capability, ruling 28), so the serving set is SETUID, SETGID and KILL; `no-new-privileges:true`; tmpfs `/tmp` 64 MB `noexec`; environment `TZ=UTC`, `PYTHONDONTWRITEBYTECODE=1`, `HOME=/tmp`, `TMPDIR=/tmp`, `NUMBA_CACHE_DIR=/tmp/numba`, `MPLCONFIGDIR=/tmp/mpl` (plus the build id, ruling 1).
 - Sockets: `/run/sandbox-live/sandbox.sock`, `/run/sandbox-research/sandbox.sock`, group `trader` (gid 1000), mode 0660. Store at `/store`, read-only.
 - AI code never runs in `research`, `strategy`, `trader` or `ai`. The production entry never enables the fake child mode, and the store path never skips `require_clean`.
 - Fail loudly: every refusal carries a code and a short detail. Never return an empty result for an error.
@@ -26,7 +26,7 @@
 ## Rulings
 
 1. **Plan 2 ruling 1:** The identity in `PONG` is a build id, not the Docker image id. `docker.sh -b` passes `MMR_BUILD_ID` (git sha + UTC time) as a build arg. The Dockerfile bakes it into `/etc/mmr-build-id` and the label `mmr.build_id`. The supervisor reads the file and refuses to start on `unset` or a malformed value. This value cannot go stale: a running container always reports the id of its own image, so no `docker inspect` cross-check is needed (SP3 decision D2); the label stays for operators. The trader's isolation record and gate and the strategy service's load check all key on this build id. The field keeps the index name `image_digest`. *Spec amended (section 14):* the spec said "image digest".
-2. **Plan 2 ruling 2:** Per-slot directories. `/tmp` is one 64 MB tmpfs (`noexec,nosuid,nodev`), mode 0755, owned by root. Compose cannot set a tmpfs's uid/gid (the long syntax takes `size` and `mode` only; the short list form takes no options), and a runtime tmpfs mount hides any dir baked into the image at that path. So the supervisor creates `/tmp/s<uid>` for each slot at startup, `chown`s it to the slot uid and group `sbxchild`, mode 0700, then **drops `CAP_CHOWN`** before it serves a single request. The stanza adds `CHOWN` to `cap_add` for the startup window only; after the drop the serving effective set is exactly SETUID/SETGID/KILL (`00000000000000e0`), which is what the spec section 10 production-service check asserts, and what `PONG` reports. Why a per-slot dir: pandas/numpy may write a cache, and a shared 1777 `/tmp` would let one child write where another reads (a cross-session channel), which breaks the "write outside its own dir fails" check. *The brief adds `CHOWN` for startup; since it is dropped before serving, the serving posture still matches spec 7.5's three caps. The owner should confirm this startup-only use of `CHOWN`.* If the owner refuses `CHOWN` entirely, the fallback is **no writable dir** (root-owned 0755 `/tmp`, child `HOME`/`TMPDIR` on a non-writable path, both "write inside" and "write outside" fail, caches tolerated). The container test checks the slot dir's owner and mode, that a write elsewhere fails, and that the serving CapEff is `…e0`.
+2. **Plan 2 ruling 2:** Per-slot directories. `/tmp` is one 64 MB tmpfs (`noexec,nosuid,nodev`), mode 0755, owned by root. Compose cannot set a tmpfs's uid/gid (the long syntax takes `size` and `mode` only; the short list form takes no options), and a runtime tmpfs mount hides any dir baked into the image at that path. So the supervisor creates `/tmp/s<uid>` for each slot at startup, `chown`s it to the slot uid and group `sbxchild`, mode 0700, then **drops `CAP_CHOWN`** before it serves a single request. Wiping a slot after a session needs no capability: a helper running as the slot uid does it (ruling 28). The stanza adds `CHOWN` to `cap_add` for the startup window only; after the drop the serving effective set is exactly SETUID/SETGID/KILL (`00000000000000e0`), which is what the spec section 10 production-service check asserts, and what `PONG` reports. Why a per-slot dir: pandas/numpy may write a cache, and a shared 1777 `/tmp` would let one child write where another reads (a cross-session channel), which breaks the "write outside its own dir fails" check. *The brief adds `CHOWN` for startup; since it is dropped before serving, the serving posture still matches spec 7.5's three caps. The owner should confirm this startup-only use of `CHOWN`.* If the owner refuses `CHOWN` entirely, the fallback is **no writable dir** (root-owned 0755 `/tmp`, child `HOME`/`TMPDIR` on a non-writable path, both "write inside" and "write outside" fail, caches tolerated). The container test checks the slot dir's owner and mode, that a write elsewhere fails, and that the serving CapEff is `…e0`.
 3. **Plan 2 ruling 3:** `RLIMIT_AS` = the address space mapped at fork + 256 MiB. A forked pandas process already maps more than 256 MB, so an absolute 256 MB limit would fail every allocation. *Conflict with spec 7.5 wording.*
 4. **Plan 2 ruling 4:** `RLIMIT_CPU` = 4 h per session (soft = hard, so the kernel sends SIGKILL). It is only a backstop, because a research session streams a whole evaluation period through one child. The 2 s wall time per step is the real limit. *The spec gives no value.*
 5. **Plan 2 ruling 5:** Other rlimits: `RLIMIT_NPROC` 1 (it counts threads, so no thread and no fork), `RLIMIT_FSIZE` 4 MiB, `RLIMIT_CORE` 0. The supervisor sets `OPENBLAS_NUM_THREADS`, `OMP_NUM_THREADS` and `MKL_NUM_THREADS` to 1 in code before it imports numpy. This keeps the compose environment list as the spec gives it.
@@ -37,7 +37,7 @@
 10. **Plan 2 ruling 10:** `PONG` carries `image_digest`, `boot_id` (random at start), `pid`, `pool`, `free` and `posture`. `posture` holds the supervisor's own CapEff, Seccomp mode, NoNewPrivs, uid, network interfaces, forbidden env names and mounts under `/home`. `SandboxInfo` carries the same fields. These fields are additive to the index.
 11. **Plan 2 ruling 11:** Probe sessions. Spec 7.9 runs hostile checks on the running service, but the protocol table has no request for that. This plan adds `OPEN_PROBE {kind, name}` and the client method `SandboxClient.open_probe`. Names resolve only against two directories in the read-only image: `trader/sandbox/probes/` (kind `probe`) and `tests/authored/escapes/` (kind `escape`). These are the only sessions that skip `require_clean`. `OPEN` (the store path) never skips it. Plan 1's corpus test asserts that every escape file, and each of the nine `HOSTILE_ESCAPES`, *is* refused by `check_source` (D9). A probe session holds one conid, `PROBE_CONID`. *Spec amended (section 14).*
 12. **Plan 2 ruling 12:** The fake child mode is a `spawner` argument of `Supervisor`. `tests/sandbox/fakes.py` defines `InProcessSpawner`. `trader/sandbox_service.py` always passes `ForkSpawner()` and reads no option, environment variable or argument that could change this. A test asserts that no module under `trader/` imports `tests`.
-13. **Plan 2 ruling 13:** A failed tmpfs wipe quarantines the slot: it is never reused, the failure is logged at ERROR, and `PONG.free` shows the loss. Reusing a dirty slot would let a later session read files from an earlier one, which is a lookahead channel.
+13. **Plan 2 ruling 13:** A failed tmpfs wipe (ruling 28) quarantines the slot: it is never reused, the failure is logged at ERROR, and `PONG.free` shows the loss. Reusing a dirty slot would let a later session read files from an earlier one, which is a lookahead channel.
 14. **Plan 2 ruling 14:** `init: true` (docker-init is PID 1), so the supervisor is an ordinary process: a signal that reaches it is not ignored. `ipc: none` removes `/dev/shm`. `entrypoint` replaces `docker-entrypoint.sh`.
 15. **Plan 2 ruling 15:** The supervisor joins group `trader` (`setgroups([1000])`). It sets `/run/sandbox-*` to root:trader 0750 and each socket to 0660. A child calls `setgroups([])` before `setresgid`/`setresuid`.
 16. **Plan 2 ruling 16:** Seccomp profile = moby `v27.5.1` `profiles/seccomp/default.json` (sha256 `9c1025c88ccaa517b648da571961838744ea2137f176bfe6a48b21294cae9c76`), vendored verbatim. `ptrace`, `process_vm_readv`, `process_vm_writev`, `kcmp` and `pidfd_open` are removed from every allow rule. The default action is `SCMP_ACT_ERRNO` with errno 1, so these calls fail with EPERM. No explicit rule is added that matches the default action, because runc skips such a rule and crun may refuse it.
@@ -51,7 +51,10 @@
 24. **Plan 2 ruling 24:** `os.fork()` runs inside an asyncio process that has an executor thread pool (the per-bar timeout uses `run_in_executor`). This is the known 3.12 fork-with-threads hazard. It is low risk here: the BLAS libraries are single-threaded (ruling 5), the executor threads only ever block in `recv`, and the child calls only async-signal-safe operations (`setresuid`, `setrlimit`, `os.exec`-free) before it serves. The child never touches the inherited event loop. Recorded so the hazard is explicit.
 25. **Plan 2 ruling 25:** Concurrency. The server offloads every request except `PING` to a thread pool so the event loop never blocks; `PING` is answered inline (lock-free) so health always responds. The supervisor's lock is held only for O(1) bookkeeping (slot pop/append, session insert/remove), never across a fork, a class load or a bar round-trip, so a slow research bar never holds the lock and the two pools stay independent. A `_Session.busy` flag rejects a second concurrent bar on one session. The 2 s timeout fires on the loop and calls `drop_connection`, which takes the free lock and kills the child; the kill makes the in-flight `send_bar` in the worker thread return an error. *Trade-off:* the pools share slots independently (research never consumes live's slots), but under extreme load both share one thread pool (16 workers for 7 possible sessions, so never starved in practice).
 26. **Plan 2 ruling 26 (SP3 decision D1, spec amended in section 14):** A live session serves one authored deployment. `OPEN` carries `conids: [int]` (1-20, distinct, positive; `MAX_SESSION_CONIDS = 20` equals SP2c `MAX_CONIDS`); `BAR` and `SIGNAL` carry `conid`. One child (one slot uid) holds one strategy instance and one trimmed history per conid; all run the same digest, so no isolation is needed between them. Bar times must increase per conid. A conid outside the session is `SANDBOX_BAD_REQUEST`. A fault on any conid ends the whole session. Pools: live 3 (one per deployment; the trader caps `max_active` at 3), research 4 with exactly one conid per session (`MAX_CONIDS_PER_SESSION`). Seven slots, uids `20001..20007`. `OPEN_PROBE` also carries `conids` (one, `PROBE_CONID = 1`), so `BAR` is uniform.
-27. **Plan 2 ruling 27 (SP3 decisions D2, D3):** The posture in `PONG` also reports `root_read_only` (from `/proc/mounts`) and `pids_max` (cgroup v2, then v1), and `run_isolation_checks` checks them (`read_only_root`, `pids_limit` = 64). With caps, seccomp, no-new-privileges, interfaces and env already in the posture, the proof needs no host `docker inspect`. `escape_kill_other_child` runs while a benign probe session is held open; the check passes only if the escape faults and the neighbour still answers.
+27. **Plan 2 ruling 27 (SP3 decisions D2, D3):** The posture in `PONG` also reports `root_read_only` (from `/proc/mounts`) and `pids_max` (cgroup v2, then v1), and `run_isolation_checks` checks them (`read_only_root`, `pids_limit` = 64). With caps, seccomp, no-new-privileges, interfaces and env already in the posture, the proof needs no host `docker inspect`. Every hostile check (`hostile_check`, review r1 #3) passes only if the escape OPENED, faulted at BAR with the marker its behaviour predicts (`EXPECTED_FAULT_MARKERS`; a load fault never counts), and a neighbouring benign session and `PING` still answer afterwards.
+28. **Plan 2 ruling 28 (review r1 #2):** The serving supervisor cannot read a 0700 slot directory its child owns (no CAP_CHOWN or CAP_DAC_*). `wipe_slot_as_owner` forks a short-lived helper, drops it to the slot uid (`setgroups([])`, gid 20000, the slot uid; `RLIMIT_CPU` 5 s), empties the directory and exits 0; any failure quarantines the slot. The session leaves the table under the lock, and the kill, the wipe and the slot release run outside it (ruling 25). The container test `test_a_closed_session_leaves_a_clean_slot_and_frees_it` proves it under the real serving capabilities.
+29. **Plan 2 ruling 29:** `OPENED` carries the supervisor's build id (`SandboxSession.image_digest`), so the strategy service can refuse a session that opened on an unproven build without a separate `PING` race (Plan 4 ruling 19). `PONG` carries `live_open`, the number of open live sessions, on both sockets; `prove-isolation` refuses while it is not 0 (owner ruling 2026-10-11; Plan 3 ruling 15), which also keeps a probe away from a live child's abstract sockets (ruling 21).
+30. **Plan 2 ruling 30 (review r1 #8 and follow-up):** the sandbox full-stack run shares nothing with a live stack on the same host. `scripts/run_sandbox_fullstack.sh` always passes `-p mmr-sbxtest` (an override must start with `mmr-sbxtest`, else exit 2), so containers, network and named volumes are its own; `docker-compose.sbxtest.override.yml` publishes no host port and gives ib-gateway no `.env` (no IB login that could end the live session); `${HOME}` points at a throwaway directory with a copy of `config_defaults` and keys made by `mmr keys init` for the run; `--env-file` is an empty file, so `.env` is never interpolated. Before `up`, `scripts/check_sbxtest_config.py` checks the rendered config and refuses (exit 2) on a non-test project, any published port (named as live when in 4200x/4210x/7496/7497/5901/7424/8081), any bind under the operator's `~/.config/mmr` or `~/.local/share/mmr`, a read of `.env`, or a volume outside `mmr-sbxtest_*`. `down -v` and the throwaway home are removed on exit. `tests/test_sandbox_fullstack_runner.py` covers the checker, the script and, with Docker, the real rendered config.
 
 ## Review Focus
 
@@ -496,7 +499,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from trader.sandbox.child import ChildError, ChildRuntime, build_guarded_builtins, load_authored_class
+from trader.sandbox.child import (ChildError, ChildRuntime, build_guarded_builtins, guarded_import,
+                                  load_authored_class)
 
 T0 = datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc)
 C1, C2 = 101, 202
@@ -638,9 +642,10 @@ class Over(AuthoredStrategy):
 
 def test_the_guarded_builtins_hide_dangerous_names():
     guarded = build_guarded_builtins()
-    for name in ("eval", "exec", "open", "__import__", "compile", "input", "breakpoint", "getattr"):
+    for name in ("eval", "exec", "open", "compile", "input", "breakpoint", "getattr"):
         assert name not in guarded
-    assert "len" in guarded and "range" in guarded and "min" in guarded
+    assert guarded["__import__"] is guarded_import
+    assert "len" in guarded and "range" in guarded and "min" in guarded and "__build_class__" in guarded
 
 
 def test_a_disallowed_import_at_module_load_is_blocked():
@@ -677,6 +682,46 @@ class Late(AuthoredStrategy):
     runtime.load()
     with pytest.raises(ChildError):
         runtime.on_bar(C1, T0, BAR)
+
+
+def test_the_benign_api_class_loads_and_answers_one_bar():
+    # Review r1 #1: a class statement needs __build_class__, and `from trader.authored.api import ...` must pass
+    # the guard by its exact module name although ALLOWED_IMPORTS has no root `trader`.
+    source = '''
+import numpy as np
+from trader.authored.api import AuthoredStrategy, Decision
+
+
+class Benign(AuthoredStrategy):
+    LOOKBACK_BARS = 5
+
+    def on_bar(self, history, params):
+        if np.mean(history["close"]) > 0:
+            return Decision(action="BUY", probability=min(len(history) / 10.0, 1.0))
+        return None
+'''
+    runtime = ChildRuntime(source=source, class_name="Benign", params={}, lookback=5, conids=(C1,))
+    runtime.load()
+    assert runtime.on_bar(C1, T0, BAR) == {"action": "BUY", "probability": 0.1}
+
+
+@pytest.mark.parametrize("statement", ["from trader.sandbox import protocol", "import trader.authored.api",
+                                       "from trader.authored import keys", "from trader import authored",
+                                       "import trader"])
+def test_every_other_trader_import_is_refused(statement):
+    source = f"""
+{statement}
+from trader.authored.api import AuthoredStrategy, Decision
+
+
+class Sneaky(AuthoredStrategy):
+    LOOKBACK_BARS = 2
+
+    def on_bar(self, history, params):
+        return None
+"""
+    with pytest.raises(ChildError, match="not allowed"):
+        load_authored_class(source, "Sneaky", skip_static_check=True)
 ```
 
 - [ ] **Step 2: Run** `.venv/bin/python -m pytest tests/sandbox/test_child_runtime.py -q` — expected: FAIL (`ModuleNotFoundError`).
@@ -729,9 +774,14 @@ class ChildError(Exception):
         self.detail = detail
 
 
+_API_MODULE = "trader.authored.api"
+
+
 def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
-    root = name.split(".")[0]
-    if level != 0 or root not in _ALLOWED_IMPORT_NAMES:
+    """Exact module names only (review r1 #1). ``trader.authored.api`` passes only as ``from ... import``, so the
+    authored module gets the API module itself, never the ``trader`` package."""
+    allowed = name in _ALLOWED_IMPORT_NAMES and (name != _API_MODULE or bool(fromlist))
+    if level != 0 or not allowed:
         raise ChildError(f"import of {name!r} is not allowed")
     return _builtins.__import__(name, globals, locals, fromlist, level)
 
@@ -740,6 +790,9 @@ def build_guarded_builtins() -> dict:
     guarded = {name: getattr(_builtins, name) for name in _SAFE_BUILTIN_NAMES
                if hasattr(_builtins, name)}
     guarded["__import__"] = guarded_import
+    # A class statement calls __build_class__ (review r1 #1). Authored source can never name it: the static
+    # checker refuses every name that starts with "_".
+    guarded["__build_class__"] = _builtins.__build_class__
     return guarded
 
 
@@ -1062,13 +1115,13 @@ The supervisor is transport-free: it takes parsed requests and returns reply dic
 
 **Files:**
 - Create: `trader/sandbox/supervisor.py`
-- Create: `trader/sandbox/probes/__init__.py` (empty), `trader/sandbox/probes/benign_orb.py`
+- Create: `trader/sandbox/probes/__init__.py` (empty), `trader/sandbox/probes/benign_orb.py`, `trader/sandbox/probes/writes_own_slot.py`
 - Create: `tests/sandbox/fakes.py`
 - Test: `tests/sandbox/test_supervisor.py`
 
 **Interfaces:**
 - Consumes: Task 1 `protocol` (`Request`, codes, `validate_signal`, `FrameError`), Task 2 `child` (`Spawner`, `SpawnSpec`, `ChildError`, `ChildHandle`, `ChildRuntime`, `load_authored_class`), Plan 1 `source_digest`, `require_clean`, `AuthoredStaticRejected`.
-- Produces: `Pool` (`name`, `size`, slot pool), `Supervisor(*, spawners, pool_sizes, store_dir, image_digest, posture, child_mem_bytes=256*1024*1024)`, `LIVE_POOL_SIZE = 3`, `RESEARCH_POOL_SIZE = 4`, `MAX_CONIDS_PER_SESSION = {"live": 20, "research": 1}`, `Supervisor.handle(pool_name, conn_id, request) -> dict`, `Supervisor.drop_connection(conn_id) -> None`, `Supervisor.pong(pool_name) -> dict`, `Slot` (uid, dir). `PROBE_DIR`, `ESCAPE_DIR`. `tests/sandbox/fakes.py`: `InProcessSpawner`.
+- Produces: `Pool` (`name`, `size`, slot pool), `Supervisor(*, spawners, pool_sizes, store_dir, image_digest, posture, child_mem_bytes=256*1024*1024, wiper=None)`, `wipe_slot_as_owner(slot) -> bool` (ruling 28), `SBXCHILD_GID`, `LIVE_POOL_SIZE = 3`, `RESEARCH_POOL_SIZE = 4`, `MAX_CONIDS_PER_SESSION = {"live": 20, "research": 1}`, `Supervisor.handle(pool_name, conn_id, request) -> dict`, `Supervisor.drop_connection(conn_id) -> None`, `Supervisor.pong(pool_name) -> dict`, `Slot` (uid, dir). `PROBE_DIR`, `ESCAPE_DIR`. `tests/sandbox/fakes.py`: `InProcessSpawner`.
 
 - [ ] **Step 1: Write the failing tests.** Write `tests/sandbox/fakes.py`:
 
@@ -1116,6 +1169,7 @@ Write `tests/sandbox/test_supervisor.py`:
 
 ```python
 import hashlib
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -1175,6 +1229,7 @@ def test_open_then_bars_then_close(tmp_path):
     opened = _open(sup, tmp_path)
     assert opened["type"] == "OPENED"
     session = opened["session"]
+    assert opened["image_digest"] == "mmr-build-id"                  # ruling 29: the session's own build
     reply = _bar(sup, session, T0)
     assert reply["type"] == "SIGNAL" and reply["action"] is None and reply["conid"] == C1
     reply = _bar(sup, session, T0 + timedelta(minutes=1))
@@ -1298,7 +1353,58 @@ def test_pong_reports_the_image_digest_and_free_counts(tmp_path):
     sup = _supervisor(tmp_path, live=3, research=4)
     pong = sup.pong("live")
     assert pong["type"] == "PONG" and pong["image_digest"] == "mmr-build-id"
-    assert pong["free"] == 3 and pong["pool"] == "live"
+    assert pong["free"] == 3 and pong["pool"] == "live" and pong["live_open"] == 0
+    _open(sup, tmp_path)
+    assert sup.pong("research")["live_open"] == 1                     # every socket reports the live count
+
+
+def test_a_closed_session_wipes_its_slot_outside_the_lock_and_frees_it(tmp_path):    # review r1 #2
+    sup = _supervisor(tmp_path, live=1)
+    wiped = []
+
+    def wiper(slot):
+        assert not sup._lock.locked()              # ruling 25: the wipe helper is never forked under the lock
+        wiped.append(slot.uid)
+        return True
+    sup._wiper = wiper
+    session = _open(sup, tmp_path)["session"]
+    assert sup.handle("live", 1, p.parse_request({"v": 1, "type": "CLOSE", "session": session}))["type"] == "CLOSED"
+    assert wiped == [20001] and sup.pong("live")["free"] == 1
+    assert _open(sup, tmp_path, conn=2)["type"] == "OPENED"
+
+
+def test_a_slot_that_cannot_be_wiped_is_never_reused(tmp_path):
+    sup = _supervisor(tmp_path, live=1)
+    sup._wiper = lambda slot: False
+    session = _open(sup, tmp_path)["session"]
+    sup.handle("live", 1, p.parse_request({"v": 1, "type": "CLOSE", "session": session}))
+    assert sup.pong("live")["free"] == 0 and _open(sup, tmp_path, conn=2)["code"] == p.SANDBOX_BUSY
+
+
+def test_the_wipe_helper_empties_the_directory_as_the_slot_uid(tmp_path, monkeypatch):
+    from trader.sandbox.supervisor import Slot, wipe_slot_as_owner
+
+    directory = tmp_path / "s20001"
+    (directory / "nested").mkdir(parents=True)
+    (directory / "leftover.csv").write_text("x")
+    (directory / "nested" / "deep.txt").write_text("y")
+    seen = tmp_path / "uid-seen"
+    for name in ("setgroups", "setresgid"):
+        monkeypatch.setattr(os, name, lambda *args: None)       # a unit test is not root
+    monkeypatch.setattr(os, "setresuid", lambda *ids: seen.write_text(str(ids)))
+    assert wipe_slot_as_owner(Slot(uid=20001, directory=str(directory))) is True
+    assert list(directory.iterdir()) == [] and seen.read_text() == "(20001, 20001, 20001)"
+
+
+def test_a_helper_that_cannot_become_the_slot_uid_leaves_a_dirty_slot(tmp_path, monkeypatch):
+    from trader.sandbox.supervisor import Slot, wipe_slot_as_owner
+
+    directory = tmp_path / "s20002"
+    directory.mkdir()
+    (directory / "leftover.csv").write_text("x")
+    monkeypatch.setattr(os, "setgroups", lambda *args: (_ for _ in ()).throw(PermissionError("not root")))
+    assert wipe_slot_as_owner(Slot(uid=20002, directory=str(directory))) is False
+    assert (directory / "leftover.csv").exists()
 
 
 def test_the_production_pools_are_three_live_and_four_research():
@@ -1337,6 +1443,27 @@ class BenignOrb(AuthoredStrategy):
         return None
 ```
 
+and `trader/sandbox/probes/writes_own_slot.py` (a probe, so it loads with the static check skipped; used by the container test of ruling 28):
+
+```python
+"""Writes one file into its own slot directory and says whether the directory was clean when it started.
+
+BUY: the slot was empty (the last session's files were wiped). SELL: a file was left from an earlier session.
+"""
+import pandas as pd
+
+from trader.authored.api import AuthoredStrategy, Decision
+
+
+class WritesOwnSlot(AuthoredStrategy):
+    LOOKBACK_BARS = 2
+
+    def on_bar(self, history, params):
+        clean = len(pd.io.common.os.listdir(".")) == 0       # the child's working directory is its slot
+        history.to_csv("leftover.csv")
+        return Decision(action="BUY" if clean else "SELL", probability=0.5)
+```
+
 Write `trader/sandbox/supervisor.py`:
 
 ```python
@@ -1348,11 +1475,13 @@ server (sandbox_service) wires sockets to it and reports a dropped connection.
 from __future__ import annotations
 
 import logging
+import os
+import resource
 import secrets
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping, Optional
 
 from trader.authored.keys import source_digest
 from trader.authored.static_check import AuthoredStaticRejected, require_clean
@@ -1404,8 +1533,10 @@ class Pool:
 class Supervisor:
     def __init__(self, *, spawners: Mapping[str, Spawner], pool_sizes: Mapping[str, int],
                  store_dir: str, image_digest: str, posture: Mapping[str, object],
-                 child_mem_bytes: int = 256 * 1024 * 1024):
+                 child_mem_bytes: int = 256 * 1024 * 1024,
+                 wiper: Optional[Callable[["Slot"], bool]] = None):
         self._spawners = dict(spawners)
+        self._wiper = wiper or wipe_slot_as_owner     # ruling 28: the slot uid empties its own directory
         self._store = Path(store_dir)
         self._image_digest = image_digest
         self._posture = dict(posture)
@@ -1442,12 +1573,16 @@ class Supervisor:
         return {"type": "PONG", "v": proto.PROTOCOL_VERSION, "image_digest": self._image_digest,
                 "boot_id": self._boot_id, "pool": pool_name,
                 "free": len(pool.free_slots) if pool else 0,
-                "size": pool.size if pool else 0, "posture": self._posture}
+                "size": pool.size if pool else 0, "posture": self._posture,
+                # Owner ruling: prove-isolation refuses while a live session is open (ruling 29).
+                "live_open": sum(1 for session in list(self._sessions.values()) if session.pool == "live")}
 
     def drop_connection(self, conn_id: int) -> None:
         with self._lock:
-            for session in [s for s in self._sessions.values() if s.conn_id == conn_id]:
-                self._end(session)
+            ended = [self._sessions.pop(s.session_id) for s in list(self._sessions.values())
+                     if s.conn_id == conn_id]
+        for session in ended:
+            self._finish(session)
 
     # ── open: the store path ────────────────────────────────────────────────
     def _open_store(self, pool_name: str, conn_id: int, request: proto.Request) -> dict:
@@ -1503,14 +1638,15 @@ class Supervisor:
         try:
             handle = self._spawners[pool_name].spawn(spec)
         except ChildError as exc:
-            with self._lock:
-                self._reclaim(pool, slot)
+            self._release(pool_name, slot)
             return _error(proto.SANDBOX_ERROR, exc.detail)
         with self._lock:
             session_id = "s" + secrets.token_hex(8)
             self._sessions[session_id] = _Session(session_id, pool_name, conn_id, slot, handle,
                                                   conids=tuple(conids))
-        return {"type": "OPENED", "v": proto.PROTOCOL_VERSION, "session": session_id}
+        # The build id travels with OPENED, so a caller knows which image this very session runs on (ruling 29).
+        return {"type": "OPENED", "v": proto.PROTOCOL_VERSION, "session": session_id,
+                "image_digest": self._image_digest}
 
     def _bar(self, conn_id: int, request: proto.Request) -> dict:
         with self._lock:
@@ -1534,9 +1670,9 @@ class Supervisor:
             proto.validate_signal(payload)
         except (ChildError, proto.FrameError) as exc:
             with self._lock:
-                live = self._sessions.get(request.session)
-                if live is not None:
-                    self._end(live)
+                live = self._sessions.pop(request.session, None)
+            if live is not None:
+                self._finish(live)
             return _error(proto.SANDBOX_ERROR, getattr(exc, "detail", str(exc)))
         with self._lock:
             live = self._sessions.get(request.session)
@@ -1553,24 +1689,28 @@ class Supervisor:
             session = self._sessions.get(request.session)
             if session is None or session.conn_id != conn_id:
                 return _error(proto.SANDBOX_BAD_REQUEST, "unknown session")
-            self._end(session)
+            self._sessions.pop(session.session_id, None)
+        self._finish(session)
         return {"type": "CLOSED", "v": proto.PROTOCOL_VERSION}
 
-    def _end(self, session: _Session) -> None:
-        """Caller holds the lock. Kill the child, then reclaim its slot."""
-        self._sessions.pop(session.session_id, None)
+    def _finish(self, session: _Session) -> None:
+        """The session already left the table (so no bar reaches it). Outside the lock (ruling 25): kill the child,
+        then wipe and free its slot."""
         try:
             session.handle.close()   # SIGKILL + reap; also unblocks an in-flight send_bar
         except Exception:  # noqa: BLE001 — closing a dead child must not raise
             log.warning("closing session %s raised", session.session_id, exc_info=True)
-        self._reclaim(self._pools[session.pool], session.slot)
+        self._release(session.pool, session.slot)
 
-    def _reclaim(self, pool: Pool, slot: Slot) -> None:
-        if _wipe_slot(slot):
-            pool.free_slots.append(slot)
-        else:
-            pool.quarantined.append(slot)   # ruling 13: never reuse a slot we could not wipe
-            log.error("quarantined slot %s: wipe failed", slot.uid)
+    def _release(self, pool_name: str, slot: Slot) -> None:
+        clean = self._wiper(slot)          # may fork a helper: never under the lock (rulings 25, 28)
+        with self._lock:
+            pool = self._pools[pool_name]
+            if clean:
+                pool.free_slots.append(slot)
+            else:
+                pool.quarantined.append(slot)   # ruling 13: never reuse a slot we could not wipe
+                log.error("quarantined slot %s: wipe failed", slot.uid)
 
 
 def _error(code: str, detail: str) -> dict:
@@ -1584,19 +1724,42 @@ def _first_class(source: str) -> str | None:
     return None
 
 
-def _wipe_slot(slot: Slot) -> bool:
-    directory = Path(slot.directory)
-    try:
-        if not directory.exists():
-            return True
-        for child in directory.iterdir():
-            if child.is_dir() and not child.is_symlink():
-                _rmtree(child)
-            else:
-                child.unlink()
+SBXCHILD_GID = 20000
+_WIPE_CPU_SECONDS = 5
+
+
+def wipe_slot_as_owner(slot: Slot) -> bool:
+    """Empty a slot directory as its own uid (ruling 28, review r1 #2).
+
+    The serving supervisor has only SETUID, SETGID and KILL: no CAP_CHOWN or CAP_DAC_*, so it cannot read a
+    0700 directory its child owns. A short-lived helper forked and dropped to the slot uid can. It runs only
+    unlink/rmdir, then exits; its exit status is the answer. A failure quarantines the slot (ruling 13)."""
+    if not Path(slot.directory).exists():
         return True
-    except OSError:
-        return False
+    pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+            resource.setrlimit(resource.RLIMIT_CPU, (_WIPE_CPU_SECONDS, _WIPE_CPU_SECONDS))
+            os.setgroups([])
+            os.setresgid(SBXCHILD_GID, SBXCHILD_GID, SBXCHILD_GID)
+            os.setresuid(slot.uid, slot.uid, slot.uid)
+            _empty(Path(slot.directory))
+            code = 0
+        except BaseException:  # noqa: BLE001 — any failure is a dirty slot
+            code = 1
+        finally:
+            os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    return os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+
+
+def _empty(directory: Path) -> None:
+    for child in directory.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            _rmtree(child)
+        else:
+            child.unlink()
 
 
 def _rmtree(directory: Path) -> None:
@@ -1819,7 +1982,7 @@ async def test_a_slow_bar_hits_the_wall_timeout(running, tmp_path, monkeypatch):
 
 async def test_a_failed_wipe_quarantines_the_slot(running, tmp_path, monkeypatch):
     sup, live, _, _ = running
-    monkeypatch.setattr("trader.sandbox.supervisor._wipe_slot", lambda slot: False)
+    monkeypatch.setattr(sup, "_wiper", lambda slot: False)
     digest = _store(tmp_path, GOOD)
     reader, writer = await _client(live)
     await _call(reader, writer, {"v": 1, "type": "OPEN", "digest": digest, "class": "Counter",
@@ -2048,7 +2211,7 @@ Callers (Plan 4's research backtester and strategy runtime) are synchronous and 
 
 **Interfaces:**
 - Consumes: Task 1 `protocol`, Task 4 `serve`, Task 3 `Supervisor`, Plan 1 `Decision`.
-- Produces (index names exactly): `SandboxClient(socket_path: str, *, connect_timeout_s=5.0)` with `ping() -> SandboxInfo`, `open_session(digest, class_name, params, bar_size, conids) -> SandboxSession`, `open_probe(kind, name) -> SandboxSession` (one conid, `PROBE_CONID`); `SandboxSession.bar(conid, t, open, high, low, close, volume) -> Decision | None`, `SandboxSession.conids`, `SandboxSession.close()`; `SandboxInfo` (frozen: `image_digest`, `boot_id`, `pool`, `free`, `size`, `posture`); `SandboxUnavailable(Exception)`, `SandboxFault(Exception)` (attribute `code`), `SandboxProtocolError(Exception)`.
+- Produces (index names exactly): `SandboxClient(socket_path: str, *, connect_timeout_s=5.0)` with `ping() -> SandboxInfo`, `open_session(digest, class_name, params, bar_size, conids) -> SandboxSession`, `open_probe(kind, name) -> SandboxSession` (one conid, `PROBE_CONID`); `SandboxSession.bar(conid, t, open, high, low, close, volume) -> Decision | None`, `SandboxSession.conids`, `SandboxSession.image_digest` (from `OPENED`, ruling 29), `SandboxSession.close()`; `SandboxInfo` (frozen: `image_digest`, `boot_id`, `pool`, `free`, `size`, `posture`, `live_open`); `SandboxUnavailable(Exception)`, `SandboxFault(Exception)` (attribute `code`), `SandboxProtocolError(Exception)`.
 
 - [ ] **Step 1: Write the failing tests.** Write `tests/sandbox/test_sandbox_client.py`:
 
@@ -2133,7 +2296,8 @@ def test_open_session_streams_bars_and_returns_decisions(stack):
     digest = stack.store(GOOD)
     client = SandboxClient(stack.live)
     session = client.open_session(digest, "Counter", {}, "1 min", [C1, C2])
-    assert session.conids == (C1, C2)
+    assert session.conids == (C1, C2) and session.image_digest == "build-x"
+    assert client.ping().live_open == 1
     assert session.bar(C1, T0, 1.0, 2.0, 0.5, 1.5, 1.0) is None
     assert session.bar(C2, T0, 1.0, 2.0, 0.5, 1.5, 1.0) is None
     decision = session.bar(C1, T0 + timedelta(minutes=1), 1.0, 2.0, 0.5, 1.5, 1.0)
@@ -2216,7 +2380,7 @@ import socket
 import struct
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 from trader.authored.api import Decision
 from trader.sandbox import protocol as proto
@@ -2247,6 +2411,7 @@ class SandboxInfo:
     free: int
     size: int
     posture: Mapping[str, Any]
+    live_open: Optional[int] = None     # open live sessions; None when PONG did not say (ruling 29)
 
 
 _HEADER = struct.Struct(">I")
@@ -2275,9 +2440,12 @@ class SandboxClient:
             sock.close()
         if reply.get("type") != "PONG":
             raise SandboxUnavailable(f"unexpected reply to PING: {reply!r}")
+        live_open = reply.get("live_open")
         return SandboxInfo(image_digest=reply["image_digest"], boot_id=reply.get("boot_id", ""),
                            pool=reply.get("pool", ""), free=reply.get("free", 0),
-                           size=reply.get("size", 0), posture=reply.get("posture", {}))
+                           size=reply.get("size", 0), posture=reply.get("posture", {}),
+                           live_open=live_open if isinstance(live_open, int) and not isinstance(live_open, bool)
+                           else None)
 
     def open_session(self, digest: str, class_name: str, params: Mapping[str, float],
                      bar_size: str, conids: Sequence[int]) -> "SandboxSession":
@@ -2298,7 +2466,7 @@ class SandboxClient:
             sock.close()
             raise SandboxUnavailable(f"sandbox dropped during OPEN: {exc}") from exc
         if reply.get("type") == "OPENED":
-            return SandboxSession(sock, reply["session"], tuple(request["conids"]))
+            return SandboxSession(sock, reply["session"], tuple(request["conids"]), str(reply["image_digest"]))
         sock.close()
         _raise_for(reply)
         raise SandboxUnavailable(f"unexpected OPEN reply: {reply!r}")
@@ -2307,10 +2475,11 @@ class SandboxClient:
 class SandboxSession:
     """Not thread-safe: the supervisor refuses a second bar in flight on one session (ruling 25)."""
 
-    def __init__(self, sock: socket.socket, session_id: str, conids: tuple[int, ...]):
+    def __init__(self, sock: socket.socket, session_id: str, conids: tuple[int, ...], image_digest: str):
         self._sock = sock
         self._id = session_id
         self.conids = conids
+        self.image_digest = image_digest     # the build this session runs on, from OPENED (ruling 29)
         self._open = True
 
     def bar(self, conid: int, t: datetime, open: float, high: float, low: float, close: float,
@@ -2415,7 +2584,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 **Interfaces:**
 - Consumes: Task 5 `SandboxClient`, `SandboxFault`, `SandboxUnavailable`, `SandboxInfo`; Task 1 datetimes.
-- Produces: `read_posture() -> dict` (adds `root_read_only: bool` and `pids_max: str`); `NEEDS_A_NEIGHBOUR`; `IsolationResult` (frozen: `passed: bool`, `image_digest: str`, `checks: tuple[CheckResult, ...]`), `CheckResult` (frozen: `name: str`, `passed: bool`, `detail: str`), `run_isolation_checks(client: SandboxClient) -> IsolationResult`, `HOSTILE_ESCAPES: tuple[str, ...]`, `EXPECTED_CAP_EFF = "00000000000000e0"`.
+- Produces: `read_posture() -> dict` (adds `root_read_only: bool` and `pids_max: str`); `hostile_check(client, name) -> CheckResult`, `EXPECTED_FAULT_MARKERS`, `LOAD_FAULT_PREFIXES` (ruling 27, review r1 #3); `IsolationResult` (frozen: `passed: bool`, `image_digest: str`, `checks: tuple[CheckResult, ...]`), `CheckResult` (frozen: `name: str`, `passed: bool`, `detail: str`), `run_isolation_checks(client: SandboxClient) -> IsolationResult`, `HOSTILE_ESCAPES: tuple[str, ...]`, `EXPECTED_CAP_EFF = "00000000000000e0"`.
 
 - [ ] **Step 1: Write the failing tests.** Write `tests/sandbox/test_posture.py`:
 
@@ -2461,19 +2630,24 @@ Write `tests/sandbox/test_isolation_checks.py`:
 ```python
 import pytest
 
-from trader.authored.sandbox_client import SandboxFault
+from trader.authored.sandbox_client import SandboxFault, SandboxUnavailable
 from trader.sandbox import isolation_checks as ic
 
 
+def _bar_fault(name):
+    """The detail the real child gives when this escape is contained at BAR (ic.EXPECTED_FAULT_MARKERS)."""
+    return f"on_bar raised {ic.EXPECTED_FAULT_MARKERS[name][0]}: fake"
+
+
 class _FakeSession:
-    def __init__(self, fault):
-        self._fault = fault
+    def __init__(self, fault=None):
+        self.fault = fault             # None: the bar answers; else the SandboxFault detail to raise
         self.bars = 0
 
     def bar(self, conid, *a, **k):
         assert conid == 1      # a probe session holds PROBE_CONID only
-        if self._fault:
-            raise SandboxFault("boom", code="SANDBOX_ERROR")
+        if self.fault is not None:
+            raise SandboxFault(self.fault, code="SANDBOX_ERROR")
         self.bars += 1
         return None
 
@@ -2493,19 +2667,28 @@ class _FakeInfo:
     pool = "research"
     free = 4
     size = 4
+    live_open = 0
     posture = {"cap_eff": ic.EXPECTED_CAP_EFF, "seccomp": 2, "no_new_privs": 1, "uid": 0,
                "interfaces": ["lo"], "forbidden_env": [], "home_mounts": [],
                "root_read_only": True, "pids_max": "64"}
 
 
 class _FakeClient:
-    """Benign probe runs; every hostile escape faults; posture is clean -> all checks pass."""
+    """Benign probes run; every hostile escape opens and faults at BAR for its own reason; posture is clean."""
+
+    def __init__(self):
+        self.pings = 0
 
     def ping(self):
+        self.pings += 1
         return _FakeInfo()
 
     def open_probe(self, kind, name):
-        return _FakeSession(fault=(name != "benign_orb"))
+        return _FakeSession(None if kind == "probe" else _bar_fault(name))
+
+
+def check_of(result, name):
+    return next(c for c in result.checks if c.name == name)
 
 
 def test_a_clean_service_passes_every_check():
@@ -2513,6 +2696,7 @@ def test_a_clean_service_passes_every_check():
     assert result.passed is True and result.image_digest == "build-x"
     assert {c.name for c in result.checks} >= set(ic.HOSTILE_ESCAPES) | {
         "benign_session", "cap_eff", "seccomp", "network_none", "read_only_root", "pids_limit"}
+    assert set(ic.EXPECTED_FAULT_MARKERS) == set(ic.HOSTILE_ESCAPES)
 
 
 def test_the_hostile_names_are_plan_1s_files():
@@ -2522,33 +2706,71 @@ def test_the_hostile_names_are_plan_1s_files():
     assert all((ESCAPE_DIR / f"{name}.py").is_file() for name in ic.HOSTILE_ESCAPES)
 
 
-def test_kill_other_child_needs_the_parallel_benign_session_to_survive():
+def test_an_open_time_fault_is_never_containment():                                     # review r1 #3
+    class NeverOpens(_FakeClient):
+        def open_probe(self, kind, name):
+            if kind == "escape":
+                raise SandboxFault("load failed: NameError: __build_class__ not found", code="SANDBOX_ERROR")
+            return _FakeSession()
+
+    result = ic.run_isolation_checks(NeverOpens())
+    assert result.passed is False
+    assert all(check_of(result, name).detail.startswith("never OPENED") for name in ic.HOSTILE_ESCAPES)
+
+
+@pytest.mark.parametrize("detail", ["load failed: SyntaxError", "constructor failed: TypeError: x",
+                                    "on_bar raised KeyError: 'close'"])
+def test_a_bar_fault_that_the_escape_does_not_explain_is_not_containment(detail):
+    class Unexplained(_FakeClient):
+        def open_probe(self, kind, name):
+            return _FakeSession(None if kind == "probe" else detail)
+
+    result = ic.run_isolation_checks(Unexplained())
+    assert result.passed is False
+    assert not any(check_of(result, name).passed for name in ic.HOSTILE_ESCAPES)
+
+
+def test_an_escape_that_kills_the_neighbour_fails():
     class KillsNeighbour(_FakeClient):
         def __init__(self):
+            super().__init__()
             self.benign = []
 
         def open_probe(self, kind, name):
-            session = _FakeSession(fault=(name != "benign_orb"))
-            if name == "benign_orb":
+            if kind == "probe":
+                session = _FakeSession()
                 self.benign.append(session)
-            if name == "escape_kill_other_child":
-                for held in self.benign:
-                    held._fault = True        # the escape killed the neighbour
-            return session
+                return session
+            for held in self.benign:
+                held.fault = "child pipe closed"           # the escape killed the neighbour
+            return _FakeSession(_bar_fault(name))
 
     result = ic.run_isolation_checks(KillsNeighbour())
-    check = next(c for c in result.checks if c.name == "escape_kill_other_child")
+    check = check_of(result, "escape_kill_other_child")
     assert check.passed is False and "neighbour" in check.detail
+
+
+def test_an_escape_after_which_ping_fails_fails():
+    class DiesAfterEscape(_FakeClient):
+        def ping(self):
+            self.pings += 1
+            if self.pings > 1:
+                raise SandboxUnavailable("supervisor gone")
+            return _FakeInfo()
+
+    result = ic.run_isolation_checks(DiesAfterEscape())
+    assert result.passed is False
+    assert "PING" in check_of(result, ic.HOSTILE_ESCAPES[0]).detail
 
 
 def test_a_hostile_escape_that_does_not_fault_fails_the_run():
     class Leaky(_FakeClient):
         def open_probe(self, kind, name):
-            return _FakeSession(fault=False)   # nothing faults: the sandbox did not contain it
+            return _FakeSession()                # nothing faults: the sandbox did not contain it
 
     result = ic.run_isolation_checks(Leaky())
     assert result.passed is False
-    assert any(not c.passed for c in result.checks)
+    assert all(check_of(result, name).detail == "ran to completion: NOT contained" for name in ic.HOSTILE_ESCAPES)
 
 
 def test_bad_posture_fails_the_run():
@@ -2695,7 +2917,7 @@ from trader.authored.sandbox_client import (
     SandboxClient, SandboxFault, SandboxProtocolError, SandboxUnavailable,
 )
 from trader.sandbox.posture import decode_cap_eff
-from trader.sandbox.protocol import PROBE_CONID
+from trader.sandbox.protocol import PROBE_CONID, SANDBOX_ERROR
 
 EXPECTED_CAP_EFF = "00000000000000e0"   # KILL + SETGID + SETUID
 EXPECTED_CAPS = frozenset({"CAP_KILL", "CAP_SETGID", "CAP_SETUID"})
@@ -2707,7 +2929,21 @@ HOSTILE_ESCAPES: tuple[str, ...] = (
     "escape_allocate_past_limit", "escape_loop_forever", "escape_pd_io_common_oskill",
     "escape_kill_other_child", "escape_sys_modules_lookup", "escape_open_socket",
 )
-NEEDS_A_NEIGHBOUR = frozenset({"escape_kill_other_child"})
+# Review r1 #3: what the real child reports when each escape is stopped at BAR. A fault without its marker
+# (a load error, an unrelated exception) is not containment: the hostile operation may never have run.
+EXPECTED_FAULT_MARKERS: dict[str, tuple[str, ...]] = {
+    "escape_read_config_keys": ("FileNotFoundError", "PermissionError"),
+    "escape_write_outside_tmpfs": ("PermissionError", "Read-only file system"),
+    "escape_fork_bomb": ("BlockingIOError", "Resource temporarily unavailable"),
+    "escape_allocate_past_limit": ("MemoryError", "Unable to allocate"),
+    "escape_loop_forever": ("bar timeout",),
+    "escape_pd_io_common_oskill": ("PermissionError",),
+    "escape_kill_other_child": ("PermissionError",),
+    "escape_sys_modules_lookup": ("PermissionError",),
+    "escape_open_socket": ("OSError", "Network is unreachable"),
+}
+LOAD_FAULT_PREFIXES = ("load failed", "constructor failed", "AUTHORED_STATIC_REJECTED", "import of",
+                       "child load failed", "session not loaded")
 
 _T0 = datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc)
 
@@ -2759,22 +2995,9 @@ def _benign_check(client: SandboxClient) -> CheckResult:
         return CheckResult("benign_session", False, f"benign probe failed: {exc}")
 
 
-def _hostile_check(client: SandboxClient, name: str) -> CheckResult:
-    try:
-        with client.open_probe("escape", name) as session:
-            _bars(session, 5)
-    except SandboxFault as exc:
-        return CheckResult(name, True, f"contained: {exc.code}")
-    except SandboxUnavailable as exc:
-        return CheckResult(name, False, f"unavailable, not proven: {exc}")
-    except SandboxProtocolError as exc:
-        # A missing escape file (Plan 1 filename drift) is a setup error, not containment.
-        return CheckResult(name, False, f"escape {name!r} not loadable: {exc}")
-    return CheckResult(name, False, "ran to completion: NOT contained")
-
-
-def _hostile_check_with_a_neighbour(client: SandboxClient, name: str) -> CheckResult:
-    """Hold a benign session open while the escape runs; it must fault and the neighbour must live."""
+def hostile_check(client: SandboxClient, name: str) -> CheckResult:
+    """Review r1 #3: contained only if the escape OPENED, faulted at BAR for the reason its behaviour predicts,
+    and both a neighbouring benign session and PING still answer afterwards."""
     try:
         neighbour = client.open_probe("probe", "benign_orb")
     except (SandboxFault, SandboxUnavailable, SandboxProtocolError) as exc:
@@ -2784,12 +3007,44 @@ def _hostile_check_with_a_neighbour(client: SandboxClient, name: str) -> CheckRe
             _bars(neighbour, 2)
         except (SandboxFault, SandboxUnavailable) as exc:
             return CheckResult(name, False, f"neighbour failed before the escape ran: {exc}")
-        verdict = _hostile_check(client, name)
+        verdict = _contained_at_bar(client, name)
+        if not verdict.passed:
+            return verdict
         try:
             _bars(neighbour, 2, start=2)
         except (SandboxFault, SandboxUnavailable) as exc:
             return CheckResult(name, False, f"the neighbour session died: {exc}")
+    try:
+        client.ping()
+    except SandboxUnavailable as exc:
+        return CheckResult(name, False, f"PING failed after the escape: {exc}")
     return verdict
+
+
+def _contained_at_bar(client: SandboxClient, name: str) -> CheckResult:
+    try:
+        session = client.open_probe("escape", name)
+    except (SandboxFault, SandboxUnavailable, SandboxProtocolError) as exc:
+        return CheckResult(name, False, f"never OPENED, not proven: {exc}")
+    with session:
+        try:
+            _bars(session, 5)
+        except SandboxFault as fault:
+            return _attributed(name, fault)
+        except (SandboxUnavailable, SandboxProtocolError) as exc:
+            return CheckResult(name, False, f"no fault at BAR, not proven: {exc}")
+    return CheckResult(name, False, "ran to completion: NOT contained")
+
+
+def _attributed(name: str, fault: SandboxFault) -> CheckResult:
+    detail = str(getattr(fault, "detail", fault))
+    if fault.code != SANDBOX_ERROR:
+        return CheckResult(name, False, f"{fault.code} at BAR is not a contained escape: {detail[:200]}")
+    if detail.startswith(LOAD_FAULT_PREFIXES):
+        return CheckResult(name, False, f"a load fault is not containment: {detail[:200]}")
+    if not any(marker in detail for marker in EXPECTED_FAULT_MARKERS[name]):
+        return CheckResult(name, False, f"the BAR fault does not show the escape was stopped: {detail[:200]}")
+    return CheckResult(name, True, f"contained at BAR: {detail[:200]}")
 
 
 def run_isolation_checks(client: SandboxClient) -> IsolationResult:
@@ -2797,8 +3052,7 @@ def run_isolation_checks(client: SandboxClient) -> IsolationResult:
     checks: list[CheckResult] = list(_posture_checks(dict(info.posture)))
     checks.append(_benign_check(client))
     for name in HOSTILE_ESCAPES:
-        run = _hostile_check_with_a_neighbour if name in NEEDS_A_NEIGHBOUR else _hostile_check
-        checks.append(run(client, name))
+        checks.append(hostile_check(client, name))
     passed = all(check.passed for check in checks)
     return IsolationResult(passed=passed, image_digest=info.image_digest, checks=tuple(checks))
 ```
@@ -3505,7 +3759,7 @@ These run in the `fullstack-tests` profile against the real stanza, never the li
 
 **Files:**
 - Modify: `docker-compose.yml` (`fullstack-tests`: mount the three volumes, depend on `sandbox`)
-- Create: `tests/fullstack/test_sandbox_service.py`, `scripts/run_sandbox_fullstack.sh`
+- Create: `tests/fullstack/test_sandbox_service.py`, `scripts/run_sandbox_fullstack.sh`, `scripts/check_sbxtest_config.py`, `docker-compose.sbxtest.override.yml`, `tests/test_sandbox_fullstack_runner.py` (ruling 30)
 
 **Interfaces:** consumes Task 5 `SandboxClient`, Task 6 `run_isolation_checks`, `HOSTILE_ESCAPES`, `EXPECTED_CAPS`; `trader.sandbox.protocol` socket paths.
 
@@ -3545,7 +3799,7 @@ docker = pytest.importorskip("docker", reason="docker-py not installed")
 
 from trader.authored.sandbox_client import SandboxClient, SandboxFault
 from trader.sandbox import protocol as proto
-from trader.sandbox.isolation_checks import EXPECTED_CAPS, HOSTILE_ESCAPES, NEEDS_A_NEIGHBOUR, run_isolation_checks
+from trader.sandbox.isolation_checks import EXPECTED_CAPS, HOSTILE_ESCAPES, hostile_check, run_isolation_checks
 
 
 def _skip_reason():
@@ -3661,20 +3915,32 @@ def test_a_benign_live_session_returns_decisions_for_each_of_its_conids():
     assert all(any(s is not None for s in per_conid) for per_conid in signals.values())
 
 
+def test_a_closed_session_leaves_a_clean_slot_and_frees_it():
+    # Review r1 #2, under the real serving capabilities (CHOWN already dropped): each session writes a file in
+    # its slot; closing must wipe it as the slot uid, so the next session on that slot starts clean.
+    client = SandboxClient(proto.RESEARCH_SOCKET)
+    size = client.ping().size
+    for i in range(2 * size + 1):
+        with client.open_probe("probe", "writes_own_slot") as session:
+            decision = session.bar(proto.PROBE_CONID, T0 + timedelta(minutes=i), 1.0, 2.0, 0.5, 1.5, 100.0)
+        assert decision.action == "BUY", f"session {i} found a file left by an earlier session"
+    info = client.ping()
+    assert info.free == info.size                                    # no slot was quarantined
+
+
 def test_the_benign_probe_also_runs():
     with SandboxClient(proto.RESEARCH_SOCKET).open_probe("probe", "benign_orb") as session:
         for i in range(5):
             session.bar(proto.PROBE_CONID, T0 + timedelta(minutes=i), 1.0, 2.0, 0.5, 1.5, 100.0)
 
 
-@pytest.mark.parametrize("escape", [name for name in HOSTILE_ESCAPES if name not in NEEDS_A_NEIGHBOUR])
+@pytest.mark.parametrize("escape", list(HOSTILE_ESCAPES))
 def test_every_hostile_escape_is_contained(escape):
-    # Plan 1's escape corpus, loaded with the static check skipped on purpose (ruling 11).
+    # Plan 1's escape corpus, loaded with the static check skipped on purpose (ruling 11). Each must OPEN, fault
+    # at BAR for its own reason, and leave a neighbouring benign session and PING working (review r1 #3).
     # Includes the exact pd.io.common.os.kill(pd.io.common.os.getppid(), 9) path (escape_pd_io_common_oskill).
-    with pytest.raises(SandboxFault):
-        with SandboxClient(proto.RESEARCH_SOCKET).open_probe("escape", escape) as session:
-            for i in range(5):
-                session.bar(proto.PROBE_CONID, T0 + timedelta(minutes=i), 1.0, 2.0, 0.5, 1.5, 100.0)
+    check = hostile_check(SandboxClient(proto.RESEARCH_SOCKET), escape)
+    assert check.passed, check.detail
 
 
 def test_killing_another_sessions_child_fails_and_the_neighbour_lives():
@@ -3718,28 +3984,269 @@ def test_a_parallel_benign_session_survives_a_hostile_one():
         good.close()
 ```
 
-- [ ] **Step 3: Write the run script** `scripts/run_sandbox_fullstack.sh`:
+- [ ] **Step 3: Write the isolation checker, the override and their tests** (review r1 #8 and the coordinator's follow-up; ruling 30)
+
+The sandbox full-stack run must share nothing with a live stack on the same host: its own compose project and named volumes, **no published host port**, no bind mount under the operator's `~/.config/mmr` or `~/.local/share/mmr` (the runner points `${HOME}` at a throwaway directory with a copied config and test-only keys), and no IB credentials (`.env` is neither interpolated nor injected). The runner renders the config first and refuses to start unless the checker passes.
+
+Write `docker-compose.sbxtest.override.yml` (applied only by the runner, after `docker-compose.test.override.yml`):
+
+```yaml
+# SP3 Plan 2 ruling 30: the sandbox full-stack test shares nothing with a live stack on the same host.
+# Applied ONLY by scripts/run_sandbox_fullstack.sh (never auto-loaded). No service publishes a host port, and
+# ib-gateway gets no .env (no IB credentials: a second login would end the live gateway's session).
+# scripts/check_sbxtest_config.py refuses the run if the rendered config still publishes a port, binds a path
+# under the operator's ~/.config/mmr or ~/.local/share/mmr, or reads .env.
+services:
+  ib-gateway:
+    ports: !reset []
+    env_file: !reset []
+  trader:
+    ports: !reset []
+  dashboard:
+    ports: !reset []
+```
+
+Write `scripts/check_sbxtest_config.py`:
+
+```python
+"""Refuse a sandbox full-stack run whose rendered compose config could touch a live stack (SP3 Plan 2 ruling 30).
+
+Reads `docker compose ... config --format json` on stdin. Exit 0 when safe, 2 with one line per problem otherwise.
+"""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from typing import Any, Iterable
+
+LIVE_PORTS = frozenset({7496, 7497, 5901, 7424, 8081, *range(42001, 42010), *range(42101, 42110)})
+PROJECT_PREFIX = "mmr-sbxtest"
+
+
+def _sources(service: dict) -> Iterable[str]:
+    for volume in service.get("volumes", []) or []:
+        if isinstance(volume, dict) and volume.get("type") == "bind":
+            yield str(volume.get("source", ""))
+
+
+def problems(config: dict[str, Any], *, operator_home: str, repo_root: str) -> list[str]:
+    found = []
+    if not str(config.get("name", "")).startswith(PROJECT_PREFIX):
+        found.append(f"project {config.get('name')!r} is not {PROJECT_PREFIX}*")
+    forbidden = [Path(operator_home, ".config", "mmr"), Path(operator_home, ".local", "share", "mmr")]
+    live_env = Path(repo_root, ".env")
+    for name, service in sorted((config.get("services") or {}).items()):
+        for port in service.get("ports", []) or []:
+            published = port.get("published") if isinstance(port, dict) else port
+            note = " (a live port)" if str(published).isdigit() and int(published) in LIVE_PORTS else ""
+            found.append(f"{name} publishes host port {published}{note}")
+        for source in _sources(service):
+            if any(Path(source) == root or root in Path(source).parents for root in forbidden):
+                found.append(f"{name} binds {source}, under the operator's live config or data")
+        for env_file in service.get("env_file", []) or []:
+            path = env_file.get("path") if isinstance(env_file, dict) else env_file
+            if Path(str(path)) == live_env:
+                found.append(f"{name} reads {path} (live credentials)")
+    for name, volume in sorted((config.get("volumes") or {}).items()):
+        if not str((volume or {}).get("name", "")).startswith(f"{PROJECT_PREFIX}_"):
+            found.append(f"volume {name} is named {(volume or {}).get('name')!r}, outside the test project")
+    return found
+
+
+def main(argv: list[str]) -> int:
+    operator_home, repo_root = argv[1], argv[2]
+    found = problems(json.load(sys.stdin), operator_home=operator_home, repo_root=repo_root)
+    for line in found:
+        print(f"refusing: {line}", file=sys.stderr)
+    return 2 if found else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+```
+
+Write `tests/test_sandbox_fullstack_runner.py`:
+
+```python
+"""The sandbox full-stack runner shares nothing with a live stack on the same host (SP3 Plan 2 ruling 30)."""
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+SCRIPT = ROOT / "scripts" / "run_sandbox_fullstack.sh"
+sys.path.insert(0, str(ROOT / "scripts"))
+from check_sbxtest_config import LIVE_PORTS, problems  # noqa: E402
+
+HOME = "/Users/operator"
+SAFE = {"name": "mmr-sbxtest",
+        "services": {"sandbox": {"volumes": [{"type": "volume", "source": "mmr_sandbox_live"}]},
+                     "trader": {"volumes": [{"type": "bind", "source": "/tmp/sbx-home/.config/mmr"}]},
+                     "fullstack-tests": {"volumes": [{"type": "bind", "source": "/var/run/docker.sock"}]}},
+        "volumes": {"mmr_db_data": {"name": "mmr-sbxtest_mmr_db_data"}}}
+
+
+def test_a_safe_config_passes():
+    assert problems(SAFE, operator_home=HOME, repo_root="/repo") == []
+
+
+@pytest.mark.parametrize("change, fragment", [
+    (lambda c: c.update(name="mmr"), "project 'mmr'"),
+    (lambda c: c["services"]["trader"].update(ports=[{"published": "42101", "target": 42101}]), "a live port"),
+    (lambda c: c["services"]["trader"].update(ports=[{"published": "55555", "target": 1}]), "publishes host port"),
+    (lambda c: c["services"]["trader"]["volumes"].append({"type": "bind", "source": f"{HOME}/.config/mmr"}),
+     "live config"),
+    (lambda c: c["services"]["trader"]["volumes"].append(
+        {"type": "bind", "source": f"{HOME}/.config/mmr/keys/rpc/trader.key"}), "live config"),
+    (lambda c: c["services"]["trader"]["volumes"].append(
+        {"type": "bind", "source": f"{HOME}/.local/share/mmr/logs"}), "live config"),
+    (lambda c: c["services"]["sandbox"].update(env_file=[{"path": "/repo/.env"}]), "live credentials"),
+    (lambda c: c["volumes"].update(mmr_ai_data={"name": "mmr_mmr_ai_data"}), "outside the test project"),
+])
+def test_each_way_to_touch_a_live_stack_is_refused(change, fragment):
+    config = json.loads(json.dumps(SAFE))
+    change(config)
+    assert any(fragment in line for line in problems(config, operator_home=HOME, repo_root="/repo"))
+
+
+def test_the_live_port_list_covers_the_gateway_rpc_and_dashboard_ports():
+    assert {7496, 7497, 5901, 7424, 8081, 42001, 42005, 42101, 42102, 42104, 42105} <= LIVE_PORTS
+
+
+def run_with_fake_docker(tmp_path, **env):
+    bin_dir, log = tmp_path / "bin", tmp_path / "docker.log"
+    bin_dir.mkdir()
+    rendered = json.dumps(SAFE)
+    (bin_dir / "docker").write_text(
+        f'#!/bin/bash\necho "HOME=$HOME $*" >> {log}\n'
+        f'if [[ " $* " == *" config "* ]]; then echo \'{rendered}\'; fi\n')
+    (bin_dir / "docker").chmod(0o755)
+    (bin_dir / "uv").write_text(f'#!/bin/bash\necho "uv HOME=$HOME $*" >> {log}\n')       # mmr keys init
+    (bin_dir / "uv").chmod(0o755)
+    result = subprocess.run(["bash", str(SCRIPT)], capture_output=True, text=True, timeout=60,
+                            env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "HOME": HOME, **env})
+    return result, (log.read_text().splitlines() if log.exists() else [])
+
+
+def test_the_runner_uses_a_throwaway_home_the_test_project_and_no_env_file(tmp_path):
+    result, calls = run_with_fake_docker(tmp_path)
+    assert result.returncode == 0, result.stderr
+    compose = [call for call in calls if call.startswith("HOME=")]
+    assert compose and all(" compose -p mmr-sbxtest " in call for call in compose)
+    assert all(not call.startswith(f"HOME={HOME} ") for call in calls)          # never the operator's home
+    assert all("--env-file" in call and "docker-compose.sbxtest.override.yml" in call for call in compose)
+    assert any(" keys init" in call for call in calls if call.startswith("uv "))  # test-only keys
+    assert any(" up " in call for call in compose) and any(" down -v " in call for call in compose)
+
+
+def test_a_rendered_config_that_touches_a_live_stack_stops_the_run_before_up(tmp_path):
+    unsafe = json.loads(json.dumps(SAFE))
+    unsafe["services"]["trader"]["ports"] = [{"published": "42101", "target": 42101}]
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "docker.log"
+    (bin_dir / "docker").write_text(
+        f'#!/bin/bash\necho "$*" >> {log}\n'
+        f'if [[ " $* " == *" config "* ]]; then echo \'{json.dumps(unsafe)}\'; fi\n')
+    (bin_dir / "docker").chmod(0o755)
+    (bin_dir / "uv").write_text("#!/bin/bash\nexit 0\n")
+    (bin_dir / "uv").chmod(0o755)
+    result = subprocess.run(["bash", str(SCRIPT)], capture_output=True, text=True, timeout=60,
+                            env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "HOME": HOME})
+    assert result.returncode == 2 and "a live port" in result.stderr
+    assert not any(" up " in f" {line} " for line in log.read_text().splitlines())
+
+
+@pytest.mark.parametrize("project", ["mmr", "prod", ""])
+def test_a_project_that_could_be_the_live_stack_is_refused(tmp_path, project):
+    result, calls = run_with_fake_docker(tmp_path, MMR_SBXTEST_PROJECT=project)
+    assert result.returncode == 2 and calls == []
+    assert "refusing" in result.stderr
+
+
+def test_the_script_warns_against_a_live_host():
+    assert "never run this against the live stack" in SCRIPT.read_text().lower()
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="docker is not installed")
+def test_the_real_rendered_config_passes_the_checker(tmp_path):
+    empty_env = tmp_path / "compose.env"
+    empty_env.write_text("")
+    rendered = subprocess.run(
+        ["docker", "compose", "-p", "mmr-sbxtest", "--env-file", str(empty_env), "-f", "docker-compose.yml",
+         "-f", "docker-compose.test.override.yml", "-f", "docker-compose.sbxtest.override.yml",
+         "--profile", "test", "config", "--format", "json"],
+        cwd=ROOT, capture_output=True, text=True, timeout=120,
+        env={**os.environ, "HOME": str(tmp_path / "home"),
+             "DOCKER_CONFIG": os.environ.get("DOCKER_CONFIG", str(Path.home() / ".docker"))})
+    if rendered.returncode != 0:
+        pytest.skip(f"docker compose config is not available here: {rendered.stderr[-200:]}")
+    config = json.loads(rendered.stdout)
+    assert config["name"] == "mmr-sbxtest"
+    assert problems(config, operator_home=str(Path.home()), repo_root=str(ROOT)) == []
+    ports = [p for s in config["services"].values() for p in s.get("ports", []) or []]
+    assert ports == []                                       # nothing published, so no live port either
+```
+
+- [ ] **Step 4: Write the run script** `scripts/run_sandbox_fullstack.sh`:
 
 ```bash
 #!/bin/bash
-# Bring up the full stack plus the sandbox and run the container checks (SP3 Plan 2).
-# Never run against the live stack: this uses the test override (fake broker) and its own project.
+# Bring up the full stack plus the sandbox and run the container checks (SP3 Plan 2, ruling 30).
+#
+# WARNING: never run this against the live stack. It is built to share nothing with one on the same host:
+#   - its own compose project (mmr-sbxtest), so its own containers, network and named volumes (mmr-sbxtest_*);
+#   - no published host port (docker-compose.sbxtest.override.yml);
+#   - ${HOME} points at a throwaway directory with a copy of config_defaults and keys generated for this run,
+#     never the operator's ~/.config/mmr; .env is neither interpolated (--env-file is an empty file) nor injected;
+#   - the rendered config is checked (scripts/check_sbxtest_config.py) and the run refuses before `up` otherwise.
+# It removes its containers, volumes and the throwaway directory when it ends.
 set -o errexit -o pipefail -o nounset
+PROJECT="${MMR_SBXTEST_PROJECT-mmr-sbxtest}"
+if [[ "$PROJECT" != mmr-sbxtest* ]]; then
+  echo "refusing: compose project '${PROJECT}' could address the live stack; it must start with mmr-sbxtest" >&2
+  exit 2
+fi
 BUILDDIR=$(cd "$(dirname "$0")/.." && pwd)
 cd "$BUILDDIR"
+OPERATOR_HOME="$HOME"
+export DOCKER_CONFIG="${DOCKER_CONFIG:-$OPERATOR_HOME/.docker}"    # docker keeps its context with the new HOME
+export UV_CACHE_DIR="${UV_CACHE_DIR:-$OPERATOR_HOME/.cache/uv}"
+TEST_HOME=$(mktemp -d "${TMPDIR:-/tmp}/mmr-sbxtest-home.XXXXXX")
+mkdir -p "$TEST_HOME/.config/mmr" "$TEST_HOME/.local/share/mmr/logs" "$TEST_HOME/.local/share/mmr/artifacts" \
+         "$TEST_HOME/.local/share/mmr/tws_settings"
+cp -R config_defaults/. "$TEST_HOME/.config/mmr/"
+: > "$TEST_HOME/compose.env"
+HOME="$TEST_HOME" uv run --frozen --project "$BUILDDIR" mmr keys init     # keys for this run only
+export HOME="$TEST_HOME"
 export MMR_BUILD_ID="${MMR_BUILD_ID:-$(git rev-parse --short HEAD 2>/dev/null || echo nogit)-test}"
-exec docker compose -f docker-compose.yml -f docker-compose.test.override.yml \
-  --profile test up --build --abort-on-container-exit fullstack-tests
+compose=(docker compose -p "$PROJECT" --env-file "$TEST_HOME/compose.env" -f docker-compose.yml
+         -f docker-compose.test.override.yml -f docker-compose.sbxtest.override.yml --profile test)
+cleanup() {
+  "${compose[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+  rm -rf "$TEST_HOME"
+}
+trap cleanup EXIT
+"${compose[@]}" config --format json \
+  | python3 scripts/check_sbxtest_config.py "$OPERATOR_HOME" "$BUILDDIR" || exit 2
+"${compose[@]}" up --build --abort-on-container-exit fullstack-tests
 ```
 
-Make it executable: `chmod +x scripts/run_sandbox_fullstack.sh`.
+Make both scripts executable (`chmod +x scripts/run_sandbox_fullstack.sh scripts/check_sbxtest_config.py`). `-p` overrides the base file's `name: mmr`. If `mmr keys init` needs more than `HOME` on the base (for example a `--dir` flag), use that flag with `$TEST_HOME/.config/mmr`; never let it write to the operator's home. Run `.venv/bin/python -m pytest tests/test_sandbox_fullstack_runner.py -q`: PASS (the real-render test skips without Docker; when it runs and a service still publishes a port or binds the operator's config, add the `!reset` line for that service to the override, never relax the checker).
 
-- [ ] **Step 4: Note on running.** These container tests need Docker and are not part of the unit suite (they skip without `MMR_FAKE_BROKER=1` and the mounted socket, like the existing `tests/fullstack/*`). Do not run them from this plan's unit steps. The owner runs `scripts/run_sandbox_fullstack.sh` on a host with Docker. State in the PR that they were not run here if Docker was unavailable.
+- [ ] **Step 5: Note on running.** These container tests need Docker and are not part of the unit suite (they skip without `MMR_FAKE_BROKER=1` and the mounted socket, like the existing `tests/fullstack/*`). Do not run them from this plan's unit steps. The owner runs `scripts/run_sandbox_fullstack.sh` on a host with Docker. State in the PR that they were not run here if Docker was unavailable.
 
-- [ ] **Step 5: Commit.**
+- [ ] **Step 6: Commit.**
 
 ```bash
-git add docker-compose.yml tests/fullstack/test_sandbox_service.py scripts/run_sandbox_fullstack.sh
+git add docker-compose.yml tests/fullstack/test_sandbox_service.py scripts/run_sandbox_fullstack.sh \
+        scripts/check_sbxtest_config.py docker-compose.sbxtest.override.yml tests/test_sandbox_fullstack_runner.py
 git commit -m "test: add container checks for the real sandbox stanza"
 ```
 

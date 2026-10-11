@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - **Base:** master after SP3 Plans 1–4 are merged. Code read at `d69fdcf2`.
-- **ai.duckdb migration:** this plan uses **40** (`author_attempts`) in a new `trader/ai/author_schema.py`, appended last to `ALL_MIGRATIONS`. 41–44 stay free. Check on the base commit that 40–44 are unused (`grep -rn "Migration(4[0-4]" trader/ai`). Plain `CREATE` only; no `ALTER`, no backfill (owner: no legacy data). No trader journal migration in this plan.
+- **ai.duckdb migration:** this plan uses **40** (`author_attempts`) in a new `trader/ai/author_schema.py`, appended last to `ALL_MIGRATIONS`. 41–44 stay free. Check on the base commit that 40–44 are unused (`grep -rn "Migration(4[0-4]" trader/ai`). Plain `CREATE` only; no `ALTER`, no backfill (owner: no legacy data). **Trader journal migration 132** (Task 2, owner ruling 2026-10-11): `ai_costs.role` gains `author`, by a table rebuild that copies every row unchanged (the one owner-approved exception to "no ALTER").
 - **Plan 1 names used exactly:** `trader.authored.api` (`AuthoredStrategy`, `Decision`), `trader.authored.keys` (`source_digest(source: bytes) -> str`, `authored_key(digest, class_name) -> str`, `is_authored_key(key) -> bool`), `trader.authored.allowed_api` (`ALLOWED_IMPORTS`, `ALLOWED_MODULE_ATTRIBUTES`), `trader.authored.static_check` (`StaticViolation(rule, line, detail)`, `check_source(source) -> list[StaticViolation]`, `require_clean(source) -> str`).
 - **Plan 3 names used exactly:** principal `ai_author`; methods `submit_authored_strategy`, `get_authored_strategies` (`ai_author`), `list_authored_strategies` and `record_isolation_proof` (`cli`); states `STORED`, `EVALUATING`, `SHADOW`, `DEPLOYED`, `REJECTED`, `RETIRED`, `EXPIRED`, `FAILED`; codes `AUTHORED_STRATEGIES_DISABLED`, `AUTHORED_CAP_FULL`, `AUTHORED_STATIC_REJECTED`, `AUTHORED_BAD_TUNABLES`, `AUTHORED_BAD_BAR_SIZE`, `AUTHORED_ISOLATION_UNPROVEN`; config `ai_paper.authored_strategies` (`enabled`, `max_active`, `bar_sizes`); table `authored_strategies` (key column `digest`, spec 7.3); CLI `mmr ai-author prove-isolation`, `mmr ai-author list`.
 - **Plan 2 / Plan 4 names used exactly (acceptance only):** `trader.sandbox.protocol` (`LIVE_SOCKET`, `RESEARCH_SOCKET`), `trader.authored.sandbox_client.SandboxClient`, `trader/research/authored_evaluation.py`, `trader/strategy/authored_runtime.py`.
@@ -42,7 +42,7 @@
 11. Plan 5 ruling 11: a model refusal or failure ends the night (`MODEL_REFUSED_<code>`, `MODEL_FAILED_<outcome>`); a restart after a call may have left is `FAILED PROCESS_RESTARTED`, never re-asked; a restart before any send lets the slot run again while due.
 12. Plan 5 ruling 12: the submit body is stored before the call and resent unchanged (at most once a minute) after a lost reply or a `REFUSED` with `retryable: true`, until `STORED`, `EXISTING` or a final `REFUSED` (Plan 3's digest idempotency, Plan 3 ruling 6).
 13. Plan 5 ruling 13: every number class constant except `LOOKBACK_BARS` is a tunable and needs a range with minimum < maximum and minimum ≤ default ≤ maximum; code reads the defaults with `ast`, never from the model, and sends `{low, high, default}` (Plan 3 ruling 5, decision D5: the trader checks that each default is the class value).
-14. Plan 5 ruling 14: author spend is reported to the trader under the existing cost role `research`, which nothing sends today (the trader's `ai_costs` CHECK and `RecordAiCostRequest.role` allow only orchestrator, jev, research); `ai.duckdb` keeps role `author`, and `served_id` `aut-YYYYMMDD` marks the spend. *Owner should confirm*, or give Plan 3 trader migration 132 for an `author` role.
+14. Plan 5 ruling 14 (owner ruling 2026-10-11): author spend is booked under its own role `author` in the trader's `ai_costs`. Trader journal migration 132 rebuilds `ai_costs` with the wider role CHECK (rows and seals copied unchanged) and `RecordAiCostRequest.role` gains `author`; `served_id` `aut-YYYYMMDD` marks the night.
 15. Plan 5 ruling 15: Jev's reason for an earlier authored file is re-read from its journaled answer (`<judgment_id>/jev/1`) with `parse_backtest_ruling` and fenced as untrusted, next to the judgment code; the author's earlier notes are fenced too.
 16. Plan 5 ruling 16: the prompt's authored trial count is Plan 3's `judged_count` (Plan 3 ruling 19); the case's `strategy_trials` (Plan 4) stays the number Jev reads.
 17. Plan 5 ruling 17: the author reads the scoreboard with `get_scoreboard` (added to the `ai_supervisor` client set); an unreadable scoreboard or authored list waits like an away trader, before any row is written.
@@ -78,7 +78,7 @@ Shapes this plan uses, as Plans 1–4 wrote them on 2026-10-11 (the owner plan's
 ## Conflicts found while planning (for the owner and the index)
 
 - The index gives no plan the ai-side step that submits stored authored files to the research service; this plan takes it (Ruling 7).
-- The trader's `ai_costs.role` CHECK has no `author` value and the index forbids ALTER; this plan reports author spend as `research` (Ruling 14).
+- *Settled (owner ruling 2026-10-11):* author spend has its own `ai_costs` role, added by trader migration 132 (Ruling 14).
 - *Settled (decision D5):* Plan 3's submit body and `RecordView` now carry each tunable's default; the offer uses the record's default (Ruling 6), so a lost `ai.duckdb` no longer stops an evaluation.
 - *Settled (decision D1, spec section 14):* the live pool is one session per deployment (3), each serving all of the deployment's 8–20 conids; the trader caps `max_active` at 3 (controller decision C2).
 
@@ -95,7 +95,7 @@ Shapes this plan uses, as Plans 1–4 wrote them on 2026-10-11 (the owner plan's
 | File | Responsibility | Task |
 |---|---|---|
 | `trader/ai/config.py`, `config_defaults/ai.yaml`, `tests/ai/author/helpers.py` | optional `author` role, `authoring:` block, authored universe | 1 |
-| `trader/ai/gateway.py`, `trader/ai/budget_cap.py`, `trader/ai/replay.py`, `trader/ai/outbox.py` | active roles, deadline length, author cost role | 2 |
+| `trader/ai/gateway.py`, `trader/ai/budget_cap.py`, `trader/ai/replay.py`, `trader/scoreboard/schema.py`, `trader/scoreboard/ingest_models.py` | active roles, deadline length, author cost role (trader migration 132) | 2 |
 | `trader/ai/author_schema.py`, `trader/ai/runtime_schema.py`, `trader/ai/schedule.py` | migration 40, `AuthorSlot` | 3 |
 | `trader/ai/rpc_clients.py`, `trader/ai/author_wire.py` | `ai_author` client, Plan 3 reply shapes | 4 |
 | `trader/ai/author_roles.py` | prompt, answer schema, local check, submit body | 5 |
@@ -389,18 +389,18 @@ authoring:
 
 ---
 
-### Task 2: Active roles in the gateway, the author's deadline and its cost role
+### Task 2: Active roles in the gateway, the author's deadline and its cost role (trader migration 132)
 
 **Files:**
-- Modify: `trader/ai/gateway.py`, `trader/ai/budget_cap.py`, `trader/ai/replay.py`, `trader/ai/outbox.py`
-- Test: `tests/ai/author/test_author_gateway.py`
+- Modify: `trader/ai/gateway.py`, `trader/ai/budget_cap.py`, `trader/ai/replay.py`, `trader/scoreboard/schema.py` (migration 132), `trader/scoreboard/ingest_models.py` (`RecordAiCostRequest.role`)
+- Test: `tests/ai/author/test_author_gateway.py`, `tests/scoreboard/test_author_cost_role.py`
 
 **Interfaces:**
 - Consumes: Task 1 (`AiConfig.roles` holds active roles only).
 - Produces:
   - `ModelGateway.new_deadline(label: str = "", seconds: Optional[float] = None) -> DecisionDeadline` (the decision deadline when `seconds` is None); same signature on `ModelCaller`, `CapGatedGateway`, `ReplayGateway`.
   - `ModelGateway(...)` and `build_gateway(...)` need a client for each active role only; a call for a known but inactive role raises `CallRefused("ROLE_DISABLED")`.
-  - `outbox.TRADER_COST_ROLES = {"orchestrator": "orchestrator", "jev": "jev", "author": "research"}` used by `cost_body`.
+  - Trader journal migration **132** `sp3_ai_costs_author_role` (owner ruling 2026-10-11, Ruling 14): `ai_costs.role` accepts `author`; `RecordAiCostRequest.role` gains `"author"`. The ai outbox sends the role as journaled (`author`), so no mapping.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -409,6 +409,8 @@ authoring:
 import datetime as dt
 
 import pytest
+
+from trader.scoreboard.ingest_models import RecordAiCostRequest
 
 from tests.ai.author.helpers import author_text, load
 from tests.ai.decisions.fakes import ScriptedProvider
@@ -489,7 +491,7 @@ def test_the_cap_gate_and_replay_pass_the_deadline_length():
     assert replay.new_deadline("u", seconds=300.0).remaining() > 300.0          # replay never runs out of time
 
 
-def test_author_spend_is_reported_under_the_research_cost_role():                    # ruling 14
+def test_author_spend_is_reported_under_its_own_cost_role():                          # ruling 14 (owner)
     class Event:
         kind, role, backend, model = COST_CONFIRMED, "author", "openrouter", "vendor/author-1"
         attempt_key, event_id, input_tokens, output_tokens, cost_micros = "aut-20261008/author/1#1", "e1", 900, 60, 2280
@@ -498,10 +500,11 @@ def test_author_spend_is_reported_under_the_research_cost_role():               
         started_at = NIGHT
     body = cost_body(Event(), Attempt(), CallContext("aut-20261008", "exp-" + "c" * 20, "research", "aut-20261008"))
     assert (body["role"], body["model"], body["served_kind"], body["served_id"]) == (
-        "research", "vendor/author-1", "research", "aut-20261008")
+        "author", "vendor/author-1", "research", "aut-20261008")
+    RecordAiCostRequest.model_validate(body)                    # the trader's wire model accepts the role
 ```
 
-- [ ] **Step 2: Run, expect failure** `.venv/bin/python -m pytest tests/ai/author/test_author_gateway.py -q --timeout=60` → fails: building a gateway without an author client raises `AiConfigError: ROLE_UNKNOWN` (it still loops over `ROLE_NAMES`), `new_deadline()` takes no `seconds`, and the cost role is `author`.
+- [ ] **Step 2: Run, expect failure** `.venv/bin/python -m pytest tests/ai/author/test_author_gateway.py -q --timeout=60` → fails: building a gateway without an author client raises `AiConfigError: ROLE_UNKNOWN` (it still loops over `ROLE_NAMES`), `new_deadline()` takes no `seconds`, and `RecordAiCostRequest` refuses the role `author`.
 
 - [ ] **Step 3: Implement.**
 
@@ -555,18 +558,87 @@ In `build_gateway` replace `for name in ROLE_NAMES` with `for name in config.rol
         return DecisionDeadline(self._clock, 1e9, label)              # replay waits for nothing
 ```
 
-(add `Optional` to the `typing` import if it is missing). `trader/ai/outbox.py`, next to `DEAD_CODES`:
+(add `Optional` to the `typing` import if it is missing). `trader/ai/outbox.py` stays as it is: `cost_body` sends `event.role`, which is `author` for author spend.
+
+Write `tests/scoreboard/test_author_cost_role.py` (owner ruling 2026-10-11: author spend gets its own role):
 
 ```python
-# The trader's ai_costs.role allows orchestrator, jev and research only (no trader migration in SP3 Plan 5).
-# Author spend is research spend there; ai.duckdb keeps the exact role (Plan 5 ruling 14).
-TRADER_COST_ROLES = {"orchestrator": "orchestrator", "jev": "jev", "author": "research"}
+"""Trader journal migration 132: ai_costs.role accepts author; existing rows and their seals survive the rebuild."""
+import pytest
+
+from tests.scoreboard.common import NOW
+from tests.scoreboard.ingest_world import FakeDecisions, cost, enter_fact, make_ingest
+from trader.scoreboard.schema import _COSTS_AUTHOR_ROLE, MIGRATIONS, apply_scoreboard_migrations
+from trader.scoreboard.store import ScoreboardStore
+
+
+ROWS = "SELECT * FROM ai_costs ORDER BY record_id"
+
+
+def journal_before_sp3(db, migrator):
+    for version, name, statements in MIGRATIONS:               # the journal as the SP2 soak left it
+        if version < 132:
+            migrator.apply(version, name, statements)
+    store = ScoreboardStore(db, now=lambda: NOW)
+    ingest = make_ingest(store, decisions=FakeDecisions(enter_fact()))
+    assert cost(ingest)["status"] == "INSERTED"
+    assert cost(ingest, record_id="cost-jev-2", attempt_id="dec-2/jev/1#1", role="jev")["status"] == "INSERTED"
+    return store, ingest
+
+
+def test_migration_132_keeps_every_cost_row_and_seal_and_accepts_author(db, migrator):
+    store, ingest = journal_before_sp3(db, migrator)
+    before = db.execute(ROWS, fetch="all")
+    assert len(before) == 2
+    assert apply_scoreboard_migrations(migrator) is True      # 132 runs now
+    assert db.execute(ROWS, fetch="all") == before            # identical values, every column
+    assert store.verify_seals() == []
+    assert cost(ingest, record_id="cost-author-1", attempt_id="aut-20261008/author/1#1",
+                role="author")["status"] == "INSERTED"
+    assert store.verify_seals() == []
+
+
+def test_a_rebuild_that_fails_halfway_rolls_back_and_keeps_the_rows(db, migrator):
+    store, _ingest = journal_before_sp3(db, migrator)
+    before = db.execute(ROWS, fetch="all")
+    broken = (*_COSTS_AUTHOR_ROLE[:3], "SELECT * FROM no_such_table")      # fails after the DROP
+    with pytest.raises(Exception):
+        migrator.apply(132, "sp3_ai_costs_author_role", broken)
+    assert db.execute(ROWS, fetch="all") == before            # one transaction: the DROP rolled back too
+    assert 132 not in set(migrator.applied_versions()) and store.verify_seals() == []
+    assert apply_scoreboard_migrations(migrator) is True      # the real migration still runs afterwards
+
+
+def test_an_unknown_role_is_still_refused_by_the_table(db, migrator):
+    apply_scoreboard_migrations(migrator)
+    with pytest.raises(Exception, match="(?i)check|constraint"):
+        db.execute("INSERT INTO ai_costs (record_id, experiment_id, role, provider, model, attempt_id, cost_status, "
+                   "called_at, served_kind, served_id, correction_seq, body_digest, recorded_at) "
+                   "VALUES ('x', 'e', 'bogus', 'p', 'm', 'a', 'unknown', now(), 'research', 's', 0, 'd', now())")
 ```
 
-and in `cost_body` change `"role": event.role` to `"role": TRADER_COST_ROLES.get(event.role, event.role)`.
+In `trader/scoreboard/schema.py`, after `_COSTS`:
 
-- [ ] **Step 4: Run** `tests/ai/author/test_author_gateway.py tests/ai/test_gateway.py tests/ai/test_replay.py tests/ai/runtime/ tests/ai/research/test_research_pump.py` → pass.
-- [ ] **Step 5: Commit** `feat: build the gateway for active roles and give the author its own deadline`.
+```python
+# Migration 132 (SP3 Plan 5, owner ruling 2026-10-11): ai_costs.role gains 'author'. DuckDB cannot change a
+# CHECK in place, so the table is rebuilt the way journal migration 52 rebuilt the allocation-authority tables
+# (trader/data/allocation_authority_store.py): the same columns with the wider CHECK, every row copied as it is
+# (the seals cover the row values, so they stay valid), the old table dropped and the new one renamed.
+# SchemaMigrator.apply runs all four statements and the version row in one transaction: a failure leaves the
+# old table and its rows untouched. ai_costs has no index or sequence to recreate (migration 63 creates none).
+_COSTS_AUTHOR_ROLE = (
+    _COSTS[0].replace("CREATE TABLE IF NOT EXISTS ai_costs (", "CREATE TABLE ai_costs_v132 (", 1)
+             .replace("'orchestrator','jev','research'", "'orchestrator','jev','research','author'", 1),
+    "INSERT INTO ai_costs_v132 SELECT * FROM ai_costs",
+    "DROP TABLE ai_costs",
+    "ALTER TABLE ai_costs_v132 RENAME TO ai_costs",
+)
+```
+
+append `(132, "sp3_ai_costs_author_role", _COSTS_AUTHOR_ROLE),` as the last entry of `MIGRATIONS`, and add "SP3 Plan 5 adds 132" to the module docstring. In `trader/scoreboard/ingest_models.py`, `RecordAiCostRequest.role` becomes `Literal["orchestrator", "jev", "research", "author"]`. If `cost(ingest, ...)` in `tests/scoreboard/ingest_world.py` takes other keyword names for the record id or attempt, use its names; never weaken an assertion.
+
+- [ ] **Step 4: Run** `tests/ai/author/test_author_gateway.py tests/scoreboard/test_author_cost_role.py tests/scoreboard/ tests/ai/test_gateway.py tests/ai/test_replay.py tests/ai/runtime/ tests/ai/research/test_research_pump.py` → pass.
+- [ ] **Step 5: Commit** `feat: build the gateway for active roles and give the author its own deadline and cost role`.
 
 ---
 
@@ -3454,10 +3526,15 @@ Built and merged with the switch off and the author model empty. Turn it on in t
 2. Build and start as in sections 5 and 8, with `trader.yaml` `ai_paper.authored_strategies.enabled: false` and an
    empty `roles.author.model` in `ai.yaml` (the shipped defaults). The `sandbox` service starts with the stack.
    - check: `docker compose ps sandbox` is healthy.
-3. Prove the isolation of the running sandbox (host only): `mmr ai-author prove-isolation`.
-   - check: it prints a pass and the sandbox build id. Until a pass exists for that image the trader refuses
-     every authored registration (`AUTHORED_ISOLATION_UNPROVEN`) and the strategy service loads no authored
-     deployment. A rebuilt sandbox image needs a new run.
+3. Prove the isolation of the running sandbox (host only): `mmr ai-author prove-isolation`. Run it only while no
+   live sandbox session is open (owner ruling 2026-10-11: a hostile probe must never run next to a live strategy's
+   child). On first turn-on there is none. Later (after a rebuild): set `ai_paper.authored_strategies.enabled: false`,
+   `docker compose restart trader`, wait one strategy reconcile (30 s) so the strategy service closes its authored
+   sessions, run the command, then turn the switch back on. The command refuses with `LIVE_SESSIONS_OPEN` (exit 1,
+   nothing recorded) while the sandbox reports an open live session.
+   - check: it prints a pass and the sandbox build id. Until a pass exists for that build the trader refuses
+     every authored registration (`AUTHORED_ISOLATION_UNPROVEN`) and the strategy service opens no live session
+     for an authored deployment. A rebuilt sandbox image needs a new run.
 4. In `~/.config/mmr/ai.yaml`: set `roles.author.model` and add its row under `pricing:`; keep `research.enabled:
    true`. Leave `authoring:` at its defaults (60 minutes after the close, 300 s per call). Then
    `docker compose --profile ai up -d --force-recreate ai`.
@@ -3514,6 +3591,11 @@ recorded. Turn-on order: SP2_PAPER_DEPLOY.md section 10.
   `DIGEST_MISMATCH`, `ENGINE_ERROR`. `REFUSED`: the trader's `AUTHORED_*` code or `RPC_<code>`.
 - Trader refusals: `AUTHORED_STRATEGIES_DISABLED`, `AUTHORED_CAP_FULL`, `AUTHORED_STATIC_REJECTED`,
   `AUTHORED_BAD_TUNABLES`, `AUTHORED_BAD_BAR_SIZE`, `AUTHORED_ISOLATION_UNPROVEN`.
+- `LIVE_SESSIONS_OPEN` (`prove-isolation`): a live sandbox session is open; switch authored strategies off first.
+- `AUTHORED_REPORT_REFUSED` (research log): the trader refused an authored evaluation's end; the request stays open
+  and the end is sent again hourly and at a restart. Check the record with `mmr ai-author list`.
+- `AUTHORED_ISOLATION_UNPROVEN` (strategy log): the live sandbox runs a build without a passing proof; no signal
+  until `prove-isolation` passes for it.
 - Scoreboard: `not enough data` with `SCOPE_UNKNOWN`, `NO_COMMON_SESSIONS`, `TOO_FEW_TRIPS`, `FEES_PENDING`,
   `SHARPE_UNKNOWN`; the warning `AUTHORED_SCOPE_UNKNOWN` says why the scope could not be read.
 
@@ -3527,8 +3609,8 @@ recorded. Turn-on order: SP2_PAPER_DEPLOY.md section 10.
 model call; a config or code change, or a night that ran twice after a restart, is `INCOMPLETE`.
 
 ### Known limits
-- Author spend reaches the trader's cost records under the role `research` (the trader's `ai_costs` allows only
-  orchestrator, jev and research); `ai.duckdb` keeps the role `author`, and `served_id` `aut-YYYYMMDD` marks it.
+- Author spend reaches the trader's cost records under its own role `author` (trader migration 132); `served_id`
+  `aut-YYYYMMDD` marks the night.
 - Authored files are evaluated on one universe (the first research universe by name) at their default point (the
   defaults the trader stored with each file).
 - A registration that waited for the isolation proof goes through the next research evening, not at once (the

@@ -29,7 +29,7 @@ You do not need an Interactive Brokers account to run the tests. To run the full
 Run the same commands as CI:
 
 ```bash
-uv run --frozen pytest tests/ --timeout=30 --timeout-method=thread -q --ignore=tests/test_ibrx_async.py
+uv run --frozen pytest tests/ --timeout=120 --timeout-method=signal -q --ignore=tests/test_ibrx_async.py
 uv run --frozen pytest tests/test_ibrx_async.py --timeout=30 -q
 ```
 

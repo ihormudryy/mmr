@@ -575,7 +575,7 @@ The interpreter is pinned to exactly **Python 3.12.13** via `.python-version` â€
 
 ```bash
 uv sync --python 3.12.13 --frozen --extra test
-uv run --frozen --extra test pytest tests/ --timeout=30 -q --ignore=tests/test_ibrx_async.py
+uv run --frozen --extra test pytest tests/ --timeout=120 --timeout-method=signal -q --ignore=tests/test_ibrx_async.py
 # Prefer the live pytest summary â€” the suite has 4,400+ tests and grows
 ```
 

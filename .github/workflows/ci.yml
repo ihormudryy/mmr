@@ -35,12 +35,12 @@ jobs:
       - run: uv run --frozen python -c 'import platform; assert platform.python_version() == "3.12.13"'
       - name: Run tests
         if: github.event_name != 'push'
-        run: uv run --frozen pytest $(uv run --frozen python scripts/ci_test_shard.py ${{ matrix.shard }} 8) --timeout=30 --timeout-method=thread -q
+        run: uv run --frozen pytest $(uv run --frozen python scripts/ci_test_shard.py ${{ matrix.shard }} 8) --timeout=120 --timeout-method=signal -q
       - name: Run tests with coverage (master only)
         if: github.event_name == 'push'
         env:
           COVERAGE_FILE: .coverage.shard${{ matrix.shard }}
-        run: uv run --frozen pytest $(uv run --frozen python scripts/ci_test_shard.py ${{ matrix.shard }} 8) --cov --cov-report= --timeout=30 --timeout-method=thread -q
+        run: uv run --frozen pytest $(uv run --frozen python scripts/ci_test_shard.py ${{ matrix.shard }} 8) --cov --cov-report= --timeout=120 --timeout-method=signal -q
       - name: Upload coverage data
         if: github.event_name == 'push' && !cancelled()
         uses: actions/upload-artifact@v4

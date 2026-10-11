@@ -69,3 +69,18 @@ def test_a_key_with_stray_whitespace_is_not_an_authored_key(key):
     assert not is_authored_key(key)
     with pytest.raises(ValueError):
         parse_authored_key(key)
+
+
+@pytest.mark.parametrize("digest, class_name", [
+    (None, "X"), (DIGEST.encode(), "X"), (DIGEST, None), (DIGEST, b"X"),
+])
+def test_authored_key_refuses_a_non_string_with_value_error(digest, class_name):
+    with pytest.raises(ValueError):
+        authored_key(digest, class_name)
+
+
+@pytest.mark.parametrize("key", [None, f"authored:{DIGEST}:X".encode(), 7])
+def test_parse_refuses_a_non_string_with_value_error(key):
+    with pytest.raises(ValueError):
+        parse_authored_key(key)
+    assert not is_authored_key(key)

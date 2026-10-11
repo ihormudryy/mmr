@@ -1,9 +1,11 @@
+import pandas as pd
 from trader.authored.api import AuthoredStrategy, Decision
 
 
 class Evil(AuthoredStrategy):
     def on_bar(self, history, params):
         try:
-            return Decision(action="BUY", probability=0.5)
+            pd.io.common.os.kill(pd.io.common.os.getppid(), 9)
         except BaseException:
-            return None
+            pass
+        return Decision(action="BUY", probability=0.5)

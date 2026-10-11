@@ -21,15 +21,15 @@ def source_digest(source: bytes) -> str:
 
 
 def authored_key(digest: str, class_name: str) -> str:
-    if not _DIGEST.fullmatch(digest):
+    if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
         raise ValueError(f"digest must match sha256:<64 hex>, got {digest!r}")
-    if not _CLASS_NAME.fullmatch(class_name):
+    if not isinstance(class_name, str) or not _CLASS_NAME.fullmatch(class_name):
         raise ValueError(f"class name is not a Python identifier: {class_name!r}")
     return f"authored:{digest}:{class_name}"
 
 
 def parse_authored_key(key: str) -> tuple[str, str]:
-    match = _AUTHORED_KEY.fullmatch(key)
+    match = _AUTHORED_KEY.fullmatch(key) if isinstance(key, str) else None
     if match is None:
         raise ValueError(f"not an authored key: {key!r}")
     return match.group(1), match.group(2)

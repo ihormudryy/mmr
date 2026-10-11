@@ -32,11 +32,11 @@ async def test_end_to_end_propose_to_jev_on_the_enter(tmp_path, loop_thread, mon
         assert rw.reviews() == [(f"vendor/jev-1#{judgment_id}", "llm", True)]   # reviewer, kind, holdout once
         assert len(rw.bundles()) == 1
 
-        rw.next_morning(10, 1)                                            # Monday: the version is active
+        rw.next_morning(10, 15, 30)                                       # Monday: the version is active
         rw.strategy.reconcile()
         assert version in rw.strategy.instances()
         rw.node.jev.script(JEV_MARKER, entry_ruling("TAKE"))
-        source = rw.strategy.feed_bar(CONID, rw.morning_bar(CONID))       # TimeOfDay buys on the 10:00 bar
+        source = rw.strategy.feed_bar(CONID, rw.morning_bar(CONID))       # TimeOfDay buys on the 10:00 bar (closed 10:15)
         await rw.node.signals()
         decision_id = derive_decision_id(source, f"enter:{CONID}")
         assert rw.world.decision_row(decision_id).deployment_version == version

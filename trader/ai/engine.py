@@ -112,6 +112,7 @@ class SignalOpportunity:
     deployment_digest: Optional[str] = None      # an AI-deployment instance's binding (SP2c Plan 2): all three or none
     deployment_version: Optional[str] = None
     source_digest: Optional[str] = None
+    bar_size: Optional[str] = None               # the strategy's bar size: the bar closes this long after signal_time
 
     def __post_init__(self) -> None:
         _check_binding(deployment_digest=self.deployment_digest, deployment_version=self.deployment_version,

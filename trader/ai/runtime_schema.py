@@ -1,4 +1,4 @@
-"""ai.duckdb tables owned by SP2 Plan 5: migrations 10-17 (18-19 stay free). Plain CREATE only."""
+"""ai.duckdb tables owned by SP2 Plan 5: migrations 10-18 (19 stays free). CREATE, plus one added column (18)."""
 from __future__ import annotations
 
 from datetime import datetime
@@ -71,6 +71,8 @@ RUNTIME_MIGRATIONS: tuple[Migration, ...] = (
             state VARCHAR NOT NULL CHECK (state IN ('RUNNING', 'DONE', 'MISSED', 'SKIPPED', 'TIMED_OUT',
                                                     'FAILED')),
             reason VARCHAR, started_at TIMESTAMPTZ NOT NULL, finished_at TIMESTAMPTZ)""",)),
+    Migration(18, "ai_opportunities_bar_size", (           # issue #146: freshness counts from the bar's close
+        "ALTER TABLE ai_opportunities ADD COLUMN bar_size VARCHAR",)),
 )
 
 ALL_MIGRATIONS: tuple[Migration, ...] = (

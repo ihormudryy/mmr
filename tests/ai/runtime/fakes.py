@@ -180,12 +180,14 @@ def write_correction(store, attempt_key, *, usage, cost_micros, now):
     store.transaction(work)
 
 
-def signal(cursor, *, action="BUY", conid=AAPL, at=None, strategy="orb", **binding):
+def signal(cursor, *, action="BUY", conid=AAPL, at=None, strategy="orb", bar_size="1 min", **binding):
+    """``at`` is the start of the signal's bar, as the trader's record holds it; by default the 1-minute bar that
+    closed at 11:00."""
     import hashlib
-    at = at or et(11, 0)
+    at = at or et(10, 59)
     return {"cursor": cursor, "source_event_id": "sig-" + hashlib.sha256(f"{strategy}{cursor}".encode()).hexdigest()[:32],
             "strategy_name": strategy, "conid": conid, "action": action, "probability": 0.6,
-            "signal_time": at.isoformat(), "recorded_at": at.isoformat(), **binding}
+            "signal_time": at.isoformat(), "recorded_at": at.isoformat(), "bar_size": bar_size, **binding}
 
 
 class FakeSignals:

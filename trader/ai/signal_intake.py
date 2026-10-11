@@ -17,14 +17,19 @@ from trader.ai.engine import SignalOpportunity, parse_aware
 from trader.ai.rpc_clients import RpcRefused
 from trader.ai.runtime_schema import cursor_generation_in_tx, cursor_value_in_tx, set_cursor_in_tx
 from trader.ai.store import to_utc
+from trader.bar_size import BarSize
 
 logger = logging.getLogger(__name__)
 
 SIGNAL_CURSOR = "signals"
 SOURCE_EVENT_ID = re.compile(r"^sig-[0-9a-f]{32}$")
 RECORD_GENERATION = re.compile(r"^gen-[0-9a-f]{32}$")
-_COLUMNS = ("opportunity_id, signal_cursor, strategy_name, conid, action, probability, signal_time, recorded_at, "
-            "deployment_digest, deployment_version, source_digest, state")
+STALE = "STALE"
+BAR_SIZE_UNKNOWN = "STALE_BAR_SIZE_UNKNOWN"
+BAR_NOT_CLOSED = "BAR_NOT_CLOSED"
+_STORED = ("opportunity_id, signal_cursor, strategy_name, conid, action, probability, signal_time, recorded_at, "
+           "deployment_digest, deployment_version, source_digest, bar_size")
+_COLUMNS = f"{_STORED}, state"
 
 
 class SignalIntakeError(Exception):
@@ -59,10 +64,13 @@ def _parse_signal(raw: Any) -> SignalOpportunity:
         recorded_at = parse_aware(raw.get("recorded_at"), "recorded_at")
     except ValueError as exc:
         raise SignalIntakeError("SIGNAL_MALFORMED", f"{source}: {exc}") from None
+    bar_size = raw.get("bar_size")
+    if bar_size is not None and bar_size not in BarSize.bar_sizes():
+        raise SignalIntakeError("SIGNAL_MALFORMED", f"{source}: bar_size")
     binding = {name: raw.get(name) for name in ("deployment_digest", "deployment_version", "source_digest")}
     try:
         return SignalOpportunity(source, _nonnegative_int(raw.get("cursor"), "cursor"), raw["strategy_name"], conid,
-                                 raw["action"], probability, signal_time, recorded_at, **binding)
+                                 raw["action"], probability, signal_time, recorded_at, **binding, bar_size=bar_size)
     except ValueError as exc:
         raise SignalIntakeError("SIGNAL_MALFORMED", f"{source}: {exc}") from None
 
@@ -70,7 +78,8 @@ def _parse_signal(raw: Any) -> SignalOpportunity:
 def _opportunity(row: tuple) -> tuple[SignalOpportunity, str]:
     values = list(row)
     return SignalOpportunity(values[0], int(values[1]), values[2], int(values[3]), values[4], values[5],
-                             to_utc(values[6]), to_utc(values[7]), values[8], values[9], values[10]), values[11]
+                             to_utc(values[6]), to_utc(values[7]), values[8], values[9], values[10],
+                             values[11]), values[12]
 
 
 class SignalIntake:
@@ -114,10 +123,11 @@ class SignalIntake:
                 if conn.execute("SELECT 1 FROM ai_opportunities WHERE opportunity_id = ?",
                                 [s.opportunity_id]).fetchone():
                     continue                                              # redelivered: not a new opportunity
-                conn.execute("INSERT INTO ai_opportunities VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'NEW', NULL, ?, ?)",
+                conn.execute(f"INSERT INTO ai_opportunities ({_STORED}, state, reason, created_at, updated_at) "
+                             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'NEW', NULL, ?, ?)",
                              [s.opportunity_id, s.signal_cursor, s.strategy_name, s.conid, s.action, s.probability,
                               s.signal_time, s.recorded_at, s.deployment_digest, s.deployment_version,
-                              s.source_digest, now, now])
+                              s.source_digest, s.bar_size, now, now])
                 new.append(s.opportunity_id)
             set_cursor_in_tx(conn, SIGNAL_CURSOR, next_cursor, now, generation)
             return new
@@ -149,15 +159,32 @@ class SignalIntake:
             set_cursor_in_tx(conn, SIGNAL_CURSOR, 0, now)
         await self._store.atransaction(work)
 
-    def is_fresh(self, opportunity: SignalOpportunity, now: dt.datetime) -> bool:
-        return now - opportunity.signal_time <= self._max_age
+    def stale_reason(self, opportunity: SignalOpportunity, now: dt.datetime) -> Optional[str]:
+        """None while fresh. signal_time is the start of the signal's bar, so the age counts from the bar's close
+        (issue #146). A signal whose bar close is unknown, or still ahead of ``now``, is never fresh: a bar that has
+        not closed means a bad frame or a clock skew, so the signal is refused for good, not kept until its close."""
+        try:
+            bar_close = opportunity.signal_time + BarSize.intraday_length(opportunity.bar_size)
+        except ValueError:
+            logger.error("%s: signal %s from %s has bar size %r, so its bar close is unknown; it is not judged",
+                         BAR_SIZE_UNKNOWN, opportunity.opportunity_id, opportunity.strategy_name,
+                         opportunity.bar_size)
+            return BAR_SIZE_UNKNOWN
+        if bar_close > now:
+            logger.error("%s: signal %s from %s is on a bar that closes at %s, after now (%s); it is not judged",
+                         BAR_NOT_CLOSED, opportunity.opportunity_id, opportunity.strategy_name,
+                         bar_close.isoformat(), now.isoformat())
+            return BAR_NOT_CLOSED
+        return None if now - bar_close <= self._max_age else STALE
 
     async def expire_stale(self) -> list[str]:
         now = self._clock.now()
-        stale = [opp.opportunity_id for opp, state in await self.open_opportunities()
-                 if state == "NEW" and not self.is_fresh(opp, now)]
-        for opportunity_id in stale:
-            await self.mark(opportunity_id, "MISSED", "STALE")
+        stale = []
+        for opportunity, state in await self.open_opportunities():
+            reason = self.stale_reason(opportunity, now) if state == "NEW" else None
+            if reason is not None:
+                await self.mark(opportunity.opportunity_id, "MISSED", reason)
+                stale.append(opportunity.opportunity_id)
         return stale
 
     async def open_opportunities(self) -> list[tuple[SignalOpportunity, str]]:

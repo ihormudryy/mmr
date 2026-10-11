@@ -43,7 +43,7 @@ def test_cursors_are_monotonic_and_reads_page(record):
     view = page.signals[0].to_json()
     assert set(view) == {"cursor", "source_event_id", "strategy_name", "conid", "action", "probability",
                          "signal_time", "recorded_at", "deployment_digest", "deployment_version",
-                         "source_digest"}
+                         "source_digest", "bar_size"}
     assert (view["deployment_digest"], view["deployment_version"], view["source_digest"]) == (None, None, None)
     assert SOURCE_EVENT_ID.fullmatch(view["source_event_id"]) and view["conid"] == 265598
     assert view["signal_time"] == (T0 + dt.timedelta(minutes=1)).isoformat()
@@ -274,3 +274,41 @@ def test_a_partial_binding_is_refused(missing):
 def test_a_binding_that_is_not_a_digest_is_refused(field):
     with pytest.raises(ValueError, match="all set"):
         bound_entry(**{field: "sha256:abc"})
+
+
+# --- issue #146: the bar size travels with the signal ---------------------------------------------
+
+def test_the_bar_size_round_trips_and_leaves_the_identity_alone(record):
+    sized = SignalEntry.create(strategy_name="orb", conid=265598, action="BUY", probability=0.7, signal_time=T0,
+                               bar_size="15 mins")
+    assert sized.source_event_id == entry().source_event_id
+    record.append(sized)
+    (signal,) = record.read(0, 10).signals
+    assert (signal.entry.bar_size, signal.to_json()["bar_size"]) == ("15 mins", "15 mins")
+
+
+@pytest.mark.parametrize("bar_size", ["15 min", "15m", "", 15])
+def test_an_unknown_bar_size_is_refused(bar_size):
+    with pytest.raises(ValueError, match="bar_size"):
+        SignalEntry.create(strategy_name="orb", conid=265598, action="BUY", probability=0.7, signal_time=T0,
+                           bar_size=bar_size)
+
+
+def test_a_record_from_before_the_bar_size_gains_the_column_and_reads_null(tmp_path, clock):
+    db = DuckDBConnection.get_instance(str(tmp_path / "old.duckdb"))
+    db.transaction(lambda conn: conn.execute(
+        """CREATE TABLE strategy_signal_record (
+        cursor BIGINT PRIMARY KEY, source_event_id VARCHAR NOT NULL UNIQUE, strategy_name VARCHAR NOT NULL,
+        conid BIGINT NOT NULL, action VARCHAR NOT NULL, probability DOUBLE,
+        signal_time TIMESTAMPTZ NOT NULL, recorded_at TIMESTAMPTZ NOT NULL,
+        deployment_digest VARCHAR, deployment_version VARCHAR, source_digest VARCHAR)"""))
+    db.transaction(lambda conn: conn.execute(
+        "INSERT INTO strategy_signal_record VALUES (1, ?, 'orb', 265598, 'BUY', 0.7, ?, ?, NULL, NULL, NULL)",
+        [entry().source_event_id, T0, T0]))
+    db.transaction(lambda conn: conn.execute(
+        """CREATE TABLE strategy_signal_record_state (last_cursor BIGINT NOT NULL, retention_watermark BIGINT NOT NULL)"""))
+    db.transaction(lambda conn: conn.execute("INSERT INTO strategy_signal_record_state VALUES (1, 0)"))
+    record = StrategySignalRecord(db, now=clock)
+    record.append(SignalEntry.create(strategy_name="orb", conid=265598, action="SELL", probability=0.7,
+                                     signal_time=T0, bar_size="1 min"))
+    assert [s.to_json()["bar_size"] for s in record.read(0, 10).signals] == [None, "1 min"]

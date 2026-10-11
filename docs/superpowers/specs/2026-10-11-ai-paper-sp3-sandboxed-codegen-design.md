@@ -548,8 +548,8 @@ with the plan rulings.
   constant. The sandbox accepts any finite number for a tunable (research
   neighbours may leave the range); the trader checks ranges at submit and claim.
 - **Evaluation length (benchmark; owner confirmed 2026-10-11).** A full
-  authored evaluation at the SP2c defaults is estimated at about 11 h (over
-  4 h). An authored evaluation uses the most recent 302 sessions
+  authored evaluation at the SP2c defaults is estimated at 10.6 h (measured,
+  Plan 1 ruling 1; over 4 h). An authored evaluation uses the most recent 302 sessions
   (`research_service.authored_evaluation_sessions: 302` in `trader.yaml`), with
   SP2c's folds and embargo and the holdout scaled in proportion (39 sessions).
   Catalogue strategies keep the full SP2c length. The sandbox is not weakened.

@@ -213,7 +213,7 @@ confirmed).
 
 Benchmark:
 
-- Plan 1 ruling 1 (spec 14): owner confirmed 302 (2026-10-11). A full authored evaluation was estimated at about 11 h, so authored keys use the most recent 302 sessions (`research_service.authored_evaluation_sessions: 302`, SP2c's folds and embargo, holdout scaled to 39); catalogue strategies keep the full SP2c length. Built by Plan 4 Task 12 (Plan 4 ruling 25). Plan 1 Task 7 still measures and records the hours.
+- Plan 1 ruling 1 (spec 14): owner confirmed 302 (2026-10-11). Measured 2026-10-12: a full authored evaluation (10 conids x 690 sessions x 3 cohort points, 2 tunables, 2 neighbours each, 6 folds, embargo 5, + 90-session holdout) is estimated at 10.57 h at 0.8872 ms/bar streamed. Since 10.57 h is over 4 h: reduce research_service.period_sessions for authored keys only to N=310 (>= 132: 6 folds, embargo 5, holdout 90); never weaken the sandbox. Owner kept 302 (not the script's 310): authored keys use the most recent 302 sessions (`research_service.authored_evaluation_sessions: 302`, SP2c's folds and embargo, holdout scaled to 39); catalogue strategies keep the full SP2c length. Built by Plan 4 Task 12 (Plan 4 ruling 25).
 
 All other rulings:
 

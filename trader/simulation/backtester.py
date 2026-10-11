@@ -607,16 +607,15 @@ class Backtester:
                     pending_signals.append((synthetic, conid, timestamp))
 
             # 3. Run the strategy on each conid at its current bar.
-            #    on_bar is the fast path (reads precomputed state by index);
-            #    its default impl falls back to on_prices(accumulated) so
-            #    strategies that only implement the legacy API still work.
+            #    on_bar gets only the bars up to this one (#150), the same
+            #    frame the live runtime hands on_prices.
             for conid in list(bars_this_ts.keys()):
                 idx = bar_index.get(conid, -1)
                 if idx < 0:
                     continue
-                full_prices = all_data[conid]
+                prices_so_far = all_data[conid].iloc[:idx + 1]
                 state = precompute_state.get(conid, {})
-                signal = strategy.on_bar(full_prices, state, idx)
+                signal = strategy.on_bar(prices_so_far, state, idx)
                 if not signal:
                     continue
                 if warming:

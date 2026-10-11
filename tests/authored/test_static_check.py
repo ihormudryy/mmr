@@ -518,3 +518,80 @@ def test_probe_round_two_verdicts(name):
         assert rules == set()
     else:
         assert rule in rules
+
+
+# --- fix round 3: free names follow Python scoping, nested class shape -------
+
+SCOPED_HEAD = ("from trader.authored.api import AuthoredStrategy, Decision\n\n"
+               "LIMIT = 3\n\n\n"
+               "class S(AuthoredStrategy):\n")
+
+
+@pytest.mark.parametrize("class_body", [
+    # bound only in the class body; a method cannot see it
+    "    PythonFinalizationError = 1\n\n"
+    "    def on_bar(self, history, params):\n"
+    "        y = PythonFinalizationError\n        return None\n",
+    # a parameter of another method
+    "    def other(self, secret):\n        return None\n\n"
+    "    def on_bar(self, history, params):\n"
+    "        y = secret\n        return None\n",
+    # a lambda parameter outside its lambda
+    "    def on_bar(self, history, params):\n"
+    "        f = lambda hidden: hidden\n        y = hidden\n        return None\n",
+    # a comprehension target after its comprehension
+    "    def on_bar(self, history, params):\n"
+    "        y = [item for item in history]\n        z = item\n        return None\n",
+    # a nested function's local, read by its parent
+    "    def on_bar(self, history, params):\n"
+    "        def inner():\n            local = 1\n            return local\n"
+    "        y = local\n        return None\n",
+])
+def test_a_name_bound_only_in_another_scope_is_unknown(class_body):
+    assert "unknown_name" in _rules(SCOPED_HEAD + class_body)
+
+
+@pytest.mark.parametrize("class_body", [
+    # module-level constant read in a method
+    "    def on_bar(self, history, params):\n"
+    "        y = LIMIT\n        return None\n",
+    # enclosing-function local read in a nested function and a lambda
+    "    def on_bar(self, history, params):\n"
+    "        scale = 2\n"
+    "        def inner(v):\n            return v * scale\n"
+    "        f = lambda v: v + scale\n"
+    "        y = inner(1) + f(1)\n        return None\n",
+    # a class-body name read in the class body itself
+    "    WINDOW = 5\n    LOOKBACK_BARS = WINDOW * 10\n\n"
+    "    def on_bar(self, history, params):\n        return None\n",
+    # a comprehension reads its own target and the enclosing function
+    "    def on_bar(self, history, params):\n"
+    "        y = [item * LIMIT for item in history if item]\n        return None\n",
+    # a walrus in a comprehension binds in the enclosing function
+    "    def on_bar(self, history, params):\n"
+    "        y = [last := item for item in history]\n        z = last\n        return None\n",
+    # a method reads a name bound later in the same function
+    "    def on_bar(self, history, params):\n"
+    "        if history:\n            later = 1\n        return later\n",
+])
+def test_a_name_bound_in_a_visible_scope_passes(class_body):
+    assert check_source(SCOPED_HEAD + class_body) == []
+
+
+def test_a_comprehension_target_is_not_visible_in_its_first_iterable():
+    body = ("    def on_bar(self, history, params):\n"
+            "        y = [ghost for ghost in ghost]\n        return None\n")
+    assert "unknown_name" in _rules(SCOPED_HEAD + body)
+
+
+@pytest.mark.parametrize("nested", [
+    "class Inner(metaclass=zip):\n    pass",
+    "class Inner(Decision):\n    pass",
+    "class Inner(dict):\n    pass",
+])
+def test_a_nested_class_with_bases_or_keywords_is_refused(nested):
+    assert "class_shape" in _rules(_probe(nested))
+
+
+def test_a_plain_nested_class_passes():
+    assert check_source(_probe("class Inner:\n    pass")) == []

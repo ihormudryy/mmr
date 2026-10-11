@@ -67,10 +67,9 @@ def _bad_string(text: str) -> bool:
 
 
 class _Checker(ast.NodeVisitor):
-    def __init__(self, bound_names: frozenset[str]) -> None:
+    def __init__(self) -> None:
         self.violations: list[StaticViolation] = []
         self.module_aliases: dict[str, str] = {}   # alias -> real module name
-        self.bound_names = bound_names
 
     def add(self, rule: str, node: ast.AST, detail: str) -> None:
         self.violations.append(StaticViolation(rule, getattr(node, "lineno", 0), detail))
@@ -134,8 +133,6 @@ class _Checker(ast.NodeVisitor):
             self._check_binding(node, node.id)
         elif node.id in _BUILTIN_NAMES and node.id not in ALLOWED_BUILTINS:
             self.add("banned_builtin", node, f"builtin {node.id}")
-        elif node.id not in ALLOWED_BUILTINS and node.id not in self.bound_names:
-            self.add("unknown_name", node, f"name {node.id} is never bound in the file")
         if node.id in self.module_aliases and not self._is_chain_root(node):
             self.add("module_alias_misuse", node, f"module alias {node.id} used outside a chain root")
         self.generic_visit(node)
@@ -234,6 +231,9 @@ class _Checker(ast.NodeVisitor):
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self._check_identifier(node, node.name)
         self._check_binding(node, node.name)
+        nested = not isinstance(getattr(node, "_parent", None), ast.Module)
+        if nested and (node.bases or node.keywords):
+            self.add("class_shape", node, f"nested class {node.name} may have no bases or keywords")
         self._check_no_decorator_or_type_params(node)
         self.generic_visit(node)
 
@@ -257,19 +257,119 @@ def _check_node_types(tree: ast.AST, checker: _Checker) -> None:
             checker.add("node_type", node, f"{type(node).__name__} is not allowed")
 
 
-def _bound_names(tree: ast.AST) -> frozenset[str]:
-    """Every name the file binds anywhere; scope is ignored on purpose (simpler, still closed)."""
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
-            names.add(node.id)
-        elif isinstance(node, ast.arg):
-            names.add(node.arg)
-        elif isinstance(node, (ast.FunctionDef, ast.ClassDef)):
-            names.add(node.name)
-        elif isinstance(node, ast.alias):
-            names.add(node.asname or node.name.split(".")[0])
-    return frozenset(names)
+class _Scope:
+    def __init__(self, kind: str, parent: _Scope | None) -> None:
+        self.kind = kind            # module, function, class or comprehension
+        self.parent = parent
+        self.names: set[str] = set()
+
+    def sees(self, name: str) -> bool:
+        """Python's lookup: this scope, then enclosing scopes except class bodies."""
+        if name in self.names:
+            return True
+        scope = self.parent
+        while scope is not None:
+            if scope.kind != "class" and name in scope.names:
+                return True
+            scope = scope.parent
+        return False
+
+
+class _FreeNameChecker(ast.NodeVisitor):
+    """Finds loaded names that no visible scope binds and that are not allowed builtins.
+
+    Bindings are collected for the whole file first, then reads are resolved, so a
+    name bound later in the same function counts as bound (as in Python).
+    """
+
+    def __init__(self) -> None:
+        self.scope = _Scope("module", None)
+        self.reads: list[tuple[ast.Name, _Scope]] = []
+
+    def unknown_names(self, tree: ast.Module) -> list[ast.Name]:
+        self.generic_visit(tree)
+        return [node for node, scope in self.reads
+                if node.id not in ALLOWED_BUILTINS and node.id not in _BUILTIN_NAMES
+                and not scope.sees(node.id)]
+
+    def _in_new_scope(self, kind: str, nodes: list[ast.AST], bound: tuple[str, ...] = ()) -> None:
+        outer = self.scope
+        self.scope = _Scope(kind, outer)
+        self.scope.names.update(bound)
+        for node in nodes:
+            self.visit(node)
+        self.scope = outer
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Load):
+            self.reads.append((node, self.scope))
+        else:
+            self.scope.names.add(node.id)
+
+    def visit_alias(self, node: ast.alias) -> None:
+        self.scope.names.add(node.asname or node.name.split(".")[0])
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.visit(node.value)
+        target_scope = self.scope
+        while target_scope.kind == "comprehension":
+            target_scope = target_scope.parent
+        target_scope.names.add(node.target.id)
+
+    def _visit_function(self, node: ast.FunctionDef | ast.Lambda, body: list[ast.AST]) -> None:
+        arguments = node.args
+        every_arg = [*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs,
+                     *(a for a in (arguments.vararg, arguments.kwarg) if a is not None)]
+        for default in [*arguments.defaults, *arguments.kw_defaults]:
+            if default is not None:
+                self.visit(default)
+        for arg in every_arg:
+            if arg.annotation is not None:
+                self.visit(arg.annotation)
+        self._in_new_scope("function", body, tuple(arg.arg for arg in every_arg))
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.scope.names.add(node.name)
+        for expression in [*node.decorator_list, *([node.returns] if node.returns else [])]:
+            self.visit(expression)
+        self._visit_function(node, node.body)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self._visit_function(node, [node.body])
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.scope.names.add(node.name)
+        for expression in [*node.decorator_list, *node.bases, *node.keywords]:
+            self.visit(expression)
+        self._in_new_scope("class", node.body)
+
+    def _visit_comprehension(self, generators: list[ast.comprehension],
+                             results: list[ast.AST]) -> None:
+        self.visit(generators[0].iter)   # the first iterable is evaluated outside
+        parts: list[ast.AST] = []
+        for index, generator in enumerate(generators):
+            parts.append(generator.target)
+            if index > 0:
+                parts.append(generator.iter)
+            parts.extend(generator.ifs)
+        self._in_new_scope("comprehension", parts + results)
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._visit_comprehension(node.generators, [node.elt])
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        self._visit_comprehension(node.generators, [node.elt])
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        self._visit_comprehension(node.generators, [node.elt])
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._visit_comprehension(node.generators, [node.key, node.value])
+
+
+def _check_free_names(tree: ast.Module, checker: _Checker) -> None:
+    for node in _FreeNameChecker().unknown_names(tree):
+        checker.add("unknown_name", node, f"name {node.id} is not bound in a visible scope")
 
 
 def _imports_base_class(body: list[ast.stmt]) -> bool:
@@ -348,11 +448,12 @@ def check_source(source: str) -> list[StaticViolation]:
     except (ValueError, MemoryError, RecursionError) as error:
         return _unparseable(0, f"too complex to parse: {type(error).__name__}")
     _link_parents(tree)
-    checker = _Checker(_bound_names(tree))
+    checker = _Checker()
     _check_node_types(tree, checker)
     _check_module_shape(tree, checker)
     try:
         checker.visit(tree)
+        _check_free_names(tree, checker)
     except RecursionError:
         return _unparseable(0, "too deeply nested to check")
     return sorted(checker.violations, key=lambda v: (v.line, v.rule, v.detail))

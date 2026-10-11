@@ -46,7 +46,7 @@ V1" as a risk, on condition that the sandbox is correct from the first day.
 | Catalogue strategy | A strategy file in the repo's `strategies/`. |
 | Store | The read-only, content-addressed volume that holds authored files. |
 | Digest | `sha256:` of the file bytes. The store key and the binding key. |
-| Session (sandbox) | One child process serving one strategy, one conid, one run. |
+| Session (sandbox) | One child process serving one strategy for one run: live, all conids of one deployment; research, one conid (amended, 14). |
 | Authored key | `authored:sha256:<hex>:<Class>`, the strategy key of an authored file. |
 
 ## 4. Findings in today's code that shape this design
@@ -248,13 +248,14 @@ The `sandbox` stanza does **not** inherit `x-mmr-hardening` or
 `x-mmr-common-env`. It sets:
 
 - `network_mode: none`, `read_only: true`, `cap_drop: [ALL]`,
-  `cap_add: [SETUID, SETGID, KILL]`, `security_opt: [no-new-privileges:true,
+  `cap_add: [CHOWN, SETUID, SETGID, KILL]` (CHOWN only at startup, then dropped; 14),
+  `security_opt: [no-new-privileges:true,
   seccomp=./config_defaults/sandbox-seccomp.json]`, `pids_limit: 64`, `cpus: 2`,
   `mem_limit: 4g`.
-- **Process model.** The supervisor runs as uid 0 inside the container with only
-  those three capabilities (no other root power: read-only root, no network, no
+- **Process model.** The supervisor runs as uid 0 inside the container and, once
+  started, with only SETUID, SETGID and KILL (no other root power: read-only root, no network, no
   mounts of value). Each session's child gets its **own** uid from a pool
-  (`20001..20013`, one per session slot, group `sbxchild` gid 20000, none in
+  (`20001..20007`, one per session slot, group `sbxchild` gid 20000, none in
   `sudo` or `trader`), set with `setgid`/`setuid` after `fork` and before any
   authored code loads; it keeps no capability. A child therefore cannot signal,
   `ptrace` or read the memory of the supervisor (different uid, no `CAP_KILL`) or
@@ -279,8 +280,8 @@ Sockets and pools (separate, so research cannot starve live trading):
 
 | Socket | Mounted by | Pool |
 |---|---|---|
-| `/run/sandbox-live/sandbox.sock` | `sandbox`, `strategy` | 9 sessions (3 deploys × up to 3 conids, SP2c `max_cohort_points`) |
-| `/run/sandbox-research/sandbox.sock` | `sandbox`, `research` | 4 sessions |
+| `/run/sandbox-live/sandbox.sock` | `sandbox`, `strategy` | 3 sessions, one per authored deployment, each serving all its conids (amended, 14) |
+| `/run/sandbox-research/sandbox.sock` | `sandbox`, `research` | 4 sessions, one conid each |
 
 Each socket file is created with group `trader` (gid 1000, which `strategy` and
 `research` run as) and mode `0660`, so those callers connect and no other user
@@ -292,17 +293,19 @@ Protocol, frames of 4-byte length plus JSON, `"v": 1`:
 
 | Request | Reply |
 |---|---|
-| `OPEN {digest, class, params, bar_size}` | `OPENED {session}` or `ERROR {code}` |
-| `BAR {session, t, open, high, low, close, volume}` | `SIGNAL {session, t, action, probability}` (action may be null) |
+| `OPEN {digest, class, params, bar_size, conids}` | `OPENED {session, image_digest}` or `ERROR {code}` |
+| `OPEN_PROBE {kind, name, conids}` (isolation checks only, 14) | `OPENED {session, image_digest}` or `ERROR {code}` |
+| `BAR {session, conid, t, open, high, low, close, volume}` | `SIGNAL {session, conid, t, action, probability}` (action may be null) |
 | `CLOSE {session}` | `CLOSED` |
-| `PING` | `PONG` |
+| `PING` | `PONG {image_digest (the build id), posture, live_open, ...}` |
 
 `OPEN` re-hashes the stored file (`SANDBOX_DIGEST_MISMATCH`), runs the static
 check, then forks one child, drops it to its slot uid, and only then loads the
-class. A session holds only bars it
-was sent, trimmed to `LOOKBACK_BARS`; `BAR` times must strictly increase. A full
+class. A session holds, per conid, only bars it
+was sent for that conid, trimmed to `LOOKBACK_BARS`; `BAR` times must strictly
+increase per conid. A full
 pool answers `SANDBOX_BUSY` at once (no queue). Limits per child: 2 s wall per
-bar, `RLIMIT_CPU`, `RLIMIT_AS` 256 MB, `RLIMIT_NPROC` blocking new processes,
+bar, `RLIMIT_CPU`, `RLIMIT_AS` = address space at fork + 256 MiB (14), `RLIMIT_NPROC` blocking new processes,
 file descriptors closed except the pipe to its parent; import guard and reduced
 built-ins inside. Any limit hit, exception or bad output (action not BUY/SELL/null,
 probability outside 0..1 or NaN) kills the child and returns
@@ -311,7 +314,8 @@ probability outside 0..1 or NaN) kills the child and returns
 ### 7.6 Sandbox client and its two callers
 
 `trader/authored/sandbox_client.py`: opens a session, streams bars, returns
-decisions; one session per (strategy, conid, run). `SANDBOX_BUSY` and an
+decisions; one session per (strategy, run): research, one per conid; live, one
+per deployment for all its conids (14). `SANDBOX_BUSY` and an
 unreachable socket are **availability** errors; only `SANDBOX_ERROR` and
 `SANDBOX_DIGEST_MISMATCH` are faults of the strategy.
 
@@ -327,8 +331,8 @@ unreachable socket are **availability** errors; only `SANDBOX_ERROR` and
   daily limit); after 3 attempts it is `FAILED SANDBOX_UNAVAILABLE`. After the
   holdout opens, SP2c's rule applies (a holdout that dies still counts as
   revealed).
-- **Strategy (live):** each deployed authored strategy holds one live session per
-  conid for the trading day. Each completed bar (from `_strategy_frame`, unclosed
+- **Strategy (live):** each deployed authored strategy holds one live session for
+  the trading day, serving all of its conids (14). Each completed bar (from `_strategy_frame`, unclosed
   bars dropped as today) is streamed and a decision maps to a `Signal`. The
   digest is checked at load and on every dispatch, as today. Signals take the
   existing path: signal record, AI intake, Jev, risk gate. An availability error
@@ -359,12 +363,14 @@ changes a gate.
 
 `mmr ai-author prove-isolation` (operator, host only) runs the section 10
 "production service" and "hostile session" checks against the **running**
-`sandbox` service and records the result in the trader: the sandbox image digest,
-the time, pass or fail, and each check. While no passing record exists for the
-image digest the sandbox reports in `PONG`, the trader refuses an authored
-registration (`AUTHORED_ISOLATION_UNPROVEN`) and the strategy service refuses to
-load an authored deployment. Evaluation, Jev judgment and SHADOW still run. A
-rebuilt image needs a new run. The record holds no secret and no strategy code.
+`sandbox` service and records the result in the trader: the sandbox build id
+(the image identity, 14), the time, pass or fail, and each check. It runs only
+while no live session is open (14). While no passing record exists for the
+builds research reported (14), the trader refuses an authored registration
+(`AUTHORED_ISOLATION_UNPROVEN`); and the strategy service sends no bar to a
+build that has no passing record, whatever the registration said (the binding
+check, 14). Evaluation, Jev judgment and SHADOW still run. A rebuilt image needs
+a new run. The record holds no secret and no strategy code.
 
 ## 8. Failure handling
 
@@ -394,10 +400,13 @@ rebuilt image needs a new run. The record holds no secret and no strategy code.
 | Strategies per night / author retries | 1 / 1 | code |
 | File size | 20 KB | code |
 | `LOOKBACK_BARS` | 1..2000 | code |
-| Per-bar time / child memory | 2 s / 256 MB | code |
-| Live / research sessions | 9 / 4 | code |
+| Per-bar time / child memory | 2 s / address space at fork + 256 MiB | code |
+| Live / research sessions | 3 (one per deployment) / 4 (one conid each) | code |
+| Conids per live session | 1..20 (SP2c `MAX_CONIDS`) | code |
+| `authored_strategies.max_active` range | 1..3 (the live pool) | trader.yaml (owner) |
 | Unavailable-sandbox attempts | 3 nights | code |
-| Child uids | 20001..20013 (one per slot) | image |
+| `research_service.authored_evaluation_sessions` | 302 (holdout scaled, 14) | trader.yaml (owner) |
+| Child uids | 20001..20007 (one per slot) | image |
 
 ## 10. Testing
 
@@ -408,8 +417,8 @@ rebuilt image needs a new run. The record holds no secret and no strategy code.
   `importlib` and `__import__` in strings, computed `getattr`, decorators, lambda
   defaults, `try/except` swallowing a kill.
 - **Production service** (full-stack test profile, the real `sandbox` stanza from
-  `docker-compose.yml`, not an override): the supervisor's effective
-  capabilities are exactly SETUID, SETGID and KILL, each child runs as its slot
+  `docker-compose.yml`, not an override): the serving supervisor's effective
+  capabilities are exactly SETUID, SETGID and KILL (CHOWN dropped after startup, 14), each child runs as its slot
   uid with no capability and no `sudo`/`trader` group, `network_mode: none`, the
   seccomp profile is loaded; its environment contains no
   `ALPACA_*`, `MASSIVE_*`, `TWELVEDATA_*`, `IB_*` or `OPENROUTER_*` name; `research`
@@ -427,9 +436,9 @@ rebuilt image needs a new run. The record holds no secret and no strategy code.
 - **Static check:** the same `pd.io.common.os...` file and every `pd.<module>` /
   `np.<module>` chain are refused `AUTHORED_STATIC_REJECTED`; the shipped
   pandas/numpy walk (7.2) passes.
-- **Staged deploy:** with no isolation record for the running image digest, an
+- **Staged deploy:** with no isolation record for the running build id, an
   authored DEPLOY registers nothing and the load is refused; after a passing
-  `prove-isolation` it registers; a different image digest needs a new run.
+  `prove-isolation` it registers; a different build id needs a new run.
 - **Pools:** research holding all 4 research sessions does not delay a live
   `OPEN`; a full pool answers `SANDBOX_BUSY` at once; live `SANDBOX_BUSY` leaves
   the strategy `DEPLOYED` with an alarm.
@@ -477,4 +486,70 @@ trading.
 ## 13. Open questions
 
 - Exact evaluation length for authored strategies if the benchmark (section 10)
-  is too slow.
+  is too slow. Settled in 14: 302 sessions (owner confirmed).
+
+## 14. Amendments (2026-10-11, from the plans)
+
+The implementation plans (index `2026-10-11-ai-paper-sp3-00-index.md`) found these
+gaps. The lines above are fixed in place and point here. The owner confirms them
+with the plan rulings.
+
+- **Live pool per deployment.** A deployment binds 8 to 20 conids (SP2c); the old
+  "3 × 3" counted parameter points. One live session now serves one deployment:
+  `OPEN` carries `conids` (1-20), `BAR` and `SIGNAL` carry `conid`. One child
+  holds one strategy instance and one history per conid (same digest, so no
+  isolation is needed between them); times increase per conid; a fault on any
+  conid ends the whole session and retires the strategy. Live pool 3, research
+  pool 4 (one conid per session, used one at a time per job). Seven slots, uids
+  `20001..20007`. `max_active` is 1..3, so every deployment can get a session.
+- **Image identity is a build id.** `docker.sh` bakes `<git sha>-<UTC time>` into
+  `/etc/mmr-build-id`; `PONG` reports it as `image_digest`. The isolation record,
+  the registration gate and the strategy service's load check all key on it. No
+  `docker inspect`: `PONG` also reports the posture (capabilities, seccomp,
+  no-new-privileges, network, environment, read-only root, pids limit). The
+  trader learns the running build id from research's `STARTED` report.
+  Registration needs a passing proof for the build that evaluated the strategy
+  and for the build research reported last, checked again inside the seal
+  transaction; it does not prove the build running now. The binding check is
+  the strategy service's: it refreshes the proof at every reconcile, opens no
+  live session on a build without a passing proof (it reads the build from
+  `PING` before `OPEN` and from `OPENED`), and checks it on every bar.
+- **Isolation run.** `mmr ai-author prove-isolation` runs
+  `mmr ai-author prove-isolation --in-container` inside `research` (research
+  socket, no key). Hostile files load through `OPEN_PROBE` from the read-only
+  image (`trader/sandbox/probes/`, `tests/authored/escapes/`); only probes skip
+  the static check. A hostile check passes only if the escape opened, failed at
+  `BAR` for its own reason, and a neighbouring session and `PING` still answer.
+  The run refuses while a live session is open (`PONG.live_open`, owner ruling),
+  so a probe never runs next to a live strategy's child. Each hostile file
+  attempts a genuinely forbidden act (write under read-only `/store`, fork past
+  the process limit, kill across uids, open a socket on a network-less
+  container), so its `BAR` fails for the reason the check expects. The host
+  records the printed result as `cli`.
+- **Startup CAP_CHOWN.** The supervisor needs CHOWN once, to give each slot its
+  own `/tmp/s<uid>` (mode 0700); it drops CHOWN before it serves. The serving
+  set stays SETUID, SETGID and KILL. After a session a short helper running as
+  the slot uid empties the slot; a slot it cannot empty is never reused.
+- **Child memory.** A forked pandas process already maps more than 256 MB, so
+  `RLIMIT_AS` is the address space at fork plus 256 MiB.
+- **Entries stop at the send.** A retired or switched-off authored strategy is
+  also refused on the order saga's SUBMITTING transaction, so a retirement
+  between the last gate and the broker send stops the entry. The gate resolves
+  the record from the entering version's base deployment, so a renewed version
+  is fenced as well.
+- **The live proof is never cached.** The strategy service reads the trader's
+  latest proof for the sandbox build on every new session and every bar, so a
+  proof withdrawn for a build already running stops the next bar (zero stale
+  bars).
+- **Author spend has its own role.** The trader's `ai_costs.role` accepts
+  `author` (journal migration 132 rebuilds the table, rows and seals unchanged).
+- **Tunables carry a default.** `submit_authored_strategy` sends
+  `{low, high, default}` per tunable; the default must equal the class
+  constant. The sandbox accepts any finite number for a tunable (research
+  neighbours may leave the range); the trader checks ranges at submit and claim.
+- **Evaluation length (benchmark; owner confirmed 2026-10-11).** A full
+  authored evaluation at the SP2c defaults is estimated at about 11 h (over
+  4 h). An authored evaluation uses the most recent 302 sessions
+  (`research_service.authored_evaluation_sessions: 302` in `trader.yaml`), with
+  SP2c's folds and embargo and the holdout scaled in proportion (39 sessions).
+  Catalogue strategies keep the full SP2c length. The sandbox is not weakened.

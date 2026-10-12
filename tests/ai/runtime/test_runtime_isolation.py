@@ -23,7 +23,8 @@ MODULES = ("trader.ai.ids", "trader.ai.runtime_schema", "trader.ai.rpc_clients",
            "trader.ai.research_cycle", "trader.ai.research_menu", "trader.ai.research_roles",
            "trader.ai.research_wire", "trader.ai.backtest_judge",
            # SP3 Plan 5
-           "trader.ai.author_schema", "trader.ai.author_wire", "trader.ai.author_roles", "trader.ai.author_facts")
+           "trader.ai.author_schema", "trader.ai.author_wire", "trader.ai.author_roles", "trader.ai.author_facts",
+           "trader.ai.author_loop")
 
 
 def test_the_runtime_stays_clear_of_the_trading_runtime():

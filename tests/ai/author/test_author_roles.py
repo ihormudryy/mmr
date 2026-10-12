@@ -113,10 +113,10 @@ def test_the_rules_tell_the_model_to_bind_each_constant_once():
 
 def test_the_files_that_decide_the_verdict_pin_the_author_judgment_code():
     from trader.ai.tools import JUDGMENT_SOURCES, TRADER_ROOT
-    pinned = {TRADER_ROOT / "automation" / "authored_submission.py", TRADER_ROOT / "authored" / "static_check.py",
-              TRADER_ROOT / "authored" / "allowed_api.py", TRADER_ROOT / "authored" / "keys.py"}
-    assert pinned <= set(JUDGMENT_SOURCES)
-    assert TRADER_ROOT / "authored" not in JUDGMENT_SOURCES
+    authored = {TRADER_ROOT / "authored" / name for name in ("static_check.py", "allowed_api.py", "keys.py", "api.py")}
+    assert TRADER_ROOT / "automation" / "authored_submission.py" in JUDGMENT_SOURCES
+    assert {source for source in JUDGMENT_SOURCES if TRADER_ROOT / "authored" in source.parents} == authored
+    assert TRADER_ROOT / "authored" not in JUDGMENT_SOURCES        # not the sandbox client, streaming or proofs
 
 
 RETRY_MESSAGE_MAX_BYTES = 8 * 1024

@@ -56,6 +56,11 @@ class AuthorSlot:
         return f"aut-{self.session_date:%Y%m%d}"
 
 
+def author_slot_end(session_date: dt.date) -> dt.datetime:
+    """New York midnight after the session: the author slot's end and the end of its budget day (Ruling 5)."""
+    return dt.datetime.combine(session_date + dt.timedelta(days=1), dt.time(0), tzinfo=ET)
+
+
 class SessionSlots:
     def __init__(self, *, calendar: Optional[Any] = None, entry_minutes: int = 15, position_minutes: int = 15,
                  grace_seconds: int = 120, research_after_close_minutes: int = 30,
@@ -145,8 +150,8 @@ class SessionSlots:
         for _ in range(MAX_CLOSED_DAYS):
             schedule = self._schedule_on(day)
             if schedule is not None and schedule.close_utc + self._author_after_close <= now:
-                midnight = dt.datetime.combine(schedule.session_date + dt.timedelta(days=1), dt.time(0), tzinfo=ET)
-                return AuthorSlot(schedule.session_date, schedule.close_utc + self._author_after_close, midnight)
+                return AuthorSlot(schedule.session_date, schedule.close_utc + self._author_after_close,
+                                  author_slot_end(schedule.session_date))
             day -= dt.timedelta(days=1)
         return None
 

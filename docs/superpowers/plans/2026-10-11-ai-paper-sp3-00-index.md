@@ -219,7 +219,7 @@ Money and risk:
 - Plan 4 ruling 12: Jev's `strategy_trials` for an authored key = authored files judged so far + this file's trials.
 - Plan 5 ruling 8: a registration refused `AUTHORED_ISOLATION_UNPROVEN` waits for the next research evening.
 - Plan 5 ruling 14 (owner confirmed 2026-10-11): author spend has its own `ai_costs` role `author` (trader migration 132 rebuilds the table, rows and seals copied unchanged).
-- Plan 4 ruling 19 (review r1 #6, r2 #4): a passing proof is never cached; `is_proven` reads the authoritative trader proof for the build on every call, before every new session and on every bar, fail-closed, with a 2 s timeout on its own query client. Built 2026-10-12: after a read that got no answer (trader down, timeout, remote error) the gate stays shut for 20 s without asking, because the read runs on the strategy service's event loop; a definite answer is never held.
+- Plan 4 ruling 19 (review r1 #6, r2 #4): a passing proof is never cached; `is_proven` reads the authoritative trader proof for the build on every call, before every new session and on every bar, fail-closed, with a 2 s timeout on its own query client. Built 2026-10-12: after a read that got no answer (trader down, timeout, remote error) the gate stays shut for 20 s without asking, because the read then ran on the strategy service's event loop; a definite answer is never held. Final review I2: an authored instance's bars now run on its own worker thread, so only the dispatch check of a signal reads the proof on the loop.
 - Plan 4 ruling 10 (review r1 #7): an authored end the trader refuses for good parks the request (claim open, `AUTHORED_REPORT_REFUSED`, resent hourly and at restart); refusal is never delivery.
 
 Deploy and runbook:

@@ -1,7 +1,6 @@
 import pytest
-import yaml
 
-from tests.compose_rpc_helpers import ROOT, load_compose, volumes
+from tests.compose_rpc_helpers import ROOT, load_compose, load_override, volumes
 
 FORBIDDEN_ENV_PREFIXES = ("ALPACA_", "MASSIVE_", "TWELVEDATA_", "IB_", "TWS_", "OPENROUTER_",
                           "AWS_", "AZURE_", "DASHBOARD_", "TELEGRAM", "TRADING_MODE")
@@ -146,7 +145,8 @@ def test_only_the_sandbox_and_the_trader_side_touch_the_store():
 
 
 def test_the_test_override_makes_research_reachable_without_its_service():
-    override = yaml.safe_load((ROOT / "docker-compose.test.override.yml").read_text())
+    override = load_override("docker-compose.test.override.yml")
     research = override["services"]["research"]
     assert research["profiles"] == ["ai", "test"]
     assert research["command"] == ["sleep", "infinity"]
+    assert research["depends_on"] == [] and research["healthcheck"] == {"disable": True}

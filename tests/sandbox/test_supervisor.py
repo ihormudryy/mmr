@@ -617,6 +617,15 @@ def test_the_probe_directories_are_the_shipped_ones():
     assert (ESCAPE_DIR / "escape_import_os.py").is_file()
 
 
+@pytest.mark.parametrize("name, class_name", [("holds_only_its_pipe", "HoldsOnlyItsPipe"),
+                                               ("ptrace_denied", "PtraceDenied")])
+def test_the_container_check_probes_ship_with_one_class_each(name, class_name):
+    # Task 11: these run only in a real forked child (tests/fullstack/test_sandbox_service.py); here only their shape.
+    from trader.sandbox.supervisor import _only_class, _read_probe_source
+
+    assert _only_class(_read_probe_source("probe", name)) == class_name
+
+
 # ── the wipe helper (ruling 28) ─────────────────────────────────────────────
 
 def test_the_wipe_helper_never_follows_a_symlink_out_of_the_slot(tmp_path, monkeypatch):

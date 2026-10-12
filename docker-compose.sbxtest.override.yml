@@ -1,0 +1,37 @@
+# SP3 Plan 2 ruling 30 (review r2 #2): the sandbox full-stack test shares nothing with a live stack on the same
+# host. Applied ONLY by scripts/run_sandbox_fullstack.sh (never auto-loaded), after docker-compose.test.override.yml.
+# The runner renders and starts only `sandbox` and `fullstack-tests`, so ib-gateway (and trader, strategy, data,
+# dashboard, scheduler) never start. Both rendered services use a test-only image tag; fullstack-tests runs the
+# sandbox test and depends only on a healthy `sandbox`; no host port is published; nothing reads .env.
+# scripts/check_sbxtest_config.py refuses the run if the rendered config names another service, publishes a port,
+# carries a credential variable with a value, binds a path under the operator's ~/.config/mmr or
+# ~/.local/share/mmr, reads an env file, or still carries the mmr:latest tag.
+services:
+  sandbox:
+    image: ${MMR_SBXTEST_IMAGE}            # a test-only tag; never mmr:latest
+  fullstack-tests:
+    image: ${MMR_SBXTEST_IMAGE}-test       # a distinct test-stage tag, so `up --build` never overwrites sandbox's
+    # No trader or ib-gateway; the sandbox test needs only a sandbox that already answers its health PING.
+    depends_on: !override
+      sandbox:
+        condition: service_healthy
+    # The base sets TRADING_MODE for the trader-facing fullstack tests; the sandbox test needs no mode.
+    environment: !override
+      MMR_FAKE_BROKER: "1"
+      TZ: UTC
+    command: ["python", "-m", "pytest", "tests/fullstack/test_sandbox_service.py", "-q", "--timeout=600"]
+    # The checks write authored files to the store and reach both sockets through the sandbox's own named volumes.
+    # Only here, not in docker-compose.yml: the trader-facing fullstack run (project `mmr`) never mounts them.
+    volumes:
+      - mmr_authored_strategies:/store
+      - mmr_sandbox_live:/run/sandbox-live
+      - mmr_sandbox_research:/run/sandbox-research
+  # Defensive: even though the runner never starts these, strip their published ports and the gateway's .env so a
+  # future `up` of the whole profile by mistake still cannot bind a live port or log in to IB.
+  ib-gateway:
+    ports: !reset []
+    env_file: !reset []
+  trader:
+    ports: !reset []
+  dashboard:
+    ports: !reset []

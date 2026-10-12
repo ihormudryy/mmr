@@ -34,6 +34,11 @@ services:
       MMR_FAKE_BROKER: "1"
   # Ruling 18: the container tests use research's real socket mount without its real service
   # (which needs keys and a trader), so research joins the test profile and just sleeps.
+  # A sleeping research has no trader to wait for and no port 42106 to answer, so its own healthcheck and
+  # depends_on are dropped too; otherwise it shows unhealthy and pulls trader (and ib-gateway) into the run.
   research:
     profiles: ["ai", "test"]
     command: ["sleep", "infinity"]
+    depends_on: !reset []
+    healthcheck:
+      disable: true

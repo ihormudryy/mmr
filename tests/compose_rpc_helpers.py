@@ -16,6 +16,27 @@ def load_compose() -> dict:
     return yaml.safe_load(COMPOSE_PATH.read_text())
 
 
+class _ComposeLoader(yaml.SafeLoader):
+    """Safe YAML plus compose's merge tags (!reset, !override), each read as its plain value."""
+
+
+def _plain_value(loader: yaml.SafeLoader, node: yaml.Node):
+    if isinstance(node, yaml.MappingNode):
+        return loader.construct_mapping(node, deep=True)
+    if isinstance(node, yaml.SequenceNode):
+        return loader.construct_sequence(node, deep=True)
+    return loader.construct_scalar(node)
+
+
+for _merge_tag in ("!reset", "!override"):
+    _ComposeLoader.add_constructor(_merge_tag, _plain_value)
+
+
+def load_override(name: str) -> dict:
+    """A compose override file next to docker-compose.yml, its !reset/!override tags read as plain values."""
+    return yaml.load((ROOT / name).read_text(), Loader=_ComposeLoader)  # noqa: S506 - a SafeLoader subclass
+
+
 def parse_volume(volume) -> dict:
     """Normalise short and long volume syntax to {type, source, target, read_only}."""
     if isinstance(volume, dict):

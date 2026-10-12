@@ -25,6 +25,18 @@ class AuthoredReplayError(RuntimeError):
     sandbox, never a strategy fault."""
 
 
+class SandboxOpenFault(SandboxFault):
+    """A fault answered to OPEN: the stored file did not load. No session reported its build, so the evaluator
+    checks the build again before it blames the file (ruling F7b)."""
+
+    def __reduce__(self):
+        return _sandbox_open_fault, (self.detail, self.code)
+
+
+def _sandbox_open_fault(detail: str, code: str) -> SandboxOpenFault:
+    return SandboxOpenFault(detail, code=code)
+
+
 # The backtester's precompute does not name its conid. A research session holds exactly one conid and the
 # strategy never sees it, so one fixed label is enough; each conid still gets its own session (ruling 1, D1).
 RESEARCH_SESSION_CONID = 1
@@ -51,8 +63,7 @@ class AuthoredProxyStrategy(Strategy):
             return {}
         stream = None
         try:
-            session = self._client.open_session(self._digest, self._class_name, self._params, self._bar_size,
-                                                [RESEARCH_SESSION_CONID])
+            session = self._open()
             stream = BarStream(session, RESEARCH_SESSION_CONID)
             self._require_expected_build(session)
             return {"stamps": prices.index, "decisions": stream.send_frame(prices)}
@@ -66,6 +77,13 @@ class AuthoredProxyStrategy(Strategy):
         finally:
             if stream is not None:
                 stream.close()
+
+    def _open(self) -> Any:
+        try:
+            return self._client.open_session(self._digest, self._class_name, self._params, self._bar_size,
+                                             [RESEARCH_SESSION_CONID])
+        except SandboxFault as fault:
+            raise SandboxOpenFault(fault.detail, code=fault.code) from fault
 
     def _require_expected_build(self, session: Any) -> None:
         """The trader proves the build of research's STARTED report; a sandbox restarted onto another build

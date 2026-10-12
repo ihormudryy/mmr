@@ -9,7 +9,8 @@ from tests.authored.fake_sandbox import FakeSandbox, caller_source
 from tests.research.evaluation_fixtures import (CONIDS, build_spec_file, write_costs_config, write_trend_bars,
                                                write_universe)
 from trader.authored.sandbox_client import SandboxFault, SandboxProtocolError, SandboxUnavailable
-from trader.research.authored_backtest import RESEARCH_SESSION_CONID, AuthoredProxyStrategy, AuthoredReplayError
+from trader.research.authored_backtest import (RESEARCH_SESSION_CONID, AuthoredProxyStrategy, AuthoredReplayError,
+                                             SandboxOpenFault)
 from trader.research.evaluation_jobs import RunEnvironment, WindowJob, run_window_job
 from trader.research.strategy_key import authored_strategy_path
 
@@ -135,3 +136,9 @@ def test_an_authored_window_trades_like_the_catalogue_strategy(market, sandbox):
 def test_an_authored_environment_pickles_for_the_process_pool(market, sandbox):
     env = authored(market, sandbox)
     assert pickle.loads(pickle.dumps(env)) == env
+
+
+def test_a_fault_answered_to_open_is_an_open_fault_and_survives_pickling():
+    error = SandboxOpenFault("did not load", code="SANDBOX_ERROR")
+    copy = pickle.loads(pickle.dumps(error))
+    assert isinstance(copy, SandboxOpenFault) and (copy.code, copy.detail) == ("SANDBOX_ERROR", "did not load")

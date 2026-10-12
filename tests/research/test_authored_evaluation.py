@@ -7,10 +7,11 @@ from tests.research.authored_fixtures import (CATALOGUE_KEY, NOW, install_fake_s
                                              time_of_day_key)
 from tests.research.service_fakes import FakeTrader
 from trader.authored.keys import authored_key
-from trader.authored.sandbox_client import SandboxUnavailable
+from trader.authored.sandbox_client import SandboxProtocolError, SandboxUnavailable
 from trader.automation.authored_wire import ReportAuthoredEvaluationRequest
 from trader.messaging.typed_rpc import TypedRpcRemoteError
 from trader.research.artifact import ExperimentFamily
+from trader.research.authored_backtest import SandboxOpenFault
 from trader.research.authored_evaluation import SMOKE_SESSIONS, AuthoredEvaluator
 from trader.research.authored_outcome import (AUTHORED_END_CODE, AuthoredEnd, AuthoredEvaluationEnded, end_for,
                                              started_body)
@@ -232,3 +233,61 @@ def test_only_a_strategy_fault_rejects_the_file():
     assert end_for(fault(SANDBOX_DIGEST_MISMATCH)) == AuthoredEnd("SANDBOX_ERROR", SANDBOX_DIGEST_MISMATCH)
     assert end_for(fault("SANDBOX_SOMETHING_NEW")) == AuthoredEnd("SANDBOX_UNAVAILABLE", "SandboxFault")
     assert end_for(SandboxUnavailable("busy")) == AuthoredEnd("SANDBOX_UNAVAILABLE", "SandboxUnavailable")
+
+
+@pytest.mark.parametrize("error", [fault(SANDBOX_ERROR), SandboxProtocolError("bad frame")])
+def test_a_fault_on_ping_is_unavailable_and_reports_nothing(world, sandbox, error):    # Task 6 review (a)
+    def ping():
+        raise error
+    sandbox.ping = ping
+    trader = FakeTrader()
+    end = ended(world, world.build(time_of_day_key(sandbox)), trader=trader)
+    assert end == AuthoredEnd("SANDBOX_UNAVAILABLE", type(error).__name__)
+    assert trader.authored_reports == [] and sandbox.sessions == []
+
+
+def faulting_open(sandbox, *, rebuilt_to=None, gone=False):
+    """OPEN answers SANDBOX_ERROR (the module did not load); the sandbox may have restarted meanwhile."""
+    def open_session(*args, **kwargs):
+        if rebuilt_to is not None:
+            sandbox.image_digest = rebuilt_to
+        sandbox.unavailable = gone
+        raise fault(SANDBOX_ERROR)
+    sandbox.open_session = open_session
+
+
+def test_an_open_fault_on_a_rebuilt_sandbox_is_unavailable(world, sandbox):          # ruling F7b
+    faulting_open(sandbox, rebuilt_to=REBUILT_IMAGE)
+    spec = world.build(time_of_day_key(sandbox))
+    assert ended(world, spec) == AuthoredEnd("SANDBOX_UNAVAILABLE", "SandboxUnavailable")
+    assert nothing_spent(world, spec)
+
+
+def test_an_open_fault_on_the_started_build_rejects_the_file(world, sandbox):
+    faulting_open(sandbox)
+    assert ended(world, world.build(time_of_day_key(sandbox))) == AuthoredEnd("SANDBOX_ERROR", SANDBOX_ERROR)
+
+
+def test_an_open_fault_with_the_sandbox_gone_is_unavailable(world, sandbox):
+    faulting_open(sandbox, gone=True)
+    end = ended(world, world.build(time_of_day_key(sandbox)))
+    assert end == AuthoredEnd("SANDBOX_UNAVAILABLE", "SandboxUnavailable")
+
+
+def test_a_bar_fault_is_the_strategy_even_if_the_sandbox_restarts_after_it(world, sandbox):
+    def run_window(env, job):
+        try:
+            return run_window_job(env, job)
+        finally:
+            sandbox.image_digest = REBUILT_IMAGE
+    spec = world.build(authored_key(sandbox.add(caller_source("faults_above_limit")), "FaultsAboveLimit"),
+                       cohort=({"LIMIT": 1.0},))
+    assert ended(world, spec, run_window=run_window) == AuthoredEnd("SANDBOX_ERROR", SANDBOX_ERROR)
+
+
+def test_an_open_fault_in_the_folds_on_a_rebuilt_sandbox_is_unavailable(world, sandbox):
+    def run_cohort(spec, **_):
+        sandbox.image_digest = REBUILT_IMAGE
+        raise EvaluationError("backtest failed") from SandboxOpenFault("did not load", code=SANDBOX_ERROR)
+    spec = world.build(time_of_day_key(sandbox))
+    assert ended(world, spec, run_cohort=run_cohort) == AuthoredEnd("SANDBOX_UNAVAILABLE", "SandboxUnavailable")

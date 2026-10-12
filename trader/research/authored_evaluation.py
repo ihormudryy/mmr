@@ -8,11 +8,12 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from trader.authored.sandbox_client import SandboxUnavailable
+from trader.authored.sandbox_client import SandboxFault, SandboxInfo, SandboxProtocolError, SandboxUnavailable
 from trader.messaging.typed_rpc import TypedRpcRemoteError
 from trader.research import authored_backtest            # module reference: tests replace connect_sandbox
-from trader.research.authored_outcome import (SANDBOX_ERROR_EVENT, AuthoredEvaluationEnded, end_for, sandbox_cause,
-                                             started_body)
+from trader.research.authored_backtest import SandboxOpenFault
+from trader.research.authored_outcome import (SANDBOX_ERROR_EVENT, SANDBOX_UNAVAILABLE_EVENT, AuthoredEnd,
+                                             AuthoredEvaluationEnded, end_for, sandbox_cause, started_body)
 from trader.research.cohort import CohortSpec
 from trader.research.cohort_evaluation import CohortResult, evaluate_cohort
 from trader.research.evaluation import (EvaluationPaths, _day_end, _day_start, _period_session_dates, _point_key,
@@ -24,6 +25,7 @@ from trader.research.rulesets.paper_v1 import PAPER_V1
 from trader.research.validation import generate_walk_forward
 
 SMOKE_SESSIONS = 20
+PING_ERRORS = (SandboxUnavailable, SandboxFault, SandboxProtocolError)
 
 
 def smoke_window(spec: CohortSpec, paths: EvaluationPaths) -> tuple[RunEnvironment, WindowJob]:
@@ -61,9 +63,9 @@ class AuthoredEvaluator:
         judged authored files (spec 7.7). An unreachable trader (TraderUnavailable) ends the worker."""
         digest = spec.base.authored_digest
         try:
-            image_digest = authored_backtest.connect_sandbox(self._paths.sandbox_socket).ping().image_digest
-        except SandboxUnavailable as exc:
-            raise AuthoredEvaluationEnded(end_for(exc)) from exc
+            image_digest = self._ping().image_digest
+        except PING_ERRORS as exc:              # a PING error is never the strategy's: no end_for here
+            raise AuthoredEvaluationEnded(AuthoredEnd(SANDBOX_UNAVAILABLE_EVENT, type(exc).__name__)) from exc
         try:
             reply = self._trader.report_authored_evaluation(started_body(spec.request_id, digest, image_digest))
         except TypedRpcRemoteError as remote:
@@ -76,6 +78,23 @@ class AuthoredEvaluator:
             raise ServiceStateError(f"STARTED for {digest}: judged_count {judged_count!r} is not a count")
         return image_digest, judged_count
 
+    def _ping(self) -> SandboxInfo:
+        return authored_backtest.connect_sandbox(self._paths.sandbox_socket).ping()
+
+    def _end_for(self, cause: Exception, paths: EvaluationPaths) -> AuthoredEnd:
+        """Ruling F7b: a fault answered to OPEN came before any session reported its build. A sandbox restarted
+        onto a build STARTED did not report must not reject the file, so the build is read again first."""
+        end = end_for(cause)
+        if end.event != SANDBOX_ERROR_EVENT or not isinstance(cause, SandboxOpenFault):
+            return end
+        try:
+            build = self._ping().image_digest
+        except PING_ERRORS as exc:
+            return AuthoredEnd(SANDBOX_UNAVAILABLE_EVENT, type(exc).__name__)
+        if build != paths.sandbox_image_digest:
+            return AuthoredEnd(SANDBOX_UNAVAILABLE_EVENT, SandboxUnavailable.__name__)
+        return end
+
     def _smoke(self, spec: CohortSpec, paths: EvaluationPaths) -> None:
         """Before any family, trial or holdout exists: a fault here spends nothing (spec 7.6)."""
         env, job = smoke_window(spec, paths)
@@ -85,7 +104,7 @@ class AuthoredEvaluator:
             cause = sandbox_cause(exc)
             if cause is None:
                 raise
-            raise AuthoredEvaluationEnded(end_for(cause)) from exc
+            raise AuthoredEvaluationEnded(self._end_for(cause, paths)) from exc
 
     def _evaluate_authored(self, spec: CohortSpec, paths: EvaluationPaths, judged_count: int) -> CohortResult:
         base = spec.base
@@ -98,7 +117,7 @@ class AuthoredEvaluator:
             cause = sandbox_cause(exc)
             if cause is None:
                 raise
-            end = end_for(cause)
+            end = self._end_for(cause, paths)
             holdouts_after = len(registry.opened_holdout_windows(base.strategy_path, base.class_name))
             if end.event != SANDBOX_ERROR_EVENT and holdouts_after > holdouts_before:
                 raise                       # spec 8: the window counts as revealed; SP2c signs a FAILED case

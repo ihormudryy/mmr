@@ -25,11 +25,12 @@ class ToolUnavailable(Exception):
 
 TRADER_ROOT = Path(__file__).resolve().parents[1]
 # The code a judgment depends on: the ai package and the trader modules it imports for its own checks
-# (Plan 6; SP3 Plan 5 adds the submission check the author runs before it submits).
+# (Plan 6; SP3 Plan 5 adds the submission and static checks the author runs before it submits).
 JUDGMENT_SOURCES: tuple[Path, ...] = (
     TRADER_ROOT / "ai", TRADER_ROOT / "automation" / "ai_discovery_wire.py",
     TRADER_ROOT / "automation" / "risk_limits.py", TRADER_ROOT / "automation" / "ai_paper_sizing.py",
-    TRADER_ROOT / "automation" / "authored_submission.py")
+    TRADER_ROOT / "automation" / "authored_submission.py", TRADER_ROOT / "authored" / "static_check.py",
+    TRADER_ROOT / "authored" / "allowed_api.py", TRADER_ROOT / "authored" / "keys.py")
 
 
 def source_digest(sources: Iterable[Path], *, root: Path) -> str:

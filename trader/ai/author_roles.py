@@ -26,6 +26,8 @@ from trader.research.request_rules import TUNABLE_NAME
 AUTHOR_MARKER = "[AUTHOR_STRATEGY]"
 NOTE_MAX_CHARS = 600
 MAX_TUNABLES = 8
+RETRY_MAX_PROBLEMS = 20
+RETRY_DETAIL_MAX_CHARS = 200
 FILE_TEXT_MAX_CHARS = 40_000           # Plan 1's 20 KB rule decides; this only bounds the answer
 NOT_A_TUNABLE = NOT_TUNABLE
 AUTHOR_RULES = (
@@ -194,8 +196,13 @@ def author_messages(facts: Mapping[str, Any]) -> tuple[ChatMessage, ChatMessage]
 
 def retry_messages(first: tuple[ChatMessage, ...], answer_text: str,
                    problems: Sequence[StaticViolation]) -> tuple[ChatMessage, ...]:
-    """The one retry (spec 7.4): the same facts, the model's own answer and code's list of problems."""
-    listed = canonical_json([{"rule": p.rule, "line": p.line, "detail": p.detail} for p in problems])
+    """The one retry (spec 7.4): the same facts, the model's own answer and code's list of problems (the first
+    RETRY_MAX_PROBLEMS, each detail cut to RETRY_DETAIL_MAX_CHARS, so a flood of violations stays a short message)."""
+    shown = problems[:RETRY_MAX_PROBLEMS]
+    listed = canonical_json([{"rule": p.rule, "line": p.line, "detail": p.detail[:RETRY_DETAIL_MAX_CHARS]}
+                             for p in shown])
+    hidden = len(problems) - len(shown)
+    more = f"... and {hidden} more\n" if hidden else ""
     return (*first, ChatMessage("assistant", answer_text),
-            ChatMessage("user", f"{AUTHOR_MARKER} Code refused that answer. Problems:\n{listed}\n"
+            ChatMessage("user", f"{AUTHOR_MARKER} Code refused that answer. Problems:\n{listed}\n{more}"
                                 "Answer again with one corrected JSON object. This is the last try tonight."))

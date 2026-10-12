@@ -111,9 +111,31 @@ def test_the_rules_tell_the_model_to_bind_each_constant_once():
     assert any("once" in rule and "annotation" in rule for rule in AUTHOR_RULES)
 
 
-def test_the_trader_submission_check_pins_the_author_judgment_code():
+def test_the_files_that_decide_the_verdict_pin_the_author_judgment_code():
     from trader.ai.tools import JUDGMENT_SOURCES, TRADER_ROOT
-    assert TRADER_ROOT / "automation" / "authored_submission.py" in JUDGMENT_SOURCES
+    pinned = {TRADER_ROOT / "automation" / "authored_submission.py", TRADER_ROOT / "authored" / "static_check.py",
+              TRADER_ROOT / "authored" / "allowed_api.py", TRADER_ROOT / "authored" / "keys.py"}
+    assert pinned <= set(JUDGMENT_SOURCES)
+    assert TRADER_ROOT / "authored" not in JUDGMENT_SOURCES
+
+
+RETRY_MESSAGE_MAX_BYTES = 8 * 1024
+
+
+def test_the_retry_lists_at_most_twenty_problems_and_stays_small():
+    flooded = ORB_SOURCE.replace("from trader.authored.api", "import os\n" * 1500 + "from trader.authored.api")
+    problems = checked(source=flooded)
+    assert isinstance(problems, list) and len(problems) > 1000
+    retry = retry_messages(author_messages({"bar_sizes": list(BAR_SIZES)}), "previous answer", problems)[-1].content
+    assert len(retry.encode("utf-8")) < RETRY_MESSAGE_MAX_BYTES
+    assert f"... and {len(problems) - 20} more" in retry
+    assert json.loads(retry.split("\n")[1]) == [{"rule": p.rule, "line": p.line, "detail": p.detail}
+                                                 for p in problems[:20]]
+
+
+def test_a_long_detail_is_cut_in_the_retry():
+    retry = retry_messages(author_messages({}), "x", [StaticViolation("R", 1, "d" * 10_000)])[-1].content
+    assert len(retry.encode("utf-8")) < RETRY_MESSAGE_MAX_BYTES and "more" not in retry
 
 
 # --- G2: everything the trader's check_submission refuses is caught before the submit ---------------------------

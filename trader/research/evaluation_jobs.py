@@ -17,6 +17,7 @@ import pandas as pd
 from trader.data.data_access import TickStorage
 from trader.data.universe import UniverseAccessor
 from trader.objects import BarSize
+from trader.research.authored_backtest import run_authored_backtest
 from trader.research.evaluation_data import EvaluationDataError
 from trader.research.regular_sessions import RegularSessionStorage
 from trader.simulation.backtester import Backtester, BacktestConfig, trace_signature
@@ -39,6 +40,9 @@ class RunEnvironment:
     max_gross_allocation: float
     # An evaluation backtests regular-session bars only, the bars its dataset sealed; None reads every stored bar.
     regular_session_calendar: Optional[str] = None
+    # An authored strategy (SP3): strategy_file is then its store path, read by the sandbox only.
+    authored_digest: Optional[str] = None
+    sandbox_socket: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -97,9 +101,13 @@ def run_window_job(env: RunEnvironment, job: WindowJob) -> WindowOutcome:
         bar_size=BarSize.parse_str(env.bar_size), cost_model=costs,
         order_notional=env.order_notional, trading_start=job.trading_start,
         live_rules=PaperAutomationRules(max_gross_allocation=env.max_gross_allocation))
-    result = Backtester(storage, config).run_from_module(
-        env.strategy_file, env.class_name, list(env.conids),
-        universe_accessor=accessor, params=dict(job.params))
+    backtester = Backtester(storage, config)
+    if env.authored_digest is None:
+        result = backtester.run_from_module(
+            env.strategy_file, env.class_name, list(env.conids),
+            universe_accessor=accessor, params=dict(job.params))
+    else:
+        result = run_authored_backtest(backtester, env, dict(job.params), accessor)
     _require_every_conid_loaded(env, job, result.loaded_conids)
     curve = result.equity_curve
     return WindowOutcome(

@@ -436,3 +436,111 @@ def test_an_open_that_never_answers_is_unavailable(fake):
     client = SandboxClient(server.path, reply_timeout_s=0.3)
     with pytest.raises(SandboxUnavailable):
         client.open_session("sha256:" + "a" * 64, "Counter", {}, "1 min", [C1])
+
+
+def _signal(request, **overrides):
+    return {"type": "SIGNAL", "v": 1, "session": "s1", "conid": C1, "t": request["t"],
+            "action": "BUY", "probability": 0.9, **overrides}
+
+
+def _assert_session_ended(session):
+    with pytest.raises(SandboxProtocolError, match="closed"):
+        session.bar(C1, T0 + timedelta(minutes=5), *BAR)
+
+
+def test_a_signal_for_another_time_is_a_fault_and_ends_the_session(fake):
+    session = _open_fake_session(
+        fake, lambda conn, request: _reply(conn, _signal(request, t=(T0 - timedelta(minutes=1)).isoformat())))
+    with pytest.raises(SandboxFault) as exc:
+        session.bar(C1, T0, *BAR)
+    assert exc.value.code == p.SANDBOX_ERROR
+    _assert_session_ended(session)
+
+
+def test_a_signal_for_the_same_instant_in_another_zone_is_accepted(fake):
+    zone = timezone(timedelta(hours=2))
+    session = _open_fake_session(
+        fake, lambda conn, request: _reply(conn, _signal(request, t=T0.astimezone(zone).isoformat())))
+    assert session.bar(C1, T0, *BAR) == Decision(action="BUY", probability=0.9)
+    session.close()
+
+
+@pytest.mark.parametrize("broken", [
+    {"t": "not a time"}, {"t": None}, {"t": "2024-01-02T14:30:00"},     # unreadable or naive time
+    {"action": "HOLD"}, {"probability": "high"},
+])
+def test_a_malformed_signal_is_a_fault_and_ends_the_session(fake, broken):
+    session = _open_fake_session(fake, lambda conn, request: _reply(conn, _signal(request, **broken)))
+    with pytest.raises(SandboxFault) as exc:
+        session.bar(C1, T0, *BAR)
+    assert exc.value.code == p.SANDBOX_ERROR
+    _assert_session_ended(session)
+
+
+@pytest.mark.parametrize("missing", ["action", "probability", "t", "conid", "session"])
+def test_a_signal_missing_a_key_is_a_typed_error_not_a_key_error(fake, missing):
+    def reply(conn, request):
+        signal = _signal(request)
+        del signal[missing]
+        _reply(conn, signal)
+
+    session = _open_fake_session(fake, reply)
+    with pytest.raises((SandboxFault, SandboxUnavailable)):
+        session.bar(C1, T0, *BAR)
+    _assert_session_ended(session)
+
+
+def test_an_interrupted_bar_ends_the_session(fake, monkeypatch):
+    session = _open_fake_session(fake, lambda conn, request: threading.Event().wait(5))
+
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("trader.authored.sandbox_client._recv_exact", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        session.bar(C1, T0, *BAR)
+    _assert_session_ended(session)
+
+
+def test_a_reply_with_the_wrong_version_is_unavailable(fake):
+    session = _open_fake_session(fake, lambda conn, request: _reply(conn, _signal(request, v=2)))
+    with pytest.raises(SandboxUnavailable):
+        session.bar(C1, T0, *BAR)
+    _assert_session_ended(session)
+
+
+def test_an_unknown_session_reply_ends_the_session_but_a_clock_error_does_not(fake):
+    def refuse(conn, request):
+        detail = "unknown session" if request["open"] == 9.0 else "bar time must strictly increase per conid"
+        _reply(conn, {"type": "ERROR", "v": 1, "code": p.SANDBOX_BAD_REQUEST, "detail": detail})
+
+    session = _open_fake_session(fake, refuse)
+    for _ in range(2):   # a clock error leaves the session usable: the second bar reaches the server too
+        with pytest.raises(SandboxProtocolError, match="strictly increase"):
+            session.bar(C1, T0, *BAR)
+    with pytest.raises(SandboxProtocolError, match="unknown session"):
+        session.bar(C1, T0 + timedelta(minutes=1), 9.0, 10.0, 8.0, 9.5, 1.0)
+    _assert_session_ended(session)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("boot_id", 7), ("pool", None), ("free", "2"), ("free", True), ("size", 1.5), ("posture", [1]),
+])
+def test_a_pong_with_a_field_of_the_wrong_type_is_unavailable(fake, field, value):
+    def pong(conn):
+        _read_request(conn)
+        _reply(conn, {"type": "PONG", "v": 1, "image_digest": "b", "boot_id": "b", "pool": "live",
+                      "free": 1, "size": 3, "posture": {}, "live_open": 0, **{field: value}})
+
+    with pytest.raises(SandboxUnavailable):
+        SandboxClient(fake(pong).path).ping()
+
+
+@pytest.mark.parametrize("live_open", ["0", True, -1, 1.0, None])
+def test_a_live_open_that_is_not_a_count_is_unknown(fake, live_open):
+    def pong(conn):
+        _read_request(conn)
+        _reply(conn, {"type": "PONG", "v": 1, "image_digest": "b", "boot_id": "b", "pool": "live",
+                      "free": 1, "size": 3, "posture": {}, "live_open": live_open})
+
+    assert SandboxClient(fake(pong).path).ping().live_open is None

@@ -25,6 +25,8 @@ from trader.authored.api import Decision
 from trader.sandbox import protocol as proto
 
 _HEADER = struct.Struct(">I")
+# The detail the sandbox gives when a session is gone (supervisor._bar): the one BAD_REQUEST that ends it.
+_UNKNOWN_SESSION_DETAIL = "unknown session"
 _OHLCV_NAMES = ("open", "high", "low", "close", "volume")
 
 # A timed-out BAR is answered only after the sandbox killed the child and wiped its slot (about 7 s).
@@ -56,7 +58,9 @@ class SandboxInfo:
     free: int
     size: int
     posture: Mapping[str, Any]
-    live_open: Optional[int] = None     # open live sessions; None when PONG did not say (ruling 29)
+    # Open live sessions. None means unknown (absent or not a count in PONG): a caller that needs
+    # "no live session" (prove-isolation, Plan 3) must refuse on None, never read it as 0.
+    live_open: Optional[int] = None
 
 
 class SandboxClient:
@@ -79,13 +83,7 @@ class SandboxClient:
         finally:
             sock.close()
         _raise_for(reply)
-        if reply.get("type") != "PONG" or not isinstance(reply.get("image_digest"), str):
-            raise SandboxUnavailable(f"unexpected reply to PING: {reply!r}")
-        live_open = reply.get("live_open")
-        return SandboxInfo(image_digest=reply["image_digest"], boot_id=reply.get("boot_id", ""),
-                           pool=reply.get("pool", ""), free=reply.get("free", 0),
-                           size=reply.get("size", 0), posture=reply.get("posture", {}),
-                           live_open=live_open if type(live_open) is int else None)
+        return _sandbox_info(reply)
 
     def open_session(self, digest: str, class_name: str, params: Mapping[str, float],
                      bar_size: str, conids: Sequence[int]) -> "SandboxSession":
@@ -144,17 +142,20 @@ class SandboxSession:
             raise SandboxProtocolError("session is closed")
         if conid not in self.conids:
             raise SandboxProtocolError(f"conid {conid} is not in this session")
+        when = _utc(t)
         request = {"v": proto.PROTOCOL_VERSION, "type": "BAR", "session": self._id, "conid": conid,
-                   "t": _utc_iso(t), **_ohlcv(open=open, high=high, low=low, close=close, volume=volume)}
+                   "t": when.isoformat(), **_ohlcv(open=open, high=high, low=low, close=close, volume=volume)}
         _check_request(request)
         try:
             reply = _exchange(self._sock, request, self._reply_timeout)
-        except SandboxUnavailable:
+        except SandboxProtocolError:   # refused before anything was sent
+            raise
+        except BaseException:   # also an interrupt: the stream may be half read, so the session is over
             self._end()
             raise
         if reply.get("type") == "SIGNAL":
-            return self._decision(reply, conid)
-        if reply.get("code") != proto.SANDBOX_BAD_REQUEST:   # a caller mistake leaves the session usable
+            return self._decision(reply, conid, when)
+        if not _leaves_session_usable(reply):
             self._end()
         _raise_for(reply)
         raise SandboxUnavailable(f"unexpected reply to BAR: {reply!r}")
@@ -177,18 +178,30 @@ class SandboxSession:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def _decision(self, reply: Mapping[str, Any], conid: int) -> Decision | None:
-        if reply.get("session") != self._id or reply.get("conid") != conid:
+    def _decision(self, reply: Mapping[str, Any], conid: int, when: datetime) -> Decision | None:
+        try:
+            return self._read_signal(reply, conid, when)
+        except (SandboxFault, SandboxUnavailable):   # a reply we cannot trust ends the session
             self._end()
+            raise
+
+    def _read_signal(self, reply: Mapping[str, Any], conid: int, when: datetime) -> Decision | None:
+        if reply.get("session") != self._id or reply.get("conid") != conid:
             raise SandboxUnavailable(f"signal is for another session or conid: {reply!r}")
+        if not _is_instant(reply.get("t"), when):
+            raise SandboxFault(f"signal is for another time than the bar sent at {when.isoformat()}",
+                               code=proto.SANDBOX_ERROR)
+        if "action" not in reply or "probability" not in reply:
+            raise SandboxFault("signal has no action or probability", code=proto.SANDBOX_ERROR)
         try:
             proto.validate_signal(reply)
+            if reply["action"] is None:
+                return None
+            return Decision(action=reply["action"], probability=float(reply["probability"]))
         except proto.FrameError as exc:
-            self._end()
             raise SandboxFault(exc.detail, code=exc.code) from exc
-        if reply["action"] is None:
-            return None
-        return Decision(action=reply["action"], probability=float(reply["probability"]))
+        except ValueError as exc:
+            raise SandboxFault(f"signal is not a decision: {exc}", code=proto.SANDBOX_ERROR) from exc
 
     def _end(self) -> None:
         self._is_open = False
@@ -202,13 +215,44 @@ def _check_request(request: Mapping[str, Any]) -> None:
         raise SandboxProtocolError(exc.detail) from exc
 
 
-def _utc_iso(t: datetime) -> str:
+def _utc(t: datetime) -> datetime:
     if not isinstance(t, datetime) or t.utcoffset() is None:
         raise SandboxProtocolError("t must be a timezone-aware datetime")
     try:
-        return t.astimezone(timezone.utc).isoformat()
+        return t.astimezone(timezone.utc)
     except OverflowError as exc:
         raise SandboxProtocolError("t is outside the supported time range") from exc
+
+
+def _is_instant(text: Any, when: datetime) -> bool:
+    """Does ``text`` (the time a SIGNAL echoes) name the same instant as ``when``?"""
+    if not isinstance(text, str):
+        return False
+    try:
+        echoed = datetime.fromisoformat(text)
+    except ValueError:
+        return False
+    return echoed.utcoffset() is not None and echoed == when
+
+
+def _leaves_session_usable(reply: Mapping[str, Any]) -> bool:
+    """Only a bar the sandbox refused as a caller mistake keeps the session, and not when the session is gone."""
+    return reply.get("code") == proto.SANDBOX_BAD_REQUEST and reply.get("detail") != _UNKNOWN_SESSION_DETAIL
+
+
+def _sandbox_info(reply: Mapping[str, Any]) -> SandboxInfo:
+    if reply.get("type") != "PONG":
+        raise SandboxUnavailable(f"unexpected reply to PING: {reply!r}")
+    counts = {name: reply.get(name) for name in ("free", "size")}
+    texts = {name: reply.get(name) for name in ("image_digest", "boot_id", "pool")}
+    posture = reply.get("posture")
+    if (any(type(value) is not int for value in counts.values())
+            or any(not isinstance(value, str) for value in texts.values())
+            or not isinstance(posture, dict)):
+        raise SandboxUnavailable(f"PONG has a missing or mistyped field: {reply!r}")
+    live_open = reply.get("live_open")
+    return SandboxInfo(**texts, **counts, posture=posture,
+                       live_open=live_open if type(live_open) is int and live_open >= 0 else None)
 
 
 def _ohlcv(**values: Any) -> dict[str, float]:
@@ -252,7 +296,9 @@ def _exchange(sock: socket.socket, request: Mapping[str, Any], timeout_s: float)
         (length,) = _HEADER.unpack(_recv_exact(sock, _HEADER.size, deadline))
         if length > proto.MAX_FRAME_BYTES:
             raise SandboxUnavailable(f"reply of {length} bytes is over the {proto.MAX_FRAME_BYTES} cap")
-        return proto.decode_frame_body(_recv_exact(sock, length, deadline))
+        reply = proto.decode_frame_body(_recv_exact(sock, length, deadline))
+        proto.require_version(reply)
+        return reply
     except TimeoutError as exc:   # socket.timeout is TimeoutError since 3.10
         raise SandboxUnavailable(f"no reply from the sandbox within {timeout_s}s") from exc
     except OSError as exc:

@@ -106,7 +106,7 @@ def decode_frame_body(body: bytes) -> dict:
     return obj
 
 
-def _require_version(obj: Mapping[str, Any]) -> None:
+def require_version(obj: Mapping[str, Any]) -> None:
     version = obj.get("v")
     if type(version) is not int or version != PROTOCOL_VERSION:
         raise FrameError(f"unsupported protocol version {version!r}")
@@ -203,7 +203,7 @@ class Request:
 
 
 def parse_request(obj: Mapping[str, Any]) -> Request:
-    _require_version(obj)
+    require_version(obj)
     kind = obj.get("type")
     if kind == "PING":
         return Request(type="PING")

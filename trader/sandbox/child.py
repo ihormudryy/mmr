@@ -21,7 +21,7 @@ from typing import Any, Mapping, Protocol
 import pandas as pd
 
 from trader.authored.allowed_api import ALLOWED_BUILTINS, ALLOWED_FROM_IMPORT_NAMES, ALLOWED_IMPORTS
-from trader.authored.api import ACTIONS, AuthoredStrategy, Decision
+from trader.authored.api import ACTIONS, MAX_LOOKBACK_BARS, MIN_LOOKBACK_BARS, AuthoredStrategy, Decision
 from trader.authored.static_check import AuthoredStaticRejected, require_clean
 from trader.sandbox.protocol import MAX_FRAME_BYTES, FrameError, encode_frame, validate_signal
 
@@ -181,6 +181,7 @@ class ChildRuntime:
 
     def load(self) -> None:
         cls = load_authored_class(self._source, self._class_name, skip_static_check=self._skip)
+        self._lookback = _class_lookback(cls, ceiling=self._lookback)
         try:
             self._books = {conid: _ConidBook(cls()) for conid in self._conids}
         except Exception as exc:  # noqa: BLE001
@@ -200,6 +201,20 @@ class ChildRuntime:
         except Exception as exc:  # noqa: BLE001 — authored code failed
             raise ChildError(f"on_bar raised {type(exc).__name__}: {exc}") from exc
         return _signal_payload(decision)
+
+
+def _class_lookback(cls: type, *, ceiling: int) -> int:
+    """The class constant sets the history window (spec 9), clamped to the API range and the caller's ceiling.
+
+    Read again here: a probe skips the static check, so its module could change the constant after
+    ``__init_subclass__`` validated it."""
+    try:
+        lookback = getattr(cls, "LOOKBACK_BARS", None)
+    except Exception as exc:  # noqa: BLE001 — a hostile metaclass may raise anything
+        raise ChildError(f"LOOKBACK_BARS could not be read: {type(exc).__name__}") from exc
+    if type(lookback) is not int:
+        raise ChildError(f"LOOKBACK_BARS must be an int, got {type(lookback).__name__}")
+    return max(MIN_LOOKBACK_BARS, min(MAX_LOOKBACK_BARS, ceiling, lookback))
 
 
 def _signal_payload(decision: Any) -> dict:

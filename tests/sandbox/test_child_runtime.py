@@ -70,6 +70,43 @@ class Counter(AuthoredStrategy):
     assert signals[-1]["probability"] == pytest.approx(3 / 100.0)  # never more than LOOKBACK_BARS
 
 
+_COUNTS_HISTORY = '''
+from trader.authored.api import AuthoredStrategy, Decision
+
+
+class Counter(AuthoredStrategy):
+    LOOKBACK_BARS = 3
+
+    def on_bar(self, history, params):
+        return Decision(action="BUY", probability=min(len(history) / 10000.0, 1.0))
+'''
+
+
+def test_the_class_lookback_sets_the_window_under_the_supervisor_ceiling():
+    # The supervisor always passes the 2000 ceiling; the class constant is authoritative (spec 9).
+    runtime = ChildRuntime(source=_COUNTS_HISTORY, class_name="Counter", params={}, lookback=2000, conids=(C1,))
+    runtime.load()
+    signals = _bars(runtime, 10)
+    assert signals[-1]["probability"] == pytest.approx(3 / 10000.0)
+
+
+def test_a_lookback_changed_after_class_creation_is_clamped_to_the_ceiling():
+    source = _COUNTS_HISTORY + "\nCounter.LOOKBACK_BARS = 50000\n"
+    runtime = ChildRuntime(source=source, class_name="Counter", params={}, lookback=2000, conids=(C1,),
+                           skip_static_check=True)
+    runtime.load()
+    assert runtime._lookback == 2000
+
+
+@pytest.mark.parametrize("bad", ["True", "'3'", "3.0"])
+def test_a_lookback_that_is_not_an_int_fails_the_load(bad):
+    source = _COUNTS_HISTORY + f"\nCounter.LOOKBACK_BARS = {bad}\n"
+    runtime = ChildRuntime(source=source, class_name="Counter", params={}, lookback=2000, conids=(C1,),
+                           skip_static_check=True)
+    with pytest.raises(ChildError, match="LOOKBACK_BARS"):
+        runtime.load()
+
+
 def test_each_conid_has_its_own_history_and_instance():
     source = '''
 from trader.authored.api import AuthoredStrategy, Decision

@@ -74,7 +74,7 @@ class _Base(BaseModel):
 class RecordAiCostRequest(_Base):
     record_id: str
     experiment_id: str
-    role: Literal["orchestrator", "jev", "research"]
+    role: Literal["orchestrator", "jev", "research", "author"]
     provider: str
     model: str
     attempt_id: str

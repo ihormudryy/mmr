@@ -17,7 +17,7 @@ from typing import Any, Mapping, Optional, Protocol
 from trader.ai.budget import (Budget, BudgetExhausted, BudgetNotInitialized, HourlyLimitReached,
                              RELEASE_NOT_SENT, RELEASE_REJECTED)
 from trader.ai.clock import Clock
-from trader.ai.config import AiConfig, AiConfigError, ModelPrice, RoleConfig
+from trader.ai.config import ROLE_NAMES, AiConfig, AiConfigError, ModelPrice, RoleConfig
 from trader.ai.journal import (
     COST_CONFIRMED, COST_CORRECTION, COST_ESTIMATED_UNKNOWN, COST_NONE, AttemptJournal, AttemptRecord,
 )
@@ -80,7 +80,7 @@ class GatewayResult:
 
 
 class ModelCaller(Protocol):
-    def new_deadline(self, label: str = "") -> DecisionDeadline: ...
+    def new_deadline(self, label: str = "", seconds: Optional[float] = None) -> DecisionDeadline: ...
 
     async def call(self, role: str, request: ModelRequest, deadline: DecisionDeadline) -> GatewayResult: ...
 
@@ -125,8 +125,10 @@ class ModelGateway:
 
         await self.store.atransaction(work)
 
-    def new_deadline(self, label: str = "") -> DecisionDeadline:
-        return DecisionDeadline(self.clock, self.config.budget.decision_deadline_seconds, label)
+    def new_deadline(self, label: str = "", seconds: Optional[float] = None) -> DecisionDeadline:
+        """One decision's deadline; the author passes its own, longer limit (spec 6)."""
+        length = self.config.budget.decision_deadline_seconds if seconds is None else seconds
+        return DecisionDeadline(self.clock, length, label)
 
     # --- the call --------------------------------------------------------
 
@@ -150,8 +152,10 @@ class ModelGateway:
             worker.add_done_callback(lambda _done: self._slots.release())
 
     def _prepare(self, role: str, request: ModelRequest) -> tuple[RoleConfig, ModelClient, ModelPrice]:
-        if role not in self.config.roles:
+        if role not in ROLE_NAMES:
             raise CallRefused("ROLE_UNKNOWN", role)
+        if role not in self.config.roles:
+            raise CallRefused("ROLE_DISABLED", f"role {role!r} has no model in ai.yaml")
         role_config = self.config.role(role)
         if request.max_output_tokens > role_config.max_output_tokens:
             raise CallRefused("OUTPUT_LIMIT_ABOVE_ROLE", f"{request.max_output_tokens} > {role_config.max_output_tokens}")

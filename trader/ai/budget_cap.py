@@ -55,8 +55,10 @@ class CapGatedGateway:
         self._gateway, self._cap = gateway, cap
         self.budget, self.journal = gateway.budget, gateway.journal
 
-    def new_deadline(self, label: str = ""):
-        return self._gateway.new_deadline(label)
+    def new_deadline(self, label: str = "", seconds=None):
+        if seconds is None:
+            return self._gateway.new_deadline(label)
+        return self._gateway.new_deadline(label, seconds)
 
     def ready(self) -> bool:
         """False while the owner cap is unread or from another window: every call would be refused."""

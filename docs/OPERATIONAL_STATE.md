@@ -365,7 +365,7 @@ message with no traceback.
 **First start.**
 1. `./docker.sh -b` builds the image. It bakes a build id (`MMR_BUILD_ID`, git sha plus UTC time) into `/etc/mmr-build-id`. A plain `docker build` leaves it `unset`, and the sandbox refuses to start.
 2. `docker compose --profile ai up -d sandbox`. Check it: `docker compose ps sandbox` must say healthy (the check sends a PING and needs a PONG).
-3. The operator runs `mmr ai-author prove-isolation` (Plan 3). It calls `run_isolation_checks` against the running service, on the research socket, and the host records the result. It refuses while a live session is open.
+3. The operator runs `mmr ai-author prove-isolation` (Plan 3). It calls `run_isolation_checks` against the running service, on the research socket, and the host records the result. It refuses while a live session is open, and while it runs the sandbox refuses every new live session (`SANDBOX_BUSY`, `isolation probe running`): a live authored strategy misses its bars for the few minutes of the proof. Run it while the research pool is quiet, or the slot-wipe check can hit `SANDBOX_BUSY` and fail (it never passes wrongly).
 4. A rebuild of the image is a new build id. It needs a fresh `prove-isolation` (Plan 3 gate).
 
 **Do not** run the container tests against the live stack. Use `scripts/run_sandbox_fullstack.sh`. It uses compose project `mmr-sbxtest`, starts only `sandbox` and the test container, and removes everything when it ends.

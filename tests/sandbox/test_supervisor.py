@@ -793,3 +793,122 @@ def test_a_probe_is_busy_while_a_live_session_is_still_opening(tmp_path):
         release.set()
         worker.join(5)
     assert replies[0]["type"] == "OPENED"
+
+
+# ── a live OPEN waits for an isolation probe too: the exclusion is two-way (ruling 29, PR #159 review) ──────
+
+def _close(sup, pool, conn, session):
+    return sup.handle(pool, conn, p.parse_request({"v": 1, "type": "CLOSE", "session": session}))
+
+
+def test_a_live_open_is_busy_while_a_probe_session_is_open(tmp_path):
+    sup = _supervisor(tmp_path)
+    probe = _probe(sup, "probe", "benign_orb", conn=1)["session"]
+    reply = _open(sup, tmp_path, conn=2)
+    assert reply["code"] == p.SANDBOX_BUSY and reply["detail"] == "isolation probe running"
+    assert sup.pong("live")["free"] == 3 and sup.pong("live")["live_open"] == 0
+    assert _close(sup, "research", 1, probe)["type"] == "CLOSED"
+    assert _open(sup, tmp_path, conn=2)["type"] == "OPENED"
+
+
+def test_a_live_open_is_busy_while_a_probe_is_still_opening(tmp_path):
+    import threading
+
+    entered, release = threading.Event(), threading.Event()
+
+    class SlowProbe(InProcessSpawner):
+        def spawn(self, spec):
+            entered.set()
+            assert release.wait(5)
+            return super().spawn(spec)
+
+    sup = _supervisor(tmp_path, spawners={"live": InProcessSpawner(), "research": SlowProbe()})
+    replies = []
+    worker = threading.Thread(target=lambda: replies.append(_probe(sup, "probe", "benign_orb", conn=1)))
+    worker.start()
+    try:
+        assert entered.wait(5)
+        assert _open(sup, tmp_path, conn=2)["detail"] == "isolation probe running"
+    finally:
+        release.set()
+        worker.join(5)
+    assert replies[0]["type"] == "OPENED"
+
+
+def test_a_live_open_is_busy_until_the_probe_slot_is_wiped_and_released(tmp_path):
+    import threading
+
+    wiping, release = threading.Event(), threading.Event()
+
+    def slow_wiper(slot):
+        wiping.set()
+        assert release.wait(5)
+        return True
+
+    sup = _supervisor(tmp_path)
+    sup._wiper = slow_wiper
+    probe = _probe(sup, "probe", "benign_orb", conn=1)["session"]
+    closer = threading.Thread(target=lambda: _close(sup, "research", 1, probe))
+    closer.start()
+    try:
+        assert wiping.wait(5)                      # the probe left the table; its child is dead, its slot not free
+        assert _open(sup, tmp_path, conn=2)["detail"] == "isolation probe running"
+    finally:
+        release.set()
+        closer.join(5)
+    assert _open(sup, tmp_path, conn=2)["type"] == "OPENED"
+
+
+def test_a_probe_whose_spawn_failed_no_longer_blocks_live(tmp_path):
+    from trader.sandbox.child import ChildError
+
+    class Fails:
+        def spawn(self, spec):
+            raise ChildError("load failed: x")
+
+    sup = _supervisor(tmp_path, spawners={"live": InProcessSpawner(), "research": Fails()})
+    assert _probe(sup, "probe", "benign_orb", conn=1)["code"] == p.SANDBOX_ERROR
+    assert _open(sup, tmp_path, conn=2)["type"] == "OPENED"
+
+
+def test_a_research_store_session_does_not_block_live(tmp_path):
+    sup = _supervisor(tmp_path)
+    assert _open(sup, tmp_path, conn=1, pool="research")["type"] == "OPENED"
+    assert _open(sup, tmp_path, conn=2)["type"] == "OPENED"
+
+
+def test_a_probe_and_a_live_open_racing_never_both_open(tmp_path):
+    import threading
+
+    for round_ in range(20):
+        gate = threading.Event()
+
+        class Gated(InProcessSpawner):
+            def spawn(self, spec):
+                assert gate.wait(5)
+                return super().spawn(spec)
+
+        sup = _supervisor(tmp_path, spawners={"live": Gated(), "research": Gated()})
+        start = threading.Barrier(2)
+        replies = {}
+
+        def run(name, call):
+            start.wait(5)
+            replies[name] = call()
+
+        threads = [threading.Thread(target=run, args=("probe", lambda: _probe(sup, "probe", "benign_orb", conn=1))),
+                   threading.Thread(target=run, args=("live", lambda: _open(sup, tmp_path, conn=2)))]
+        for thread in threads:
+            thread.start()
+        for _ in range(500):                       # the loser is refused at once, under the lock
+            if replies:
+                break
+            threading.Event().wait(0.01)
+        gate.set()
+        for thread in threads:
+            thread.join(5)
+        kinds = sorted(reply["type"] for reply in replies.values())
+        assert kinds == ["ERROR", "OPENED"], (round_, replies)
+        loser = next(reply for reply in replies.values() if reply["type"] == "ERROR")
+        assert loser["code"] == p.SANDBOX_BUSY
+        assert loser["detail"] in ("isolation probe running", "live sessions open")

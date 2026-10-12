@@ -71,6 +71,7 @@ class _Session:
     conids: tuple[int, ...] = ()
     last_t: dict = field(default_factory=dict)   # conid -> datetime of its last accepted bar
     busy: bool = False     # a bar round-trip is in flight (ruling 25)
+    is_probe: bool = False
 
 
 @dataclass
@@ -95,6 +96,8 @@ class Supervisor:
         self._boot_id = secrets.token_hex(8)
         self._lock = threading.Lock()   # the server offloads BAR to a thread; guard shared state (ruling 25)
         self._sessions: dict[str, _Session] = {}
+        # Probe sessions from their reservation until their slot is wiped and released: no live OPEN meanwhile (ruling 29).
+        self._probes: set[str] = set()
         self._pools = {name: _build_pool(name, size, self._spawners) for name, size in pool_sizes.items()}
 
     # ── requests ──────────────────────────────────────────────────────────
@@ -201,7 +204,7 @@ class Supervisor:
             handle = self._spawners[pool_name].spawn(spec)
         except Exception as exc:  # noqa: BLE001 — any spawn failure must give the slot back
             self._forget(reserved)
-            self._release(pool_name, reserved.slot)
+            self._release(reserved)
             return _spawn_failure(pool_name, exc)
         with self._lock:
             still_open = self._sessions.get(reserved.session_id) is reserved
@@ -221,16 +224,21 @@ class Supervisor:
         with self._lock:
             if any(session.conn_id == conn_id for session in self._sessions.values()):
                 return _error(proto.SANDBOX_BAD_REQUEST, "this connection already holds a session")
-            # Ruling 29: a probe never starts beside a live child, open or still opening (it is in the table).
+            # Ruling 29, both ways: a probe never starts beside a live child, open or still opening (it is in the
+            # table), and a live child never starts while a probe is reserved, open, or not yet wiped and released.
             if is_probe and any(session.pool == "live" for session in self._sessions.values()):
                 return _error(proto.SANDBOX_BUSY, "live sessions open")
+            if pool_name == "live" and self._probes:
+                return _error(proto.SANDBOX_BUSY, "isolation probe running")
             pool = self._pools[pool_name]
             if not pool.free_slots:
                 quarantined = f" ({len(pool.quarantined)} quarantined)" if pool.quarantined else ""
                 return _error(proto.SANDBOX_BUSY, f"no free slot{quarantined}")
             session = _Session(session_id="s" + secrets.token_hex(8), pool=pool_name, conn_id=conn_id,
-                               slot=pool.free_slots.pop(), conids=tuple(conids))
+                               slot=pool.free_slots.pop(), conids=tuple(conids), is_probe=is_probe)
             self._sessions[session.session_id] = session
+            if is_probe:
+                self._probes.add(session.session_id)
         return session
 
     def _forget(self, session: _Session) -> None:
@@ -303,20 +311,23 @@ class Supervisor:
             handle.close()   # SIGKILL + reap; also unblocks an in-flight send_bar
         except Exception:  # noqa: BLE001 — closing a dead child must not raise
             log.warning("closing session %s raised", session.session_id, exc_info=True)
-        self._release(session.pool, session.slot)
+        self._release(session)
 
-    def _release(self, pool_name: str, slot: Slot) -> None:
+    def _release(self, session: _Session) -> None:
+        """Wipe the session's slot and give it back (or quarantine it). Its child is already dead."""
+        slot = session.slot
         try:
             clean = self._wiper(slot) is True   # may fork a helper: never under the lock (rulings 25, 28)
         except Exception:  # noqa: BLE001 — a wiper that fails leaves a dirty slot
             log.error("wiping slot %s raised", slot.uid, exc_info=True)
             clean = False
         with self._lock:
-            pool = self._pools[pool_name]
+            pool = self._pools[session.pool]
             if clean:
                 pool.free_slots.append(slot)
             else:
                 pool.quarantined.append(slot)   # ruling 13: never reuse a slot we could not wipe
+            self._probes.discard(session.session_id)
         if not clean:
             log.error("quarantined slot %s: wipe failed", slot.uid)
 

@@ -1,0 +1,85 @@
+from trader.sandbox import posture
+
+
+def test_read_posture_reports_known_keys(monkeypatch):
+    out = posture.read_posture()
+    assert set(out) >= {"cap_eff", "seccomp", "no_new_privs", "uid", "interfaces",
+                        "forbidden_env", "home_mounts", "root_read_only", "pids_max"}
+
+
+def test_the_root_mount_options_are_read(tmp_path):
+    mounts = tmp_path / "mounts"
+    mounts.write_text("overlay / overlay ro,relatime,lowerdir=/x 0 0\ntmpfs /tmp tmpfs rw,noexec 0 0\n")
+    assert posture.root_read_only(str(mounts)) is True
+    mounts.write_text("overlay / overlay rw,relatime 0 0\n")
+    assert posture.root_read_only(str(mounts)) is False
+
+
+def test_the_pids_limit_is_read_from_cgroup_v2_then_v1(tmp_path):
+    v2, v1 = tmp_path / "pids.max", tmp_path / "v1-pids.max"
+    v1.write_text("64\n")
+    assert posture.pids_max((str(v2), str(v1))) == "64"
+    assert posture.pids_max((str(tmp_path / "none"),)) == ""
+
+
+def test_decode_cap_eff_lists_capabilities():
+    caps = posture.decode_cap_eff("00000000000000e0")   # bits 5,6,7
+    assert set(caps) == {"CAP_KILL", "CAP_SETGID", "CAP_SETUID"}
+
+
+def test_forbidden_env_names_are_detected(monkeypatch):
+    monkeypatch.setenv("ALPACA_API_KEY_ID", "x")
+    monkeypatch.setenv("TZ", "UTC")
+    assert "ALPACA_API_KEY_ID" in posture.forbidden_env_names()
+    assert "TZ" not in posture.forbidden_env_names()
+
+
+# ── fail closed: what cannot be read must never look clean ─────────────────
+
+def test_decode_cap_eff_names_every_set_bit_and_refuses_junk():
+    assert "bit0" in posture.decode_cap_eff("00000000000000e1")   # CAP_CHOWN left on
+    assert "bit70" in posture.decode_cap_eff("4000000000000000e0")  # beyond 64 bits still shows
+    assert posture.decode_cap_eff("not hex") == []
+    assert posture.decode_cap_eff("-e0") == []
+
+
+def test_a_root_without_a_mount_line_or_with_any_rw_layer_is_not_read_only(tmp_path):
+    mounts = tmp_path / "mounts"
+    mounts.write_text("tmpfs /tmp tmpfs rw 0 0\n")
+    assert posture.root_read_only(str(mounts)) is False
+    mounts.write_text("overlay / overlay ro 0 0\noverlay / overlay rw 0 0\n")
+    assert posture.root_read_only(str(mounts)) is False
+    assert posture.root_read_only(str(tmp_path / "missing")) is False
+
+
+def test_unreadable_interfaces_and_mounts_never_look_clean(tmp_path):
+    assert posture.interfaces(str(tmp_path / "no-net")) == [posture.UNREADABLE]
+    assert posture.home_mounts(str(tmp_path / "no-mounts")) == [posture.UNREADABLE]
+
+
+def test_interfaces_and_home_mounts_are_read(tmp_path):
+    net = tmp_path / "net"
+    (net / "lo").mkdir(parents=True)
+    (net / "eth0").mkdir()
+    assert posture.interfaces(str(net)) == ["eth0", "lo"]
+    mounts = tmp_path / "mounts"
+    mounts.write_text("overlay / overlay ro 0 0\n/dev/sda1 /home/trader/.config ext4 ro 0 0\n"
+                      "/dev/sda1 /store ext4 ro 0 0\nproc /proc proc rw 0 0\n")
+    assert posture.home_mounts(str(mounts)) == ["/home/trader/.config", "/store"]
+
+
+def test_forbidden_env_names_ignore_case_and_cover_model_keys(monkeypatch):
+    monkeypatch.setenv("alpaca_api_key_id", "x")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    monkeypatch.setenv("MMR_WEB_TOKEN", "x")
+    names = posture.forbidden_env_names()
+    assert {"alpaca_api_key_id", "ANTHROPIC_API_KEY", "MMR_WEB_TOKEN"} <= set(names)
+
+
+def test_an_unreadable_proc_status_reports_unknown_not_zero(monkeypatch):
+    monkeypatch.setattr(posture, "_proc_status", lambda: {})
+    out = posture.read_posture()
+    assert out["cap_eff"] == "" and out["seccomp"] is None and out["no_new_privs"] is None
+    monkeypatch.setattr(posture, "_proc_status", lambda: {"Seccomp": "two", "NoNewPrivs": "1"})
+    out = posture.read_posture()
+    assert out["seccomp"] is None and out["no_new_privs"] == 1

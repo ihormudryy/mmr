@@ -640,7 +640,8 @@ def test_the_probe_directories_are_the_shipped_ones():
 
 
 @pytest.mark.parametrize("name, class_name", [("holds_only_its_pipe", "HoldsOnlyItsPipe"),
-                                               ("ptrace_denied", "PtraceDenied")])
+                                               ("ptrace_denied", "PtraceDenied"),
+                                               ("runs_as_slot_uid", "RunsAsSlotUid")])
 def test_the_container_check_probes_ship_with_one_class_each(name, class_name):
     # Task 11: these run only in a real forked child (tests/fullstack/test_sandbox_service.py); here only their shape.
     from trader.sandbox.supervisor import _only_class, _read_probe_source

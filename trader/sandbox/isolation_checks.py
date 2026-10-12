@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Optional
 
+from trader.authored.api import Decision
 from trader.authored.sandbox_client import SandboxClient, SandboxFault, SandboxInfo
 from trader.sandbox.posture import decode_cap_eff
 from trader.sandbox.protocol import BUILD_ID_RE, PROBE_CONID, SANDBOX_ERROR
@@ -19,6 +20,14 @@ from trader.sandbox.protocol import BUILD_ID_RE, PROBE_CONID, SANDBOX_ERROR
 EXPECTED_CAP_EFF = "00000000000000e0"   # exactly KILL + SETGID + SETUID (ruling 2)
 EXPECTED_PIDS_MAX = "64"                # compose pids_limit (spec 7.5)
 BENIGN_PROBE = "benign_orb"
+# Spec 7.9/10: probes in trader/sandbox/probes that a real child answers BUY only while the property holds.
+# check name -> probe. Each runs in its own session; a fault, None or SELL fails the check.
+PROPERTY_PROBES: dict[str, str] = {
+    "seccomp_denies_ptrace": "ptrace_denied",        # the custom profile, not just seccomp mode 2 (ruling 16)
+    "child_runs_as_slot_uid": "runs_as_slot_uid",    # slot uid, gid sbxchild, no groups, no caps
+}
+PIPE_PROBE = "holds_only_its_pipe"                    # run with a neighbour open: its pipe must not reach the probe
+SLOT_PROBE = "writes_own_slot"                        # ruling 28: a reused slot starts empty
 # Ruling 33: devices some kernels (Docker Desktop's LinuxKit) create in every network namespace. Allowed beside
 # lo only while down and without an address.
 FALLBACK_TUNNEL_DEVICES = frozenset({"tunl0", "sit0", "ip6tnl0", "ip6gre0", "gre0", "gretap0", "erspan0",
@@ -71,13 +80,17 @@ class IsolationResult:
 
 
 def run_isolation_checks(client: SandboxClient) -> IsolationResult:
-    """Posture first; then, only while no live session is open, the benign and the hostile sessions."""
+    """Posture first; then, only while no live session is open, the benign session, the probes that prove the
+    child's seccomp profile, identity, descriptors and slot wipe in a real child, and the hostile sessions."""
     info = client.ping()
     checks = [_build_id_check(info.image_digest), _boot_id_check(info.boot_id), *_posture_checks(info.posture)]
     live_gate = _live_sessions_check(info.live_open)
     checks.append(live_gate)
     if live_gate.passed:   # rulings 21, 29: no probe ever runs beside a live strategy's child
         checks.append(_benign_check(client))
+        checks.extend(_property_check(client, name, probe) for name, probe in PROPERTY_PROBES.items())
+        checks.append(_pipe_check(client))
+        checks.append(_slot_wipe_check(client, info.size))
         checks.extend(hostile_check(client, name, baseline=info) for name in HOSTILE_ESCAPES)
     return IsolationResult(passed=all(check.passed for check in checks), image_digest=info.image_digest,
                            checks=tuple(checks))
@@ -167,6 +180,59 @@ def _benign_check(client: SandboxClient) -> CheckResult:
     except Exception as exc:  # noqa: BLE001 — any failure is a failed check
         return CheckResult("benign_session", False, f"benign probe failed: {_describe(exc)}")
     return CheckResult("benign_session", True, "ran five bars and closed")
+
+
+def _probe_decision(client: SandboxClient, probe: str) -> Any:
+    """One session of ``probe``, one bar: the probe's answer."""
+    with client.open_probe("probe", probe) as session:
+        return session.bar(PROBE_CONID, _T0, 1.0, 2.0, 0.5, 1.5, 100.0)
+
+
+def _confirmed(decision: Any) -> bool:
+    return type(decision) is Decision and decision.action == "BUY"
+
+
+def _verdict(name: str, probe: str, decision: Any) -> CheckResult:
+    if _confirmed(decision):
+        return CheckResult(name, True, f"{probe} confirmed it in a real child")
+    return CheckResult(name, False, f"{probe} did not confirm it: {_short(decision)}")
+
+
+def _property_check(client: SandboxClient, name: str, probe: str) -> CheckResult:
+    try:
+        decision = _probe_decision(client, probe)
+    except Exception as exc:  # noqa: BLE001 — any failure is a failed check
+        return CheckResult(name, False, f"{probe} failed: {_describe(exc)}")
+    return _verdict(name, probe, decision)
+
+
+def _pipe_check(client: SandboxClient) -> CheckResult:
+    """With a neighbour open, the supervisor holds another child's pipe: none of it may reach the probe's child."""
+    name = "child_holds_only_its_pipe"
+    try:
+        with client.open_probe("probe", BENIGN_PROBE) as neighbour:
+            _bars(neighbour, 1)
+            decision = _probe_decision(client, PIPE_PROBE)
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(name, False, f"{PIPE_PROBE} failed: {_describe(exc)}")
+    return _verdict(name, PIPE_PROBE, decision)
+
+
+def _slot_wipe_check(client: SandboxClient, pool_size: Any) -> CheckResult:
+    """One session more than the pool has slots, one after another, each writing a file in its slot. So at least
+    one slot is reused: a slot left dirty answers SELL, and slots quarantined after failed wipes run out (BUSY)."""
+    name = "slot_wiped_between_sessions"
+    if type(pool_size) is not int or pool_size < 1:
+        return CheckResult(name, False, f"research pool size {_short(pool_size)} is not a slot count")
+    for run in range(1, pool_size + 2):
+        try:
+            decision = _probe_decision(client, SLOT_PROBE)
+        except Exception as exc:  # noqa: BLE001
+            return CheckResult(name, False, f"session {run} of {pool_size + 1} failed: {_describe(exc)}")
+        if not _confirmed(decision):
+            return CheckResult(name, False, f"session {run} of {pool_size + 1} did not start in an empty slot: "
+                                            f"{_short(decision)}")
+    return CheckResult(name, True, f"{pool_size + 1} sessions on {pool_size} slots each started in an empty slot")
 
 
 def hostile_check(client: SandboxClient, name: str, *, baseline: Optional[SandboxInfo] = None) -> CheckResult:

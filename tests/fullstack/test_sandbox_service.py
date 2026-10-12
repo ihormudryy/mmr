@@ -479,6 +479,12 @@ def test_a_real_child_holds_no_inherited_descriptor():
     assert decision is not None and decision.action == "BUY", f"extra descriptors x/100: {decision}"
 
 
+def test_a_real_child_reports_its_slot_uid_and_no_capability():
+    with SandboxClient(proto.RESEARCH_SOCKET).open_probe("probe", "runs_as_slot_uid") as session:
+        decision = session.bar(proto.PROBE_CONID, T0, 1.0, 2.0, 0.5, 1.5, 100.0)
+    assert decision is not None and decision.action == "BUY", decision
+
+
 def test_ptrace_is_denied_inside_a_real_child():
     with SandboxClient(proto.RESEARCH_SOCKET).open_probe("probe", "ptrace_denied") as session:
         decision = session.bar(proto.PROBE_CONID, T0, 1.0, 2.0, 0.5, 1.5, 100.0)
@@ -525,6 +531,9 @@ def test_run_isolation_checks_passes_on_the_running_service():
     assert result.passed, failed
     names = {c.name for c in result.checks}
     assert set(HOSTILE_ESCAPES) <= names and {"benign_session", "network_none", "cap_eff", "seccomp"} <= names
+    # Spec 7.9/10: the custom seccomp profile, the child's identity, its descriptors and its slot, in a real child.
+    assert {"seccomp_denies_ptrace", "child_runs_as_slot_uid", "child_holds_only_its_pipe",
+            "slot_wiped_between_sessions"} <= names
 
 
 def test_the_supervisor_and_ping_survive_every_hostile_session(sandbox, boot):

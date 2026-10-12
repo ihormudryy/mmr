@@ -6,12 +6,13 @@ import threading
 
 import pytest
 
+from trader.authored.api import Decision
 from trader.authored.sandbox_client import (SandboxClient, SandboxFault, SandboxProtocolError,
                                             SandboxUnavailable)
 from trader.sandbox import isolation_checks as ic
 from trader.sandbox.child import ChildError, ChildRuntime
 from trader.sandbox.server import serve
-from trader.sandbox.supervisor import ESCAPE_DIR, Supervisor
+from trader.sandbox.supervisor import ESCAPE_DIR, PROBE_DIR, Supervisor
 from tests.sandbox.fakes import InProcessSpawner
 
 
@@ -20,9 +21,15 @@ def _bar_fault(name):
     return f"on_bar raised {ic.EXPECTED_FAULT_MARKERS[name][0]}: fake"
 
 
+CONFIRMED = Decision(action="BUY", probability=0.5)       # what a property probe answers when the property holds
+_CHECKING_PROBES = {*ic.PROPERTY_PROBES.values(), ic.PIPE_PROBE, ic.SLOT_PROBE}
+PROBE_CHECKS = (*ic.PROPERTY_PROBES, "child_holds_only_its_pipe", "slot_wiped_between_sessions")
+
+
 class _FakeSession:
-    def __init__(self, fault=None):
+    def __init__(self, fault=None, decision=None):
         self.fault = fault             # None: the bar answers; else the SandboxFault detail to raise
+        self.decision = decision
         self.bars = 0
 
     def bar(self, conid, *a, **k):
@@ -30,7 +37,7 @@ class _FakeSession:
         if self.fault is not None:
             raise SandboxFault(self.fault, code="SANDBOX_ERROR")
         self.bars += 1
-        return None
+        return self.decision
 
     def close(self):
         return None
@@ -65,7 +72,9 @@ class _FakeClient:
         return _FakeInfo()
 
     def open_probe(self, kind, name):
-        return _FakeSession(None if kind == "probe" else _bar_fault(name))
+        if kind == "probe":
+            return _FakeSession(decision=CONFIRMED if name in _CHECKING_PROBES else None)
+        return _FakeSession(_bar_fault(name))
 
 
 def check_of(result, name):
@@ -78,6 +87,203 @@ def test_a_clean_service_passes_every_check():
     assert {c.name for c in result.checks} >= set(ic.HOSTILE_ESCAPES) | {
         "benign_session", "cap_eff", "seccomp", "network_none", "read_only_root", "pids_limit"}
     assert set(ic.EXPECTED_FAULT_MARKERS) == set(ic.HOSTILE_ESCAPES)
+
+
+def test_every_property_probe_ships_in_the_image():
+    from trader.sandbox.supervisor import PROBE_DIR, _only_class, _read_probe_source
+
+    for probe in _CHECKING_PROBES:
+        assert (PROBE_DIR / f"{probe}.py").is_file()
+        assert _only_class(_read_probe_source("probe", probe))
+
+
+@pytest.mark.parametrize("check", PROBE_CHECKS)
+@pytest.mark.parametrize("answer", [None, Decision(action="SELL", probability=0.5),
+                                    SandboxFault("on_bar raised OSError: x", code="SANDBOX_ERROR"),
+                                    SandboxUnavailable("sandbox unavailable: fork failed"),
+                                    SandboxProtocolError("probe 'x' not found")])
+def test_a_probe_that_does_not_confirm_fails_its_check(check, answer):
+    probe = {**ic.PROPERTY_PROBES, "child_holds_only_its_pipe": ic.PIPE_PROBE,
+             "slot_wiped_between_sessions": ic.SLOT_PROBE}[check]
+
+    class Unconfirmed(_FakeClient):
+        def open_probe(self, kind, name):
+            if name != probe:
+                return super().open_probe(kind, name)
+            if isinstance(answer, Exception):
+                raise answer
+            return _FakeSession(decision=answer)
+
+    result = ic.run_isolation_checks(Unconfirmed())
+    assert result.passed is False and check_of(result, check).passed is False
+    assert all(check_of(result, other).passed for other in PROBE_CHECKS if other != check)
+
+
+def test_the_probe_checks_run_once_and_after_the_benign_session():
+    class Recording(_FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.opened = []
+
+        def open_probe(self, kind, name):
+            self.opened.append(name)
+            return super().open_probe(kind, name)
+
+    client = Recording()
+    result = ic.run_isolation_checks(client)
+    assert result.passed is True
+    names = [c.name for c in result.checks]
+    assert names.index("benign_session") < min(names.index(c) for c in PROBE_CHECKS)
+    assert max(names.index(c) for c in PROBE_CHECKS) < min(names.index(e) for e in ic.HOSTILE_ESCAPES)
+    assert client.opened.count("ptrace_denied") == 1 and client.opened.count("runs_as_slot_uid") == 1
+
+
+def test_the_pipe_probe_runs_while_a_neighbour_session_is_open():
+    class Tracking(_FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.open_now = 0
+            self.open_at_pipe_probe = None
+
+        def open_probe(self, kind, name):
+            if name == ic.PIPE_PROBE:
+                self.open_at_pipe_probe = self.open_now
+            session = super().open_probe(kind, name)
+            self.open_now += 1
+            tracker = self
+
+            class Counted(_FakeSession):
+                def __exit__(self, *a):
+                    tracker.open_now -= 1
+            counted = Counted(session.fault, session.decision)
+            return counted
+
+    client = Tracking()
+    assert check_of(ic.run_isolation_checks(client), "child_holds_only_its_pipe").passed
+    assert client.open_at_pipe_probe == 1
+
+
+def test_the_slot_check_runs_one_session_more_than_the_pool_has_slots():
+    class Counting(_FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.slot_sessions = 0
+
+        def open_probe(self, kind, name):
+            if name == ic.SLOT_PROBE:
+                self.slot_sessions += 1
+            return super().open_probe(kind, name)
+
+    client = Counting()
+    assert check_of(ic.run_isolation_checks(client), "slot_wiped_between_sessions").passed
+    assert client.slot_sessions == _FakeInfo.size + 1
+
+
+def test_a_slot_left_dirty_on_reuse_fails_the_slot_check():
+    class DirtyOnReuse(_FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.slot_sessions = 0
+
+        def open_probe(self, kind, name):
+            if name != ic.SLOT_PROBE:
+                return super().open_probe(kind, name)
+            self.slot_sessions += 1
+            if self.slot_sessions > _FakeInfo.size:   # the first reused slot still holds leftover.csv
+                return _FakeSession(decision=Decision(action="SELL", probability=0.5))
+            return _FakeSession(decision=CONFIRMED)
+
+    check = check_of(ic.run_isolation_checks(DirtyOnReuse()), "slot_wiped_between_sessions")
+    assert check.passed is False and "did not start in an empty slot" in check.detail
+
+
+@pytest.mark.parametrize("size", [0, None, True, "4"])
+def test_a_pool_size_that_is_not_a_slot_count_fails_the_slot_check(size):
+    class OddSize(_FakeClient):
+        def ping(self):
+            info = _FakeInfo()
+            info.size = size
+            return info
+
+    assert check_of(ic.run_isolation_checks(OddSize()), "slot_wiped_between_sessions").passed is False
+
+
+def test_the_identity_probe_pins_the_slot_uids_and_group():
+    from trader.sandbox.caps import SBXCHILD_GID, SLOT_UIDS
+    from trader.sandbox.supervisor import PROBE_DIR
+
+    source = (PROBE_DIR / "runs_as_slot_uid.py").read_text()
+    assert f"SLOT_UIDS = range({SLOT_UIDS.start}, {SLOT_UIDS.stop})" in source
+    assert f"SBXCHILD_GID = {SBXCHILD_GID}" in source
+
+
+_SLOT_CHILD_STATUS = ("Name:\tpython\nUid:\t20004\t20004\t20004\t20004\nNoNewPrivs:\t1\nSeccomp:\t2\n"
+                      "Seccomp_filters:\t1\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\n"
+                      "CapEff:\t0000000000000000\nCapBnd:\t00000000000000e0\nCapAmb:\t0000000000000000\n")
+
+
+class _FakeOs:
+    """What the identity probe reads, so its logic runs here under the guarded built-ins (no real child)."""
+    O_RDONLY = 0
+
+    def __init__(self, uids=(20004,) * 3, gids=(20000,) * 3, groups=(), status=_SLOT_CHILD_STATUS):
+        self._uids, self._gids, self._groups, self._status = uids, gids, list(groups), status
+
+    def getuid(self):
+        return self._uids[0]
+
+    def getresuid(self):
+        return self._uids
+
+    def getresgid(self):
+        return self._gids
+
+    def getgroups(self):
+        return list(self._groups)
+
+    def open(self, path, flags):
+        assert path == "/proc/self/status"
+        return 3
+
+    def read(self, fd, count):
+        return self._status.encode()
+
+    def close(self, fd):
+        return None
+
+
+def _identity_answer(monkeypatch, fake_os):
+    import pandas as pd
+    from datetime import datetime, timezone
+    from trader.sandbox.supervisor import _read_probe_source
+
+    monkeypatch.setattr(pd.io.common, "os", fake_os)
+    # Our own probe, run in process only with a fake os: it cannot reach the real one.
+    runtime = ChildRuntime(source=_read_probe_source("probe", "runs_as_slot_uid"), class_name="RunsAsSlotUid",
+                           params={}, lookback=5, conids=(1,), skip_static_check=True)
+    runtime.load()
+    return runtime.on_bar(1, datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc),
+                          {"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 1.0})
+
+
+def test_the_identity_probe_confirms_a_slot_child(monkeypatch):
+    assert _identity_answer(monkeypatch, _FakeOs()) == {"action": "BUY", "probability": 0.4}
+
+
+@pytest.mark.parametrize("fake_os", [
+    _FakeOs(uids=(0, 0, 0)),
+    _FakeOs(uids=(1000, 1000, 1000)),
+    _FakeOs(uids=(20004, 20004, 0)),                                     # saved uid still root
+    _FakeOs(gids=(20000, 20000, 1000)),
+    _FakeOs(groups=(1000,)),
+    _FakeOs(status=_SLOT_CHILD_STATUS.replace("CapEff:\t0000000000000000", "CapEff:\t00000000000000e0")),
+    _FakeOs(status=_SLOT_CHILD_STATUS.replace("CapAmb:\t0000000000000000\n", "")),
+    _FakeOs(status=_SLOT_CHILD_STATUS.replace("Seccomp:\t2", "Seccomp:\t0")),
+    _FakeOs(status=_SLOT_CHILD_STATUS.replace("NoNewPrivs:\t1", "NoNewPrivs:\t0")),
+    _FakeOs(status=""),
+])
+def test_the_identity_probe_refuses_anything_else(monkeypatch, fake_os):
+    assert _identity_answer(monkeypatch, fake_os)["action"] == "SELL"
 
 
 def test_the_hostile_names_are_plan_1s_files():
@@ -513,12 +719,27 @@ class _BenignChild:
         return None
 
 
+class _ScriptedProbe:
+    """Stands in for a forked child running a property probe: it answers BUY, as the real one does when the
+    property holds. It never runs the probe's code (that needs a real slot child)."""
+    pid = -1
+
+    def send_bar(self, conid, t, ohlcv):
+        return {"action": "BUY", "probability": 0.5}
+
+    def close(self):
+        return None
+
+
 class _ScriptedSpawner:
     def __init__(self):
         self._escapes = {(ESCAPE_DIR / f"{name}.py").read_text(encoding="utf-8"): name
                          for name in ic.HOSTILE_ESCAPES}
+        self._probes = {(PROBE_DIR / f"{name}.py").read_text(encoding="utf-8") for name in _CHECKING_PROBES}
 
     def spawn(self, spec):
+        if spec.source in self._probes:
+            return _ScriptedProbe()
         name = self._escapes.get(spec.source)
         if name is None:
             return _BenignChild(spec)   # the static check still runs: only a clean probe loads here
@@ -563,6 +784,7 @@ def test_the_real_wire_passes_a_contained_service(socket_dir):
     assert [c for c in result.checks if not c.passed] == []
     assert result.passed is True and result.image_digest == "build-x"
     assert "bar timeout" in check_of(result, "escape_loop_forever").detail
+    assert all(check_of(result, name).passed for name in PROBE_CHECKS)
 
 
 def test_the_real_wire_with_the_in_process_spawner_proves_nothing(socket_dir):
@@ -574,3 +796,5 @@ def test_the_real_wire_with_the_in_process_spawner_proves_nothing(socket_dir):
         stack.stop()
     assert result.passed is False and check_of(result, "benign_session").passed is True
     assert all(check_of(result, name).detail.startswith("never OPENED") for name in ic.HOSTILE_ESCAPES)
+    # The property probes skip the static check only in a real child; refused here, they prove nothing either.
+    assert not any(check_of(result, name).passed for name in PROBE_CHECKS)

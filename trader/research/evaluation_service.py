@@ -124,6 +124,7 @@ class EvaluationService:
             spec = self._build_spec(body)
         except RequestRefused as refusal:                       # nothing is claimed
             return _submit_reply("REFUSED", code=refusal.code, detail=refusal.detail, retryable=refusal.retryable)
+        # A parked authored end stays RUNNING, so it holds a slot until the trader accepts it.
         if self._store.count(OPEN_STATES) >= self._queue_max:
             return _submit_reply("REFUSED", request_id, code="QUEUE_FULL",
                                  detail=f"{self._queue_max} evaluations are already waiting", retryable=True)
@@ -385,7 +386,9 @@ class EvaluationService:
         except TraderUnavailable:
             logger.warning("authored evaluation %s: %s not reported yet; sent again next tick", request_id, end.event)
             return False
-        except TypedRpcRemoteError as remote:                  # a wire error: as final as a refusal
+        except TypedRpcRemoteError as remote:
+            if not is_loud_trader_code(remote.code):      # as update_claim: an infrastructure error ends the service
+                raise
             reply = {"status": "REFUSED", "code": remote.code, "detail": remote.message, "retryable": False}
         if reply.get("status") in ("UPDATED", "UNCHANGED"):
             self._refused_at.pop(request_id, None)

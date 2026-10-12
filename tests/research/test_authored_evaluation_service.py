@@ -9,10 +9,11 @@ from tests.research.authored_fixtures import (CATALOGUE_KEY, NOW, POINT, install
 from tests.research.evaluation_fixtures import CONIDS
 from tests.research.service_fakes import AI, FakeTrader
 from trader.authored.keys import parse_authored_key
+from trader.messaging.typed_rpc import TypedRpcRemoteError
 from trader.research.authored_evaluation import AuthoredEvaluator
 from trader.research.authored_outcome import AUTHORED_END_CODE, AuthoredEnd, AuthoredEvaluationEnded
 from trader.research.evaluation_service import EvaluationService, ServiceStateError
-from trader.research.service_store import ResearchStore
+from trader.research.service_store import CLAIM_CLOSE_OWED, CLAIM_CLOSE_REFUSED, CLAIM_CLOSED, ResearchStore
 from trader.research.signing import AttestationSigner
 from trader.research.trader_port import TraderUnavailable
 
@@ -173,3 +174,83 @@ def test_a_parked_catalogue_request_keeps_its_claim(world):
                         "bar_size": "15 mins"}, AI)
     svc.run_next()
     assert trader.claims[reply["request_id"]]["state"] == "RUNNING"
+
+
+def remote_error(code):
+    def report(body):
+        raise TypedRpcRemoteError(code, "raised by the test")
+    return report
+
+
+@pytest.mark.parametrize("code", ["AUTHORED_STORE_UNAVAILABLE", "PERMISSION_DENIED", "AUTHENTICATION_ERROR"])
+def test_a_remote_error_on_the_end_report_stops_the_service_and_the_restart_resends(world, code):   # M1, M4
+    trader, store = FakeTrader(), ResearchStore(world.db)
+    real_report = trader.report_authored_evaluation
+    trader.report_authored_evaluation = remote_error(code)
+    svc = service(world, trader, raising(AuthoredEvaluationEnded(ERROR_END)), store=store)
+    request_id = submit(svc)
+    with pytest.raises(TypedRpcRemoteError):
+        svc.run_next()
+    assert svc.get(request_id, AI)["state"] == "RUNNING" and store.get(request_id)["state"] != "PARKED"
+    assert trader.claims[request_id]["state"] != "FAILED" and no_case_signed(world)
+    trader.report_authored_evaluation = real_report
+    service(world, trader, never, store=store).recover()
+    assert trader.authored_reports == [ERROR_END.report_body(request_id, DIGEST)]
+    assert trader.claims[request_id]["state"] == "FAILED" and not trader.reported_after_close
+
+
+def test_a_loud_remote_error_on_the_end_report_parks_the_end(world, monkeypatch):
+    """Hypothetical code: the authored surface answers only AUTHORED_STORE_UNAVAILABLE today."""
+    trader = FakeTrader()
+    real_report = trader.report_authored_evaluation
+    trader.report_authored_evaluation = remote_error("AUTHORED_RECORD_TAMPERED")
+    svc = service(world, trader, raising(AuthoredEvaluationEnded(ERROR_END)))
+    request_id = submit(svc)
+    svc.run_next()
+    assert svc.get(request_id, AI)["state"] == "RUNNING" and trader.claims[request_id]["state"] != "FAILED"
+    monkeypatch.setattr("trader.research.evaluation_service.PARKED_RESEND_SECONDS", 0)
+    trader.report_authored_evaluation = real_report
+    svc.run_next()
+    assert trader.claims[request_id]["state"] == "FAILED" and not trader.reported_after_close
+
+
+def test_a_refused_claim_close_is_not_tried_again_and_logs_one_error(world, caplog):         # M2
+    trader, store = FakeTrader(), ResearchStore(world.db)
+
+    def refusing_update(request_id, state):
+        trader.updates.append((request_id, state))
+        if state == "RUNNING":
+            return {"status": "UPDATED", "code": None, "detail": None, "retryable": False}
+        return {"status": "REFUSED", "code": "CLAIM_UNKNOWN", "detail": "refused by the test", "retryable": False}
+    trader.update_claim = refusing_update
+    svc = service(world, trader, raising(ServiceStateError("the trader refused STARTED")), store=store)
+    request_id = submit(svc)
+    with caplog.at_level(logging.ERROR):
+        svc.run_next()
+        svc.run_next()
+    assert store.get(request_id)["code"] == CLAIM_CLOSE_REFUSED
+    assert trader.updates.count((request_id, "FAILED")) == 1
+    assert len([r for r in caplog.records if "refused to close" in r.getMessage()]) == 1
+
+
+def test_a_restart_closes_an_owed_claim(world):
+    trader, store = FakeTrader(), ResearchStore(world.db)
+    trader.lose_update = {"FAILED": "request"}
+    svc = service(world, trader, raising(ServiceStateError("refused STARTED")), store=store)
+    request_id = submit(svc)
+    svc.run_next()
+    assert store.get(request_id)["code"] == CLAIM_CLOSE_OWED
+    service(world, trader, never, store=store).recover()
+    assert trader.claims[request_id]["state"] == "FAILED" and store.get(request_id)["code"] == CLAIM_CLOSED
+
+
+def test_an_end_applied_with_its_reply_lost_closes_the_claim_once(world):
+    trader = FakeTrader()
+    trader.lose_authored_reply = True
+    svc = service(world, trader, raising(AuthoredEvaluationEnded(ERROR_END)))
+    request_id = submit(svc)
+    svc.run_next()
+    assert trader.claims[request_id]["state"] != "FAILED" and svc.get(request_id, AI)["state"] == "RUNNING"
+    svc.run_next()
+    assert len(trader.authored_reports) == 1 and trader.claims[request_id]["state"] == "FAILED"
+    assert trader.updates.count((request_id, "FAILED")) == 1 and not trader.reported_after_close

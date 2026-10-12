@@ -4,10 +4,12 @@ import logging
 import pytest
 
 from tests.authored.fake_sandbox import FakeSandbox
-from tests.research.authored_fixtures import NOW, research_world, time_of_day_key
+from tests.research.authored_fixtures import (CATALOGUE_KEY, NOW, POINT, install_fake_sandbox,
+                                             research_world, time_of_day_key)
 from tests.research.evaluation_fixtures import CONIDS
 from tests.research.service_fakes import AI, FakeTrader
 from trader.authored.keys import parse_authored_key
+from trader.research.authored_evaluation import AuthoredEvaluator
 from trader.research.authored_outcome import AUTHORED_END_CODE, AuthoredEnd, AuthoredEvaluationEnded
 from trader.research.evaluation_service import EvaluationService, ServiceStateError
 from trader.research.service_store import ResearchStore
@@ -135,3 +137,39 @@ def test_an_unreachable_trader_while_starting_ends_the_worker_and_signs_nothing(
     with pytest.raises(TraderUnavailable):
         svc.run_next()
     assert no_case_signed(world)
+
+
+def test_a_refused_start_closes_the_trader_claim_failed(world, monkeypatch):    # Plan 4 F5
+    sandbox = install_fake_sandbox(monkeypatch)
+    trader = FakeTrader()
+    trader.refuse_authored_report = ("AUTHORED_STATE_CONFLICT", False)
+    evaluator = AuthoredEvaluator(research_db=world.db, paths=world.paths, now=lambda: NOW, trader=trader)
+    svc = service(world, trader, evaluator.evaluate)
+    assert time_of_day_key(sandbox) == KEY
+    request_id = submit(svc)
+    svc.run_next()
+    assert trader.claims[request_id]["state"] == "FAILED"
+    assert svc.get(request_id, AI)["state"] == "FAILED" and no_case_signed(world) and sandbox.sessions == []
+
+
+def test_a_parked_claim_close_that_fails_is_tried_again_next_tick(world):
+    trader = FakeTrader()
+    trader.lose_update = {"FAILED": "request"}
+    svc = service(world, trader, raising(ServiceStateError("the trader refused STARTED")))
+    request_id = submit(svc)
+    svc.run_next()
+    assert trader.claims[request_id]["state"] != "FAILED"
+    assert svc.get(request_id, AI)["state"] == "FAILED"         # parked: never judged, whatever the claim says
+    svc.run_next()
+    assert trader.claims[request_id]["state"] == "FAILED"
+    svc.run_next()
+    assert [u for u in trader.updates if u == (request_id, "FAILED")] == [(request_id, "FAILED")] * 2
+
+
+def test_a_parked_catalogue_request_keeps_its_claim(world):
+    trader = FakeTrader()
+    svc = service(world, trader, raising(ServiceStateError("a catalogue mismatch")))
+    reply = svc.submit({"kind": "INITIAL", "strategy_key": CATALOGUE_KEY, "cohort": [POINT], "conids": CONIDS,
+                        "bar_size": "15 mins"}, AI)
+    svc.run_next()
+    assert trader.claims[reply["request_id"]]["state"] == "RUNNING"

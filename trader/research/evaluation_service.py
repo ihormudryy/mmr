@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Optional
 from zoneinfo import ZoneInfo
 
-from trader.authored.keys import parse_authored_key
+from trader.authored.keys import is_authored_key, parse_authored_key
 from trader.research.authored_outcome import AUTHORED_END_CODE, AuthoredEnd, AuthoredEvaluationEnded
 from trader.research.case_builder import build_failed_case, build_initial_case, evaluation_summary
 from trader.research.cohort import RequestRefused, request_body
@@ -19,7 +19,7 @@ from trader.messaging.typed_rpc import TypedRpcRemoteError
 from trader.research.evaluation_case import CaseRefused, load_verified_case, write_evaluation_case
 from trader.research.evaluation_request import EvaluationRequestBody, evaluation_request_id
 from trader.research.judgment_attest import is_loud_trader_code
-from trader.research.service_store import OPEN_STATES
+from trader.research.service_store import CLAIM_CLOSE_REFUSED, CLAIM_CLOSED, OPEN_STATES
 from trader.research.trader_port import TraderUnavailable
 
 logger = logging.getLogger(__name__)
@@ -213,10 +213,43 @@ class EvaluationService:
     def _park(self, request_id: str, code: str, detail: str) -> None:
         logger.error("evaluation %s parked: %s: %s; it will not run again and needs the operator",
                      request_id, code, detail)
-        self._store.park(request_id, f"{code}: {detail}"[:PARK_DETAIL_MAX], now=self._now())
+        reason = f"{code}: {detail}"[:PARK_DETAIL_MAX]
+        row = self._store.get(request_id)
+        if row is None or not is_authored_key(row["strategy_key"]):
+            self._store.park(request_id, reason, now=self._now())
+            return
+        self._store.park_owing_claim_close(request_id, reason, now=self._now())
+        self._close_parked_claim(request_id)
+
+    def _close_parked_claims(self) -> None:
+        for row in self._store.parked_owing_claim_close():
+            self._close_parked_claim(row["request_id"])
+
+    def _close_parked_claim(self, request_id: str) -> None:
+        """Plan 4 F5: a parked authored request never finishes, so its claim closes FAILED, and Plan 3's grace
+        returns a record left EVALUATING to STORED. Best effort and never raised: tried again every tick."""
+        try:
+            reply = self._trader.update_claim(request_id, "FAILED")
+        except TraderUnavailable:
+            if not self._claim_reads(request_id, "FAILED"):
+                logger.warning("parked evaluation %s: claim not closed FAILED yet; tried again next tick", request_id)
+                return
+            reply = {"status": "UNCHANGED"}
+        except TypedRpcRemoteError as remote:
+            reply = {"status": "REFUSED", "code": remote.code, "retryable": False}
+        if reply.get("status") in ("UPDATED", "UNCHANGED"):
+            self._store.settle_claim_close(request_id, CLAIM_CLOSED, now=self._now())
+        elif reply.get("retryable"):
+            logger.warning("parked evaluation %s: the trader asks to resend the claim close (%s)", request_id,
+                           reply.get("code"))
+        else:
+            logger.error("parked evaluation %s: the trader refused to close its claim FAILED (%s); the operator "
+                         "must close it", request_id, reply.get("code"))
+            self._store.settle_claim_close(request_id, CLAIM_CLOSE_REFUSED, now=self._now())
 
     def report_pending(self) -> bool:
         """Ruling 24: send every owed DONE/FAILED again; true when the trader confirmed at least one."""
+        self._close_parked_claims()
         confirmed = False
         for row in self._store.pending_reports():
             with self._parking(row["request_id"]):

@@ -218,6 +218,9 @@ class OwedReportStore:
     def get(self, request_id):
         return {"request_id": request_id, "pending_report": "DONE", "code": None}
 
+    def parked_owing_claim_close(self):
+        return []
+
 
 class RefusingTrader:
     def __init__(self, code):

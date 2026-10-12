@@ -17,7 +17,7 @@ from typing import Any, Mapping, Optional, Protocol
 from trader.ai.budget import (Budget, BudgetExhausted, BudgetNotInitialized, HourlyLimitReached,
                              RELEASE_NOT_SENT, RELEASE_REJECTED)
 from trader.ai.clock import Clock
-from trader.ai.config import ROLE_NAMES, AiConfig, AiConfigError, ModelPrice, RoleConfig
+from trader.ai.config import AiConfig, AiConfigError, ModelPrice, RoleConfig
 from trader.ai.journal import (
     COST_CONFIRMED, COST_CORRECTION, COST_ESTIMATED_UNKNOWN, COST_NONE, AttemptJournal, AttemptRecord,
 )
@@ -95,7 +95,7 @@ class _Begun:
 class ModelGateway:
     def __init__(self, *, config: AiConfig, store: AiStore, clock: Clock, clients: Mapping[str, ModelClient],
                  budget: Optional[Budget] = None, journal: Optional[AttemptJournal] = None):
-        for name in ROLE_NAMES:
+        for name in config.roles:
             role, client = config.role(name), clients.get(name)
             if client is None or client.backend != role.backend or client.model_id != role.model:
                 raise AiConfigError("CLIENT_ROLE_MISMATCH", f"the client for role {name!r} does not match ai.yaml")
@@ -150,7 +150,7 @@ class ModelGateway:
             worker.add_done_callback(lambda _done: self._slots.release())
 
     def _prepare(self, role: str, request: ModelRequest) -> tuple[RoleConfig, ModelClient, ModelPrice]:
-        if role not in ROLE_NAMES:
+        if role not in self.config.roles:
             raise CallRefused("ROLE_UNKNOWN", role)
         role_config = self.config.role(role)
         if request.max_output_tokens > role_config.max_output_tokens:
@@ -331,5 +331,5 @@ def build_gateway(config: AiConfig, *, store: AiStore, clock: Clock, environ: Ma
                   clients: Optional[Mapping[str, ModelClient]] = None) -> ModelGateway:
     """Build real adapters from env unless the caller passes ready clients (tests do)."""
     built = {name: (clients or {}).get(name) or build_model_client(config.role(name), environ=environ)
-             for name in ROLE_NAMES}
+             for name in config.roles}
     return ModelGateway(config=config, store=store, clock=clock, clients=built)

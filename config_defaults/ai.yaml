@@ -7,7 +7,7 @@
 # There are no default model ids. An empty `model` stops the service at startup.
 # The owner picks them. Example ids (not defaults): "anthropic/claude-sonnet-4.5" on
 # openrouter, an inference-profile id on bedrock, a deployment name on azure.
-# Model ids per role. Fill them in before starting the ai service; a blank id stops it at start.
+# Model ids per role. Fill in orchestrator and jev before starting the ai service; a blank id there stops it at start.
 # Jev runs on openrouter only. Examples (check the provider's current list, they change):
 #   jev:          {backend: openrouter, model: "anthropic/claude-sonnet-4.5"}
 #   orchestrator: {backend: openrouter, model: "openai/gpt-5"}   # or bedrock / azure (deployment name)
@@ -25,6 +25,12 @@ roles:
     max_input_tokens: 60000
     max_output_tokens: 4000
     call_timeout_seconds: 45
+  author:                      # optional (SP3): an empty model means authoring is off and the ai service still starts
+    backend: openrouter        # openrouter | bedrock | azure
+    model: ""                  # needs a price row below, research.enabled and trader.yaml ai_paper.authored_strategies
+    max_input_tokens: 60000
+    max_output_tokens: 8000
+    # no call_timeout_seconds here: the author's limit is authoring.call_timeout_seconds
 
 # USD per million tokens, per backend and model id. A model with no row here is
 # refused at call time (nothing is reserved).
@@ -108,3 +114,9 @@ research:
   poll_seconds: 30
   evaluation_stale_hours: 24
   judge_attempts: 2
+
+# SP3 nightly author: at most one new strategy per New York trading day, after the close. It runs only with a model in
+# roles.author, and only while trader.yaml ai_paper.authored_strategies.enabled is true and the cap has room.
+authoring:
+  run_after_close_minutes: 60    # after the official close; 0-420, so it starts before New York midnight
+  call_timeout_seconds: 300      # the author's own limit; not bounded by budget.decision_deadline_seconds

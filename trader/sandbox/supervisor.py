@@ -235,7 +235,7 @@ class Supervisor:
                 quarantined = f" ({len(pool.quarantined)} quarantined)" if pool.quarantined else ""
                 return _error(proto.SANDBOX_BUSY, f"no free slot{quarantined}")
             session = _Session(session_id="s" + secrets.token_hex(8), pool=pool_name, conn_id=conn_id,
-                               slot=pool.free_slots.pop(), conids=tuple(conids), is_probe=is_probe)
+                               slot=pool.free_slots.pop(0), conids=tuple(conids), is_probe=is_probe)
             self._sessions[session.session_id] = session
             if is_probe:
                 self._probes.add(session.session_id)
@@ -324,7 +324,7 @@ class Supervisor:
         with self._lock:
             pool = self._pools[session.pool]
             if clean:
-                pool.free_slots.append(slot)
+                pool.free_slots.append(slot)   # FIFO with pop(0): freed slots come round in turn, so all get reused
             else:
                 pool.quarantined.append(slot)   # ruling 13: never reuse a slot we could not wipe
             self._probes.discard(session.session_id)

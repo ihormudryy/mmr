@@ -14,6 +14,7 @@ from typing import Any, Mapping, Optional
 
 from trader.authored.api import Decision
 from trader.authored.sandbox_client import SandboxClient, SandboxFault, SandboxInfo
+from trader.sandbox.caps import SLOT_UIDS
 from trader.sandbox.posture import decode_cap_eff
 from trader.sandbox.protocol import BUILD_ID_RE, PROBE_CONID, SANDBOX_ERROR
 
@@ -28,6 +29,7 @@ PROPERTY_PROBES: dict[str, str] = {
 }
 PIPE_PROBE = "holds_only_its_pipe"                    # run with a neighbour open: its pipe must not reach the probe
 SLOT_PROBE = "writes_own_slot"                        # ruling 28: a reused slot starts empty
+_SLOT_UID_BASE = 20000                                # writes_own_slot reports (uid - 20000) / 10
 # Ruling 33: devices some kernels (Docker Desktop's LinuxKit) create in every network namespace. Allowed beside
 # lo only while down and without an address.
 FALLBACK_TUNNEL_DEVICES = frozenset({"tunl0", "sit0", "ip6tnl0", "ip6gre0", "gre0", "gretap0", "erspan0",
@@ -219,20 +221,41 @@ def _pipe_check(client: SandboxClient) -> CheckResult:
 
 
 def _slot_wipe_check(client: SandboxClient, pool_size: Any) -> CheckResult:
-    """One session more than the pool has slots, one after another, each writing a file in its slot. So at least
-    one slot is reused: a slot left dirty answers SELL, and slots quarantined after failed wipes run out (BUSY)."""
+    """Ruling 28, PR #159 review: every research slot must be used, dirtied, wiped and then found empty by a later
+    session. Each session writes a file in its slot and reports the slot's uid; the pool hands its slots out in
+    turn, so 2 x size sessions visit each slot twice. A slot that is dirty when reused, never comes back
+    (quarantined), or never shows up fails the check. At most 3 x size sessions run."""
     name = "slot_wiped_between_sessions"
     if type(pool_size) is not int or pool_size < 1:
         return CheckResult(name, False, f"research pool size {_short(pool_size)} is not a slot count")
-    for run in range(1, pool_size + 2):
+    visits: dict[int, int] = {}
+    for run in range(1, 3 * pool_size + 1):
         try:
             decision = _probe_decision(client, SLOT_PROBE)
         except Exception as exc:  # noqa: BLE001
-            return CheckResult(name, False, f"session {run} of {pool_size + 1} failed: {_describe(exc)}")
+            return CheckResult(name, False, f"session {run} failed: {_describe(exc)}")
+        uid = _reported_slot_uid(decision)
+        if uid is None:
+            return CheckResult(name, False, f"session {run} reported no slot uid: {_short(decision)}")
         if not _confirmed(decision):
-            return CheckResult(name, False, f"session {run} of {pool_size + 1} did not start in an empty slot: "
-                                            f"{_short(decision)}")
-    return CheckResult(name, True, f"{pool_size + 1} sessions on {pool_size} slots each started in an empty slot")
+            return CheckResult(name, False, f"session {run} found slot {uid} not empty: a wipe left a file")
+        visits[uid] = visits.get(uid, 0) + 1
+        if len(visits) > pool_size:
+            return CheckResult(name, False, f"saw {len(visits)} slot uids for a pool of {pool_size}: {visits}")
+        if len(visits) == pool_size and all(count >= 2 for count in visits.values()):
+            return CheckResult(name, True, f"each of the {pool_size} slots {sorted(visits)} was reused and "
+                                           f"found empty")
+    return CheckResult(name, False, f"not every slot was reused and found empty in {3 * pool_size} sessions "
+                                    f"(visits per slot uid: {visits}; a slot seen once was quarantined or "
+                                    f"never came back)")
+
+
+def _reported_slot_uid(decision: Any) -> Optional[int]:
+    if type(decision) is not Decision:
+        return None
+    scaled = decision.probability * 10
+    uid = _SLOT_UID_BASE + round(scaled)
+    return uid if uid in SLOT_UIDS and abs(scaled - round(scaled)) < 1e-6 else None
 
 
 def hostile_check(client: SandboxClient, name: str, *, baseline: Optional[SandboxInfo] = None) -> CheckResult:

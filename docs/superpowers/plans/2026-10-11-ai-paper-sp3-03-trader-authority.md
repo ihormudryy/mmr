@@ -60,7 +60,7 @@ Each ruling is one line; the owner confirms them in the index under "Owner rulin
 
 ## Plan 2 handoff (2026-10-12)
 
-- Run `mmr ai-author prove-isolation` while the research pool is quiet: its `slot_wiped_between_sessions` check opens research pool size + 1 probe sessions in a row, so a running research evaluation can make it hit `SANDBOX_BUSY` and fail closed (never pass). The proof now also runs the probe checks `seccomp_denies_ptrace`, `child_runs_as_slot_uid` and `child_holds_only_its_pipe` (Plan 2 ruling 27).
+- Run `mmr ai-author prove-isolation` while the research pool is quiet: its `slot_wiped_between_sessions` check needs every research slot used and then found empty (2 × pool size sessions in a row, at most 3 ×), so a running research evaluation can make it hit `SANDBOX_BUSY` or miss a slot and fail closed (never pass). While the proof runs, the sandbox refuses new live sessions (`SANDBOX_BUSY`, `isolation probe running`). The proof also runs the probe checks `seccomp_denies_ptrace`, `child_runs_as_slot_uid` and `child_holds_only_its_pipe` (Plan 2 ruling 27).
 - Store files must stay regular 0644 files: a file the sandbox may not read is `SANDBOX_UNAVAILABLE` (Plan 2 ruling 34), a missing, non-regular or mismatched one `SANDBOX_DIGEST_MISMATCH` (Plan 2 ruling 9).
 
 ## Cross-plan additions

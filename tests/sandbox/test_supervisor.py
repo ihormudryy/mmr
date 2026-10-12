@@ -245,6 +245,19 @@ def test_a_closed_session_wipes_its_slot_outside_the_lock_and_frees_it(tmp_path)
     assert _open(sup, tmp_path, conn=2)["type"] == "OPENED"
 
 
+def test_freed_slots_are_reused_in_turn(tmp_path):     # PR #159 review: FIFO, so every slot gets reused
+    spawner = InProcessSpawner()
+    sup = _supervisor(tmp_path, spawners={"live": InProcessSpawner(), "research": spawner})
+    for conn in range(1, 9):
+        session = _probe(sup, "probe", "benign_orb", conn=conn)["session"]
+        assert _close_session(sup, "research", conn, session)["type"] == "CLOSED"
+    assert [spec.slot_uid for spec in spawner.specs] == [20004, 20005, 20006, 20007] * 2
+
+
+def _close_session(sup, pool, conn, session):
+    return sup.handle(pool, conn, p.parse_request({"v": 1, "type": "CLOSE", "session": session}))
+
+
 def test_a_slot_that_cannot_be_wiped_is_never_reused(tmp_path):
     sup = _supervisor(tmp_path, live=1)
     sup._wiper = lambda slot: False

@@ -72,9 +72,27 @@ class _FakeClient:
         return _FakeInfo()
 
     def open_probe(self, kind, name):
+        if kind == "probe" and name == ic.SLOT_PROBE:
+            return _FakeSession(decision=_slot_answer(self.next_slot()))
         if kind == "probe":
             return _FakeSession(decision=CONFIRMED if name in _CHECKING_PROBES else None)
         return _FakeSession(_bar_fault(name))
+
+    def next_slot(self):
+        """The research pool hands out its slots in turn (FIFO), as the supervisor does."""
+        if not hasattr(self, "_slots"):
+            self._slots = list(RESEARCH_UIDS[:_FakeInfo.size])
+        uid = self._slots.pop(0)
+        self._slots.append(uid)
+        return uid
+
+
+RESEARCH_UIDS = (20004, 20005, 20006, 20007)
+
+
+def _slot_answer(uid, clean=True):
+    """What writes_own_slot answers in slot ``uid``: BUY when the slot was empty, its uid in the probability."""
+    return Decision(action="BUY" if clean else "SELL", probability=(uid - 20000) / 10)
 
 
 def check_of(result, name):
@@ -163,38 +181,78 @@ def test_the_pipe_probe_runs_while_a_neighbour_session_is_open():
     assert client.open_at_pipe_probe == 1
 
 
-def test_the_slot_check_runs_one_session_more_than_the_pool_has_slots():
-    class Counting(_FakeClient):
-        def __init__(self):
-            super().__init__()
-            self.slot_sessions = 0
+def _slot_check(client):
+    return check_of(ic.run_isolation_checks(client), "slot_wiped_between_sessions")
 
+
+class _SlotScript(_FakeClient):
+    """The slot probe answers from ``answer(visit, uid)``; ``order`` lists the slot uids the pool hands out."""
+
+    def __init__(self, order, answer=lambda visit, uid: True):
+        super().__init__()
+        self.order, self.answer, self.visits, self.calls = list(order), answer, {}, 0
+
+    def open_probe(self, kind, name):
+        if name != ic.SLOT_PROBE:
+            return super().open_probe(kind, name)
+        uid = self.order[self.calls % len(self.order)]
+        self.calls += 1
+        self.visits[uid] = self.visits.get(uid, 0) + 1
+        return _FakeSession(decision=_slot_answer(uid, clean=self.answer(self.visits[uid], uid)))
+
+
+def test_every_research_slot_is_reused_and_found_clean():
+    client = _SlotScript(RESEARCH_UIDS)
+    check = _slot_check(client)
+    assert check.passed, check.detail
+    assert client.visits == {uid: 2 for uid in RESEARCH_UIDS}            # each slot dirtied, then found clean
+
+
+def test_a_pool_that_always_reuses_the_same_slot_fails():                # PR #159 review: LIFO hid the others
+    check = _slot_check(_SlotScript([20007]))
+    assert check.passed is False and "slot" in check.detail
+
+
+def test_one_dirty_slot_beside_clean_ones_fails():                        # PR #159 review regression
+    class TwoSlots(_SlotScript):
+        def ping(self):
+            info = super().ping()
+            info.size = 2
+            return info
+
+    dirty = TwoSlots([20004, 20005], answer=lambda visit, uid: not (uid == 20005 and visit > 1))
+    check = _slot_check(dirty)
+    assert check.passed is False and "20005" in check.detail
+    clean = TwoSlots([20004, 20005])
+    assert _slot_check(clean).passed is True
+
+
+def test_a_quarantined_slot_that_never_comes_back_fails():
+    # Slot 20006 is used once, its wipe fails and it is quarantined: the pool rotates over the other three.
+    class Quarantine(_SlotScript):
         def open_probe(self, kind, name):
-            if name == ic.SLOT_PROBE:
-                self.slot_sessions += 1
+            if name == ic.SLOT_PROBE and self.calls >= 4:
+                self.order = [20004, 20005, 20007]
             return super().open_probe(kind, name)
 
-    client = Counting()
-    assert check_of(ic.run_isolation_checks(client), "slot_wiped_between_sessions").passed
-    assert client.slot_sessions == _FakeInfo.size + 1
+    check = _slot_check(Quarantine(RESEARCH_UIDS))
+    assert check.passed is False and "20006" in check.detail
 
 
-def test_a_slot_left_dirty_on_reuse_fails_the_slot_check():
-    class DirtyOnReuse(_FakeClient):
-        def __init__(self):
-            super().__init__()
-            self.slot_sessions = 0
-
+@pytest.mark.parametrize("probability", [0.0, 0.05, 0.9, 1.0])
+def test_a_slot_answer_without_a_slot_uid_fails(probability):
+    class NoUid(_FakeClient):
         def open_probe(self, kind, name):
-            if name != ic.SLOT_PROBE:
-                return super().open_probe(kind, name)
-            self.slot_sessions += 1
-            if self.slot_sessions > _FakeInfo.size:   # the first reused slot still holds leftover.csv
-                return _FakeSession(decision=Decision(action="SELL", probability=0.5))
-            return _FakeSession(decision=CONFIRMED)
+            if name == ic.SLOT_PROBE:
+                return _FakeSession(decision=Decision(action="BUY", probability=probability))
+            return super().open_probe(kind, name)
 
-    check = check_of(ic.run_isolation_checks(DirtyOnReuse()), "slot_wiped_between_sessions")
-    assert check.passed is False and "did not start in an empty slot" in check.detail
+    assert _slot_check(NoUid()).passed is False
+
+
+def test_more_slot_uids_than_the_pool_has_fails():
+    check = _slot_check(_SlotScript([20001, 20002, 20003, 20004, 20005]))
+    assert check.passed is False
 
 
 @pytest.mark.parametrize("size", [0, None, True, "4"])
@@ -208,6 +266,25 @@ def test_a_pool_size_that_is_not_a_slot_count_fails_the_slot_check(size):
     assert check_of(ic.run_isolation_checks(OddSize()), "slot_wiped_between_sessions").passed is False
 
 
+def test_the_slot_probe_reports_its_uid_and_whether_the_slot_was_empty(monkeypatch, tmp_path):
+    import os as real_os
+    from datetime import datetime, timezone
+    from trader.sandbox.supervisor import _read_probe_source
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(real_os, "getuid", lambda: 20006)
+    bar = {"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 1.0}
+
+    def one_session():
+        runtime = ChildRuntime(source=_read_probe_source("probe", ic.SLOT_PROBE), class_name="WritesOwnSlot",
+                               params={}, lookback=5, conids=(1,), skip_static_check=True)
+        runtime.load()
+        return runtime.on_bar(1, datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc), bar)
+
+    assert one_session() == {"action": "BUY", "probability": 0.6}
+    assert one_session() == {"action": "SELL", "probability": 0.6}        # leftover.csv from the first session
+
+
 def test_the_identity_probe_pins_the_slot_uids_and_group():
     from trader.sandbox.caps import SBXCHILD_GID, SLOT_UIDS
     from trader.sandbox.supervisor import PROBE_DIR
@@ -215,6 +292,7 @@ def test_the_identity_probe_pins_the_slot_uids_and_group():
     source = (PROBE_DIR / "runs_as_slot_uid.py").read_text()
     assert f"SLOT_UIDS = range({SLOT_UIDS.start}, {SLOT_UIDS.stop})" in source
     assert f"SBXCHILD_GID = {SBXCHILD_GID}" in source
+    assert f"SLOT_UIDS = range({SLOT_UIDS.start}, {SLOT_UIDS.stop})" in (PROBE_DIR / "writes_own_slot.py").read_text()
 
 
 _SLOT_CHILD_STATUS = ("Name:\tpython\nUid:\t20004\t20004\t20004\t20004\nNoNewPrivs:\t1\nSeccomp:\t2\n"
@@ -721,11 +799,14 @@ class _BenignChild:
 
 class _ScriptedProbe:
     """Stands in for a forked child running a property probe: it answers BUY, as the real one does when the
-    property holds. It never runs the probe's code (that needs a real slot child)."""
+    property holds, with its slot uid in the probability (writes_own_slot). It never runs the probe's code."""
     pid = -1
 
+    def __init__(self, slot_uid):
+        self._slot_uid = slot_uid
+
     def send_bar(self, conid, t, ohlcv):
-        return {"action": "BUY", "probability": 0.5}
+        return {"action": "BUY", "probability": (self._slot_uid - 20000) / 10}
 
     def close(self):
         return None
@@ -739,7 +820,7 @@ class _ScriptedSpawner:
 
     def spawn(self, spec):
         if spec.source in self._probes:
-            return _ScriptedProbe()
+            return _ScriptedProbe(spec.slot_uid)
         name = self._escapes.get(spec.source)
         if name is None:
             return _BenignChild(spec)   # the static check still runs: only a clean probe loads here

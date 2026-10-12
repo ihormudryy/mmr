@@ -66,6 +66,8 @@ class EvaluationPaths:
     summaries_dir: Path
     # The research sandbox socket an authored strategy runs behind (Plan 4 ruling 13).
     sandbox_socket: str = RESEARCH_SOCKET
+    # The build of the STARTED report, set by the authored evaluator only (pre-flight F7).
+    sandbox_image_digest: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -163,7 +165,8 @@ def run_environment(spec: EvaluationSpec, paths: EvaluationPaths) -> RunEnvironm
         conids=tuple(spec.conids), bar_size=spec.bar_size, order_notional=spec.order_notional,
         account_equity=spec.account_equity, max_gross_allocation=spec.max_gross_allocation,
         regular_session_calendar=spec.calendar, authored_digest=spec.authored_digest,
-        sandbox_socket=None if spec.authored_digest is None else paths.sandbox_socket)
+        sandbox_socket=None if spec.authored_digest is None else paths.sandbox_socket,
+        sandbox_image_digest=None if spec.authored_digest is None else paths.sandbox_image_digest)
 
 
 @dataclass(frozen=True)

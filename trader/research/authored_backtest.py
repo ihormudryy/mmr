@@ -36,10 +36,12 @@ def connect_sandbox(socket_path: str) -> SandboxClient:
 
 
 class AuthoredProxyStrategy(Strategy):
-    def __init__(self, *, client: Any, digest: str, class_name: str, params: Mapping[str, float], bar_size: str):
+    def __init__(self, *, client: Any, digest: str, class_name: str, params: Mapping[str, float], bar_size: str,
+                 expected_build: Optional[str] = None):
         super().__init__()
         self._client, self._digest, self._class_name = client, digest, class_name
         self._params, self._bar_size = dict(params), bar_size
+        self._expected_build = expected_build
         self._failure: Optional[Exception] = None
 
     def precompute(self, prices: pd.DataFrame) -> dict:
@@ -52,6 +54,7 @@ class AuthoredProxyStrategy(Strategy):
             session = self._client.open_session(self._digest, self._class_name, self._params, self._bar_size,
                                                 [RESEARCH_SESSION_CONID])
             stream = BarStream(session, RESEARCH_SESSION_CONID)
+            self._require_expected_build(session)
             return {"stamps": prices.index, "decisions": stream.send_frame(prices)}
         except (SandboxFault, SandboxUnavailable) as exc:
             self._failure = exc
@@ -63,6 +66,13 @@ class AuthoredProxyStrategy(Strategy):
         finally:
             if stream is not None:
                 stream.close()
+
+    def _require_expected_build(self, session: Any) -> None:
+        """The trader proves the build of research's STARTED report; a sandbox restarted onto another build
+        would run an unreported one (pre-flight F7). Not a fault of the strategy."""
+        if self._expected_build is not None and session.image_digest != self._expected_build:
+            raise SandboxUnavailable(f"the session opened on build {session.image_digest}, "
+                                     f"STARTED reported {self._expected_build}")
 
     def on_bar(self, prices: pd.DataFrame, state: dict, index: int) -> Optional[Signal]:
         if not state:
@@ -83,7 +93,8 @@ class AuthoredProxyStrategy(Strategy):
 def run_authored_backtest(backtester: Backtester, env: Any, params: Mapping[str, float],
                           universe_accessor: Any) -> BacktestResult:
     proxy = AuthoredProxyStrategy(client=connect_sandbox(env.sandbox_socket), digest=env.authored_digest,
-                                  class_name=env.class_name, params=params, bar_size=env.bar_size)
+                                  class_name=env.class_name, params=params, bar_size=env.bar_size,
+                                  expected_build=env.sandbox_image_digest)
     proxy.install(StrategyContext(
         name=env.class_name, bar_size=BarSize.parse_str(env.bar_size), conids=list(env.conids), universe=None,
         historical_days_prior=0, paper_only=False, storage=backtester.storage, universe_accessor=universe_accessor,

@@ -43,6 +43,9 @@ class RunEnvironment:
     # An authored strategy (SP3): strategy_file is then its store path, read by the sandbox only.
     authored_digest: Optional[str] = None
     sandbox_socket: Optional[str] = None
+    # The build research reported STARTED on; a session OPENED on another build is unavailable (pre-flight F7).
+    # None checks nothing (the shadow replay).
+    sandbox_image_digest: Optional[str] = None
 
 
 @dataclass(frozen=True)

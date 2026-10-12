@@ -51,3 +51,7 @@ class TraderPort:
 
     def record_shadow(self, body: dict) -> dict:
         return self._call(self._command, "record_shadow_result", body)
+
+    def report_authored_evaluation(self, body: dict) -> dict:
+        """Plan 3's facts about one authored evaluation (STARTED or a sandbox end)."""
+        return self._call(self._command, "report_authored_evaluation", body)

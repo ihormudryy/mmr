@@ -72,9 +72,28 @@ def _prepare_slot_dir(path: str, uid: int, gid: int) -> None:
         info = os.fstat(fd)
     finally:
         os.close(fd)
+    _check_slot_dir(path, info, uid, gid)
+
+
+def require_slot_dirs(uids: Iterable[int] = SLOT_UIDS, gid: int = SBXCHILD_GID, *, root: str = SLOT_ROOT) -> None:
+    """Before serving: each slot dir is there, a real directory (never through a link), with the exact owner,
+    group and mode startup gave it. Needs no capability: /tmp is root-owned 0755."""
+    for uid in uids:
+        path = slot_dir(uid, root)
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            raise SlotDirError(f"{path} is missing") from None
+        _check_slot_dir(path, info, uid, gid)
+
+
+def _check_slot_dir(path: str, info: os.stat_result, uid: int, gid: int) -> None:
+    if not stat.S_ISDIR(info.st_mode):
+        raise SlotDirError(f"{path} is not a directory")
     found = (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode))
     if found != (uid, gid, SLOT_DIR_MODE):
-        raise SlotDirError(f"{path} has owner, group and mode {found}, expected {(uid, gid, SLOT_DIR_MODE)}")
+        raise SlotDirError(f"{path} has owner, group and mode {found[0]}, {found[1]}, {oct(found[2])}; "
+                           f"expected {uid}, {gid}, {oct(SLOT_DIR_MODE)}")
 
 
 def prepare_slots_then_drop_chown(uids: Iterable[int] = SLOT_UIDS) -> None:
@@ -93,11 +112,13 @@ def has_effective_cap(bit: int) -> bool:
 
 
 def require_serving_caps() -> None:
-    """The effective set must be exactly SETUID|SETGID|KILL before the first request is served."""
-    effective = _status_hex("CapEff")
-    if effective != SERVING_CAPS:
-        raise CapabilityError(f"effective capabilities are {effective:016x}, serving needs exactly "
-                              f"{SERVING_CAPS:016x} (SETUID, SETGID, KILL)")
+    """The effective and permitted sets must both be exactly SETUID|SETGID|KILL before the first request is
+    served: a capability still permitted could be made effective again."""
+    for field, name in (("CapEff", "effective"), ("CapPrm", "permitted")):
+        found = _status_hex(field)
+        if found != SERVING_CAPS:
+            raise CapabilityError(f"{name} capabilities are {found:016x}, serving needs exactly "
+                                  f"{SERVING_CAPS:016x} (SETUID, SETGID, KILL)")
 
 
 def _status_field(name: str) -> str:

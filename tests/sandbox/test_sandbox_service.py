@@ -211,6 +211,7 @@ def startup(service, monkeypatch):
     calls = []
     monkeypatch.setattr(service, "_join_trader_group", lambda: calls.append("join"))
     monkeypatch.setattr(caps, "require_serving_caps", lambda: calls.append("require"))
+    monkeypatch.setattr(caps, "require_slot_dirs", lambda: calls.append("slot_dirs"))
     monkeypatch.setattr(service, "read_build_id", lambda: "build-x")
     monkeypatch.setattr(service, "read_posture", lambda: calls.append("posture") or {"uid": 0})
 
@@ -237,7 +238,7 @@ def test_the_serving_caps_are_checked_before_the_posture_is_read_and_sigterm_clo
     # The posture is read once: read with CHOWN still there, every PONG would show it and every proof would fail.
     # SIGTERM (docker stop) must close the server: stop listening, end every session, kill its child.
     _run_with_timeout(service)
-    assert startup == ["join", "require", "posture", ("serve", ("live", "research")), "close"]
+    assert startup == ["join", "require", "slot_dirs", "posture", ("serve", ("live", "research")), "close"]
 
 
 def test_sigint_also_closes_the_server(service, startup, monkeypatch):
@@ -251,6 +252,18 @@ def test_sigint_also_closes_the_server(service, startup, monkeypatch):
     monkeypatch.setattr(service, "serve", serve_then_interrupt)
     _run_with_timeout(service)
     assert startup[-2:] == ["serve", "close"]
+
+
+def test_a_missing_or_wrong_slot_dir_never_serves(service, startup, monkeypatch):
+    from trader.sandbox import caps
+
+    def wrong_dir():
+        raise caps.SlotDirError("/tmp/s20003 has mode 0o755, expected 0o700")
+
+    monkeypatch.setattr(caps, "require_slot_dirs", wrong_dir)
+    with pytest.raises(SystemExit, match="refuses to start: /tmp/s20003"):
+        _run_with_timeout(service)
+    assert startup == ["join", "require"]
 
 
 def test_a_supervisor_that_still_holds_chown_never_serves(service, startup, monkeypatch):

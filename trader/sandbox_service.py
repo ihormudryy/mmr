@@ -78,11 +78,13 @@ def _join_trader_group() -> None:
         raise SystemExit(f"sandbox refuses to start: cannot join group trader ({TRADER_GID}): {exc}") from exc
 
 
-def _require_serving_caps() -> None:
-    """The gate before serving, whatever path led here: the effective set must be exactly SETUID|SETGID|KILL."""
+def _require_serving_posture() -> None:
+    """The gate before serving, whatever path led here: CAP_CHOWN is gone (effective and permitted are exactly
+    SETUID|SETGID|KILL) and every slot dir is there as startup made it (ruling 2)."""
     try:
         caps.require_serving_caps()
-    except caps.CapabilityError as exc:
+        caps.require_slot_dirs()
+    except (caps.CapabilityError, caps.SlotDirError) as exc:
         raise SystemExit(f"sandbox refuses to start: {exc}") from exc
 
 
@@ -102,7 +104,7 @@ def _stop_on_signals():
 
 async def _amain() -> None:
     _join_trader_group()
-    _require_serving_caps()           # CAP_CHOWN was dropped when the module started (ruling 2)
+    _require_serving_posture()        # CAP_CHOWN was dropped when the module started (ruling 2)
     supervisor = build_supervisor()   # reads the posture once, so only after the drop: PONG shows the serving caps
     with _stop_on_signals() as stop:
         server = await serve(supervisor, {"live": proto.LIVE_SOCKET, "research": proto.RESEARCH_SOCKET})

@@ -62,6 +62,16 @@ def test_an_unreadable_cap_set_is_an_error_never_a_clean_answer(monkeypatch, tmp
         caps.require_serving_caps()
 
 
+def test_the_permitted_set_must_also_be_exactly_the_serving_set(monkeypatch, tmp_path):
+    # CHOWN gone from effective but still permitted could be raised again: not a serving posture.
+    _status(tmp_path, monkeypatch, cap_eff=SERVING, cap_prm=BEFORE_DROP)
+    with pytest.raises(caps.CapabilityError, match="permitted"):
+        caps.require_serving_caps()
+    _status(tmp_path, monkeypatch, cap_eff=SERVING, cap_prm=SERVING | (1 << 1))
+    with pytest.raises(caps.CapabilityError, match="permitted"):
+        caps.require_serving_caps()
+
+
 def test_the_serving_set_must_be_exactly_setuid_setgid_kill(monkeypatch, tmp_path):
     _status(tmp_path, monkeypatch, cap_eff=SERVING)
     caps.require_serving_caps()
@@ -223,3 +233,36 @@ def test_prepare_refuses_a_symlink_in_place_of_a_slot_dir(tmp_path):
     (tmp_path / f"s{os.getuid()}").symlink_to(target)
     with pytest.raises(caps.SlotDirError, match="already exists"):
         caps.prepare_slot_dirs([os.getuid()], gid=os.getgid(), root=str(tmp_path))
+
+
+def test_require_slot_dirs_passes_on_dirs_startup_made(tmp_path):
+    caps.prepare_slot_dirs([os.getuid()], gid=os.getgid(), root=str(tmp_path))
+    caps.require_slot_dirs([os.getuid()], gid=os.getgid(), root=str(tmp_path))
+
+
+def test_require_slot_dirs_refuses_a_missing_dir(tmp_path):
+    with pytest.raises(caps.SlotDirError, match="missing"):
+        caps.require_slot_dirs([os.getuid()], gid=os.getgid(), root=str(tmp_path))
+
+
+def test_require_slot_dirs_refuses_a_wrong_mode(tmp_path):
+    caps.prepare_slot_dirs([os.getuid()], gid=os.getgid(), root=str(tmp_path))
+    (tmp_path / f"s{os.getuid()}").chmod(0o755)
+    with pytest.raises(caps.SlotDirError, match="mode"):
+        caps.require_slot_dirs([os.getuid()], gid=os.getgid(), root=str(tmp_path))
+
+
+def test_require_slot_dirs_refuses_a_wrong_owner_or_group(tmp_path):
+    caps.prepare_slot_dirs([os.getuid()], gid=os.getgid(), root=str(tmp_path))
+    with pytest.raises(caps.SlotDirError, match="owner"):
+        caps.require_slot_dirs([os.getuid()], gid=os.getgid() + 1, root=str(tmp_path))
+
+
+def test_require_slot_dirs_never_follows_a_symlink(tmp_path):
+    uid = os.getuid()
+    target = tmp_path / "real"
+    caps.prepare_slot_dirs([uid], gid=os.getgid(), root=str(target.parent))
+    os.rename(tmp_path / f"s{uid}", target)
+    (tmp_path / f"s{uid}").symlink_to(target)   # the target is a perfect slot dir; the link itself is not
+    with pytest.raises(caps.SlotDirError, match="not a directory"):
+        caps.require_slot_dirs([uid], gid=os.getgid(), root=str(tmp_path))

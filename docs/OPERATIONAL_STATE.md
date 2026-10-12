@@ -353,9 +353,35 @@ message with no traceback.
 
 - Split compose: ib-gateway, trader, strategy, data, dashboard, scheduler. The opt-in `ai` profile adds `ai` and `research`
   (start them with `docker compose --profile ai up -d ai research`; `./docker.sh -u` does not).
+  The `sandbox` service is in the same profile (see "Sandbox (SP3)"); it is not started by default either.
 - Restart policy: `unless-stopped`.
 - Paper mode; typed Ed25519 RPC (one key per principal, allow-list in
   `trader/messaging/principals.py`). Dashboard on host loopback (default 7424).
+
+## Sandbox (SP3)
+
+**State: not armed.** The `sandbox` service is in compose profiles `ai` and `test`. It is off by default and `./docker.sh -u` does not start it. It runs authored (AI-written) strategy code only. How it works: [ARCHITECTURE.md](ARCHITECTURE.md#sandbox-service-sp3).
+
+**First start.**
+1. `./docker.sh -b` builds the image. It bakes a build id (`MMR_BUILD_ID`, git sha plus UTC time) into `/etc/mmr-build-id`. A plain `docker build` leaves it `unset`, and the sandbox refuses to start.
+2. `docker compose --profile ai up -d sandbox`. Check it: `docker compose ps sandbox` must say healthy (the check sends a PING and needs a PONG).
+3. The operator runs `mmr ai-author prove-isolation` (Plan 3). It calls `run_isolation_checks` against the running service, on the research socket, and the host records the result. It refuses while a live session is open.
+4. A rebuild of the image is a new build id. It needs a fresh `prove-isolation` (Plan 3 gate).
+
+**Do not** run the container tests against the live stack. Use `scripts/run_sandbox_fullstack.sh`. It uses compose project `mmr-sbxtest`, starts only `sandbox` and the test container, and removes everything when it ends.
+
+**Seccomp.** `config_defaults/sandbox-seccomp.json` is made by `scripts/build_sandbox_seccomp.py` from moby v27.5.1 `profiles/seccomp/default.json` (sha256 `9c1025c88ccaa517b648da571961838744ea2137f176bfe6a48b21294cae9c76`, vendored as `config_defaults/docker-default-seccomp.json`). Five syscalls are removed: `ptrace`, `process_vm_readv`, `process_vm_writev`, `kcmp`, `pidfd_open`. Do not edit the JSON by hand: rerun the script.
+
+**Open deviations the owner must confirm** (index: "Owner rulings to confirm"):
+- Ruling 2: the supervisor starts with `CHOWN` to give each slot a 0700 directory, then drops it before serving. Serving caps are only SETUID, SETGID, KILL. The fallback without `CHOWN` is no writable directory.
+- Ruling 3: `RLIMIT_AS` is the address space at fork plus 256 MiB, not an absolute 256 MB (that would fail every pandas child).
+- Ruling 4: `RLIMIT_CPU` is a 4 h backstop. The 2 s wall time per step is the real limit.
+- Ruling 23: `noexec` on `/tmp` uses the compose short tmpfs string form. If a runtime ignores it, `noexec` rests on non-root, no-new-privileges and seccomp.
+- Ruling 22: Plan 3 must mount `mmr_authored_strategies` at `/store` read-write on `trader`. Until then the store volume has no writer.
+
+**Known limits.**
+- Children share one network namespace, so abstract Unix sockets could connect two children (ruling 21). The static checker is the layer that stops authored code from using sockets. Not fixed.
+- docker-py can lose the output of a short `exec`. The container tests handle it with begin and done markers and a retry. If a test fails with "lost the output", it is this, not the sandbox.
 
 ## RPC keys (SP1 Plan 2)
 

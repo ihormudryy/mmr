@@ -248,6 +248,59 @@ Logs are written to `~/.local/share/mmr/logs/` with per-session timestamps (e.g.
 | 42005 | Legacy RPC | strategy — **unbound in production**; offline simulation only |
 | 42006 | MessageBus | strategy signals |
 | 42001 | Legacy dill RPC | trader — **unbound in split production**; offline simulation only |
+| Unix socket | 4-byte length + JSON, v1 | sandbox — OPEN/BAR/CLOSE/PING on `/run/sandbox-live` and `/run/sandbox-research` (no TCP port; see "Sandbox service (SP3)") |
+
+## Sandbox service (SP3)
+
+The `sandbox` service (`trader/sandbox_service.py`, `trader/sandbox/`) runs code that an AI wrote. Nothing else runs that code: not `trader`, `strategy`, `research` or `ai`. The callers use `trader/authored/sandbox_client.py`. It is opt-in: compose profiles `ai` and `test`.
+
+**Process model.**
+- One supervisor runs as uid 0. It starts with `CHOWN`, `SETUID`, `SETGID` and `KILL`. It makes one `/tmp/s<uid>` directory per slot (owner = slot uid, group `sbxchild`, mode 0700), then drops `CHOWN` before it loads pandas or serves anything. From then on its effective set is exactly SETUID, SETGID and KILL (`CapEff 00000000000000e0`).
+- It forks one child per session. The child calls `setgroups([])`, then drops to its slot uid and group `sbxchild` (gid 20000). Only after that does it load authored code. A child holds no capability and keeps only its pipe to the supervisor (every other fd is closed). The slot uids are 20001..20007: the first three are live, the next four are research.
+- The child runs with an import guard and reduced built-ins. Both come from `trader/authored/allowed_api.py`, the same lists the static checker uses.
+- A wipe of a slot after a session runs in a short-lived helper that drops to the slot uid, because the supervisor cannot read a 0700 directory it does not own. If a wipe fails, the slot is quarantined and never reused. `PONG.free` shows the loss.
+- The one `ForkSpawner` is hard-wired in the service. No option, env var or argument turns on a fake child. Tests use `InProcessSpawner` from `tests/sandbox/fakes.py`.
+
+**Protocol.** A frame is a 4-byte big-endian length and a JSON object, at most 256 KiB, version 1. Duplicate keys, NaN and bad UTF-8 are refused. Requests:
+- `PING` gives `PONG` with `image_digest` (the build id), `boot_id`, `pid`, `pool`, `free`, `size`, `live_open` and `posture` (the supervisor's own caps, seccomp mode, no-new-privileges, uid, network devices, forbidden env names, mounts under `/home`, read-only root, cgroup `pids_max`).
+- `OPEN {digest, class, params, bar_size, conids}` gives `OPENED {session, image_digest}`. `OPEN_PROBE {kind, name, conids}` is the same for the isolation checks. It loads a file from the image only (`trader/sandbox/probes/` or `tests/authored/escapes/`), by a name that matches `[a-z0-9_]{1,64}`, and only on the research socket. It is the only path that skips the static check, and it is refused `SANDBOX_BUSY` while a live session is open.
+- `BAR {session, conid, t, open, high, low, close, volume}` gives `SIGNAL {action, probability}`. Times are UTC ISO-8601 and must strictly increase per conid.
+- `CLOSE {session}` gives `CLOSED`.
+- Errors carry a code: `SANDBOX_ERROR` (the strategy failed), `SANDBOX_DIGEST_MISMATCH` (store file missing, bytes do not match, or class differs), `SANDBOX_BUSY` (no free slot), `SANDBOX_BAD_REQUEST` (a caller mistake).
+
+**Pools and sockets.**
+
+| Pool | Socket | Sessions | Conids per session |
+|------|--------|----------|--------------------|
+| live | `/run/sandbox-live/sandbox.sock` | 3 (one per authored deployment) | 1 to 20 (all conids of that deployment) |
+| research | `/run/sandbox-research/sandbox.sock` | 4 | exactly 1 |
+
+- Each socket sits in its own named volume (`mmr_sandbox_live`, `mmr_sandbox_research`). The supervisor joins group `trader` (gid 1000), sets the directory to root:trader 0750 and the socket to mode 0660. A child never sees a socket.
+- Who mounts them: `sandbox` mounts both. `strategy` mounts the live volume. `research` mounts the research volume. `sandbox` also mounts the read-only authored store (`mmr_authored_strategies` at `/store`). Nothing else.
+- One session per connection. When the connection closes, for any reason, the child is killed and the slot is wiped and freed.
+
+**At OPEN (store path).** The supervisor reads `/store/<hex>.py`, re-hashes the bytes against the digest, runs `require_clean` (the static check) on exactly those bytes, and checks that the class in the file is the requested class. Only then does it fork. A static refusal is `SANDBOX_ERROR` with detail `AUTHORED_STATIC_REJECTED:<rule>`.
+
+**Limits.**
+- Per step: 2 s wall time for the class load and for each BAR. When a bar overruns, the server kills the child and ends the session (`SANDBOX_ERROR`, `bar timeout after 2.0s`).
+- Child rlimits: `RLIMIT_AS` = address space mapped at fork + 256 MiB (an absolute 256 MB would fail every pandas child); `RLIMIT_CPU` 4 h (a backstop, the 2 s wall is the real limit); `RLIMIT_NPROC` 1 (no thread, no fork); `RLIMIT_FSIZE` 4 MiB; `RLIMIT_CORE` 0. BLAS and OpenMP are single-threaded (set in code before numpy loads).
+- Container: `network_mode: none`, `ipc: none`, read-only root, `cap_drop: ALL`, `cap_add: CHOWN, SETUID, SETGID, KILL`, `no-new-privileges`, `pids_limit: 64`, `cpus: 2`, `mem_limit: 4g`, `nofile` 1024, `/tmp` a 64 MiB tmpfs with `noexec,nosuid,nodev`. The service holds no key, no config and no secret; it does not use `x-mmr-common-env`.
+- The history a strategy sees is trimmed to its `LOOKBACK_BARS` (1 to 2000 bars).
+
+**Seccomp.** `config_defaults/sandbox-seccomp.json` is derived by `scripts/build_sandbox_seccomp.py` from the vendored `config_defaults/docker-default-seccomp.json`. Source: moby v27.5.1, `profiles/seccomp/default.json`, sha256 `9c1025c88ccaa517b648da571961838744ea2137f176bfe6a48b21294cae9c76` (the script refuses a vendored file with another hash). It removes five syscalls from every allow rule: `ptrace`, `process_vm_readv`, `process_vm_writev`, `kcmp`, `pidfd_open`. The default action stays `SCMP_ACT_ERRNO`, so they fail with EPERM. Compose reads the profile path relative to the current directory, so `docker.sh` runs compose from the repo root.
+
+**Build id.** The id in `PONG` and `OPENED` is a build id, not a Docker image id. `./docker.sh -b` exports `MMR_BUILD_ID` (git short sha plus UTC time). The Dockerfile bakes it into `/etc/mmr-build-id` and the label `mmr.build_id`. The supervisor refuses to start when it is `unset` or malformed, so a plain `docker build` gives a sandbox that does not run. A running container always reports the id of its own image.
+
+**Client errors.** `SandboxClient` checks every request with the server's own parser before it sends. `SANDBOX_BUSY` and a socket that is unreachable, slow, dropped or out of contract raise `SandboxUnavailable` (the strategy is not to blame). `SANDBOX_ERROR` and `SANDBOX_DIGEST_MISMATCH` raise `SandboxFault` (`.code` tells which; the session is over). `SANDBOX_BAD_REQUEST` raises `SandboxProtocolError`; a refused bar leaves the session usable.
+
+**Container tests.** `scripts/run_sandbox_fullstack.sh` builds the sandbox and runs `tests/fullstack/test_sandbox_service.py` against it. It never touches a live stack: its own compose project `mmr-sbxtest` (an override that does not start with `mmr-sbxtest` is refused, exit 2), only the `sandbox` and `fullstack-tests` services (no ib-gateway), a test-only image tag, no published port, a throwaway `HOME` with test keys, no `.env`, and a clean environment (`env -i`). `scripts/check_sbxtest_config.py` checks the rendered config and the run stops before `up` if it names another service, publishes a port, binds an operator path or carries a credential. The run fails unless every test passes and none skips. Never run these tests by hand against the live `mmr` project. Without `MMR_FAKE_BROKER` (a normal pytest run) the module skips.
+
+**Known limits.**
+- Children share one network namespace, so two children could reach each other through abstract Unix sockets. The static checker keeps authored code away from socket APIs; this is recorded, not fixed. `prove-isolation` refuses while a live session is open, so a probe never runs beside a live child.
+- The supervisor forks inside an asyncio process that has worker threads (the 3.12 fork-with-threads hazard). The risk is low: BLAS is single-threaded, the workers only block in `recv`, and the child touches nothing of the loop.
+- docker-py's `exec_run` can lose the output of a short command (it reads the raw hijacked socket and misses bytes buffered with the response headers). The container tests read the response body instead and wrap each command in begin and done markers; a reply without both is run again, and five losses fail the test.
+- `noexec` on `/tmp` depends on the compose short tmpfs string form. If a runtime ignores it, `noexec` rests on non-root, no-new-privileges and seccomp.
+- A slot that cannot be wiped is lost until the service restarts.
 
 ## Tests that pin behaviour
 

@@ -26,6 +26,7 @@ from trader.strategy.ai_deployment_source import (
     source_unchanged,
 )
 from trader.strategy.authored_runtime import (
+    AUTHORED_UNPROVEN,
     ISOLATION_ALARM,
     PROOF_OUTAGE_HOLD,
     PROOF_TIMEOUT_SECONDS,
@@ -494,3 +495,37 @@ def test_an_authored_instance_that_keeps_crashing_is_re_enabled_with_a_growing_w
     world.sandbox.open_sessions[0].bar = broken_open                     # the open session now breaks
     tick()
     assert after(59) == StrategyState.ERROR and after(2) == StrategyState.RUNNING
+
+
+# Final review minor: a signal is dispatched only while the build it was decided on still has a passing proof.
+
+
+def test_a_signal_decided_on_a_proven_build_is_refused_once_the_proof_is_withdrawn(world):
+    gaps = []
+    world.rt.event_store = SimpleNamespace(append=gaps.append)
+    reconcile(world, [authored_active(world.sandbox)])
+    instance = instance_of(world)
+    instance._dispatch_conid = CONID
+    frame = bars(3)
+    signal = instance.on_prices(frame)
+    assert signal is not None
+    world.query.answer("get_isolation_proof", proof(passed=False))      # withdrawn after the decision
+    world.rt._signal_hold.dispatch((CONID, instance.name), instance, signal, CONID, frame)
+    assert world.rt.signal_record.read(0, 10).signals == ()
+    assert [event.metadata["reason"] for event in gaps] == [AUTHORED_UNPROVEN]
+    assert instance.state == StrategyState.RUNNING                       # not the strategy's fault
+
+
+def test_a_signal_with_no_open_session_is_refused(world):
+    gaps = []
+    world.rt.event_store = SimpleNamespace(append=gaps.append)
+    reconcile(world, [authored_active(world.sandbox)])
+    instance = instance_of(world)
+    instance._dispatch_conid = CONID
+    frame = bars(3)
+    signal = instance.on_prices(frame)
+    world.sandbox.open_sessions[0].close()
+    instance._end_session()                                              # an outage on a later bar ended it
+    world.rt._signal_hold.dispatch((CONID, instance.name), instance, signal, CONID, frame)
+    assert world.rt.signal_record.read(0, 10).signals == ()
+    assert [event.metadata["reason"] for event in gaps] == [AUTHORED_UNPROVEN]

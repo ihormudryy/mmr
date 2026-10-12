@@ -52,7 +52,12 @@ from trader.strategy.ai_deployment_source import (
     ai_instance_name,
     source_unchanged,
 )
-from trader.strategy.authored_runtime import PROOF_TIMEOUT_SECONDS, AuthoredDeployments, AuthoredLiveStrategy
+from trader.strategy.authored_runtime import (
+    AUTHORED_UNPROVEN,
+    PROOF_TIMEOUT_SECONDS,
+    AuthoredDeployments,
+    AuthoredLiveStrategy,
+)
 from trader.strategy.history_depth import (
     HISTORY_BELOW_WARMUP,
     HISTORY_DEPTH_CAPPED,
@@ -1876,6 +1881,8 @@ class StrategyRuntime():
             return STRATEGY_UNLOADED
         if not _is_dispatchable(strategy):
             return STRATEGY_DISABLED
+        if isinstance(strategy, AuthoredLiveStrategy) and not strategy.session_build_proven():
+            return AUTHORED_UNPROVEN
         return None
 
     def _latest_bar_time(self, held: HeldSignal) -> Optional[dt.datetime]:

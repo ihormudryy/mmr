@@ -36,6 +36,8 @@ SANDBOX_UNAVAILABLE_ALARM = "AUTHORED_SANDBOX_UNAVAILABLE"
 SANDBOX_FAULT_ALARM = "AUTHORED_SANDBOX_FAULT"
 ISOLATION_ALARM = "AUTHORED_ISOLATION_UNPROVEN"
 DIGEST_ALARM = "AUTHORED_DIGEST_MISMATCH"
+# The SIGNAL_GAP reason for a decided signal whose session build has no passing proof at dispatch, or no session.
+AUTHORED_UNPROVEN = "AUTHORED_BUILD_UNPROVEN"
 # Only these are the strategy's fault and retire it; every other sandbox error is an alarm and a retry.
 STRATEGY_FAULT_CODES = frozenset({SANDBOX_ERROR, SANDBOX_DIGEST_MISMATCH})
 # Errors that end the session and are retried with a new session at a later bar. A protocol error reaching this
@@ -164,6 +166,21 @@ class AuthoredLiveStrategy(Strategy):
         """The dispatch check (Plan 4 ruling 20): never after a fault, and only for the digest the deployment bound."""
         bound = getattr(self, "ai_source_digest", None)
         return not (self._faulted or self._closed) and isinstance(bound, str) and hmac.compare_digest(self.digest, bound)
+
+    def session_build_proven(self) -> bool:
+        """The dispatch check for a decided signal, held or not (final review minor): the build of the open
+        session still has a passing proof. No open session is unproven: fail closed. Not the reconcile check
+        (``authored_binding_intact``): an instance without a session is not to be unloaded.
+
+        Never takes the instance lock: the service loop asks this while a bar may hold the lock."""
+        current = self._current
+        if current is None or self._faulted or self._closed:
+            return False
+        try:
+            return self._proof_gate(current.session.image_digest) is True
+        except Exception as exc:
+            logger.warning("authored strategy %s: the isolation proof check at dispatch failed: %s", self.name, exc)
+            return False
 
     def may_recover(self) -> bool:
         """False while the wait after an unexpected error runs (ruling 3): the runtime does not re-enable it yet."""

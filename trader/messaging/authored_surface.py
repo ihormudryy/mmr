@@ -8,7 +8,6 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from trader.automation.authored_files import AuthoredStoreError
-from trader.automation.authored_refusals import AuthoredRefused
 from trader.automation.authored_wire import (
     GetAuthoredStrategiesRequest, GetIsolationProofRequest, RecordIsolationProofRequest,
     ReportAuthoredEvaluationRequest, RetireAuthoredStrategyRequest, SubmitAuthoredStrategyRequest,
@@ -30,13 +29,11 @@ def _require(caller: RpcCaller, allowed: frozenset[str], method: str) -> None:
 
 
 def _loudly(work: Callable[[], dict]) -> dict:
-    """An unusable store is an RPC error, never a refusal; a business refusal is always a reply body."""
+    """An unusable store is an RPC error, never a refusal (the store replies business refusals itself)."""
     try:
         return work()
     except AuthoredStoreError as exc:
         raise _DispatchProblem(STORE_UNAVAILABLE, str(exc)) from None
-    except AuthoredRefused as refused:              # the store replies itself; this keeps a stray one a reply
-        return refused.reply()
 
 
 def register_authored_surface(registry: Any, *, authored: Any, proofs: Any) -> None:

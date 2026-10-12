@@ -676,11 +676,14 @@ class AuthoredStrategyStore:
         """Withdraw a retired record's live version; the refusal to send back when that did not happen.
 
         An SP2c refusal keeps its code. Any other failure is retryable: the record is RETIRED already, a resend
-        withdraws again and so does ``refresh``."""
-        version = self._version_to_withdraw(record)
-        if version is None or self._withdraw is None:
+        withdraws again and so does ``refresh``. Finding the line's version reads the database too."""
+        if self._withdraw is None:
             return None
+        version = record.deployment_version
         try:
+            version = self._version_to_withdraw(record)
+            if version is None:
+                return None
             self._withdraw(version)
         except DeploymentRefused as refused:
             logger.error("authored strategy %s is RETIRED; withdrawing %s refused: %s", record.digest, version,

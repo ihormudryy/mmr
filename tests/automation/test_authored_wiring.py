@@ -222,3 +222,14 @@ def test_catalogue_entries_ignore_the_authored_switch(tmp_path, monkeypatch):   
             assert len(served.orders.plans) == 1
         finally:
             served.close()
+
+
+def test_a_line_lookup_failure_after_retiring_is_a_retryable_refusal(authored_stack):     # fix round 1
+    served = authored_stack
+
+    def broken_lines():
+        raise RuntimeError("journal read failed")
+    served.store._lines = broken_lines
+    reply = command(served, "strategy").call("retire_authored_strategy", retire_body(served.digest), dict)
+    assert (reply["status"], reply["code"], reply["retryable"]) == ("REFUSED", AUTHORED_WITHDRAWAL_FAILED, True)
+    assert reply["record"]["state"] == "RETIRED" and served.store.get(served.digest).state.value == "RETIRED"

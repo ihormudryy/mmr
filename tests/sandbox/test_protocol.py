@@ -367,3 +367,10 @@ def test_validate_signal_gives_only_the_sandbox_error_for_a_bad_probability(prob
     with pytest.raises(p.FrameError) as exc:
         p.validate_signal({"action": "BUY", "probability": probability})
     assert exc.value.code == p.SANDBOX_ERROR
+
+
+def test_decode_frame_body_returns_the_object_and_refuses_duplicates_and_non_objects():
+    assert p.decode_frame_body(b'{"a":1}') == {"a": 1}
+    for body in (b'{"a":1,"a":2}', b"[1]", b"\xff\xfe", b"nope"):
+        with pytest.raises(p.FrameError):
+            p.decode_frame_body(body)

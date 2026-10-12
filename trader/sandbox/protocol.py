@@ -92,6 +92,11 @@ async def read_frame(reader: asyncio.StreamReader) -> dict:
         body = await reader.readexactly(length)
     except asyncio.IncompleteReadError as exc:
         raise FrameError(f"connection closed after {len(exc.partial)} of {exc.expected} frame bytes") from exc
+    return decode_frame_body(body)
+
+
+def decode_frame_body(body: bytes) -> dict:
+    """The JSON object in one frame body (the bytes after the 4-byte length). Every failure is a FrameError."""
     try:
         obj = json.loads(body, object_pairs_hook=_object_without_duplicate_keys)
     except (ValueError, RecursionError) as exc:  # bad UTF-8, bad JSON, or absurd nesting

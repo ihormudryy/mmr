@@ -1,0 +1,420 @@
+# tests/strategy/test_authored_deployments.py
+"""SP3 spec 7.6, 7.9 and 8 (strategy side): loading an authored deployment, its gates, its retirement.
+Plan 4 rulings 18-20."""
+import datetime as dt
+import logging
+from pathlib import Path
+from types import SimpleNamespace
+
+import pandas as pd
+import pytest
+
+from tests.authored.fake_sandbox import IMAGE_DIGEST, FakeSandbox, caller_source
+from tests.test_strategy_artifact_soft_load import _make_runtime, _write_strategy
+from trader.authored.sandbox_client import SandboxProtocolError
+from trader.data.backtest_store import compute_strategy_hash
+from trader.data.duckdb_store import DuckDBConnection
+from trader.data.strategy_signal_record import StrategySignalRecord
+from trader.messaging.ai_deployment_wire import ActiveAiDeployment
+from trader.messaging.typed_rpc import TypedRpcRemoteError
+from trader.research.strategy_key import authored_strategy_path
+from trader.strategy.ai_deployment_source import AiDeploymentSource, ai_instance_name, source_unchanged
+from trader.strategy.authored_runtime import (ISOLATION_ALARM, PROOF_TIMEOUT_SECONDS, RETIRE_RESEND_CAP,
+                                              AuthoredDeployments, AuthoredLiveStrategy, crash_backoff,
+                                              proof_passes)
+from trader.trading.strategy import StrategyState
+
+VERSION, CATALOGUE_VERSION = "sha256:" + "d" * 64, "sha256:" + "f" * 64
+BASE = "sha256:" + "b" * 64
+CONID = 265598
+RETIRED = {"status": "UPDATED", "code": None, "detail": None, "retryable": False, "record": None}
+WITHDRAWAL_FAILED = {"status": "REFUSED", "code": "AUTHORED_WITHDRAWAL_FAILED", "detail": "resend",
+                     "retryable": True, "record": None}
+
+
+class FakeTraderRpc:
+    """A typed RPC client double: replies per method, in order (the last repeats); an exception is raised."""
+
+    def __init__(self, **replies):
+        self.calls, self._replies = [], {method: list(values) for method, values in replies.items()}
+        self.timeouts = []
+
+    def answer(self, method, *replies):
+        self._replies[method] = list(replies)
+
+    def call(self, method, body, response_model, timeout=None):
+        self.calls.append((method, dict(body)))
+        self.timeouts.append((method, timeout))
+        queue = self._replies[method]
+        reply = queue.pop(0) if len(queue) > 1 else queue[0]
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+
+def proof(image=IMAGE_DIGEST, passed=True):
+    return {"found": True, "proof": {"proof_id": "sha256:" + "9" * 64, "image_digest": image, "passed": passed,
+                                     "checks": [], "ran_at": "2026-10-12T01:00:00+00:00",
+                                     "recorded_at": "2026-10-12T01:00:01+00:00"}}
+
+
+def bars(count):
+    index = pd.date_range("2024-03-04 14:30", periods=count, freq="1min", tz="UTC", name="date")
+    closes = [100.0 + i for i in range(count)]
+    return pd.DataFrame({"open": closes, "high": closes, "low": closes, "close": closes, "volume": 1000.0},
+                        index=index)
+
+
+@pytest.fixture
+def world(tmp_path, tmp_duckdb_path):
+    rt = _make_runtime(tmp_path, tmp_duckdb_path, automation_enabled=False)
+    rt._load_enabled = lambda name: None
+    rt._last_dispatched_bar = {}
+    rt._warmup_shortfalls = {}
+    rt._hist_bar_days = {}
+    rt.signal_record = StrategySignalRecord(DuckDBConnection.get_instance(tmp_duckdb_path))
+    rt.event_store = SimpleNamespace(append=lambda event: None)
+    rt.zmq_messagebus_client = SimpleNamespace(write=lambda *args: None)
+    rt._load_ai_history = lambda instance: None                     # no IB in a node test
+    sandbox = FakeSandbox(research=False)                           # the live pool (Task 9 ruling)
+    query = FakeTraderRpc(get_isolation_proof=[proof()])
+    command = FakeTraderRpc(retire_authored_strategy=[RETIRED])
+    rt._authored_deployments = AuthoredDeployments(client=sandbox, trader_query=query, trader_command=command)
+    return SimpleNamespace(rt=rt, sandbox=sandbox, query=query, command=command)
+
+
+def authored_active(sandbox, name="counts_bars", class_name="CountsBars", *, params=None, digest=None,
+                    conids=(CONID,)):
+    file_digest = sandbox.add(caller_source(name))
+    return ActiveAiDeployment(version_digest=VERSION, base_digest=BASE,
+                              strategy_path=authored_strategy_path(file_digest),
+                              strategy_digest=digest or file_digest, class_name=class_name, params=params or {},
+                              conids=list(conids), bar_size="1 min", expiry_session="2026-11-06")
+
+
+def catalogue_active(world):
+    path = _write_strategy(world.rt.strategies_directory)
+    return ActiveAiDeployment(version_digest=CATALOGUE_VERSION, base_digest=BASE,
+                              strategy_path="strategies/" + Path(path).name,
+                              strategy_digest="sha256:" + compute_strategy_hash(path),
+                              class_name="VwapReclaimCat", params={}, conids=[CONID], bar_size="1 min",
+                              expiry_session="2026-11-06")
+
+
+def reconcile(world, deployments):
+    AiDeploymentSource(runtime=world.rt, read_active=lambda: deployments, paper=True).reconcile()
+
+
+def instance_of(world, version=VERSION):
+    return world.rt.get_strategy(ai_instance_name(version))
+
+
+def retirements(world):
+    return [body for method, body in world.command.calls if method == "retire_authored_strategy"]
+
+
+def test_an_authored_deployment_loads_without_any_file(world):
+    reconcile(world, [authored_active(world.sandbox)])
+    instance = instance_of(world)
+    assert isinstance(instance, AuthoredLiveStrategy) and instance.state == StrategyState.RUNNING
+    assert instance.ai_deployment_version == VERSION and instance.paper_only
+    assert not any(Path(world.rt.strategies_directory).iterdir())
+    assert world.query.calls == [("get_isolation_proof", {"image_digest": IMAGE_DIGEST})]
+
+
+def test_its_signals_take_the_existing_signal_path(world):
+    deployment = authored_active(world.sandbox)
+    reconcile(world, [deployment])
+    instance = instance_of(world)
+    instance._dispatch_conid = CONID
+    frame = bars(3)
+    world.rt._dispatch_once(instance, instance.on_prices(frame), CONID, frame)
+    entries = world.rt.signal_record.read(0, 10).signals
+    assert [(e.entry.action, e.entry.source_digest, e.entry.deployment_version) for e in entries] == [
+        ("BUY", deployment.strategy_digest, VERSION)]
+
+
+def test_a_digest_that_is_not_the_files_is_refused_and_retired(world, caplog):
+    file_digest = authored_active(world.sandbox).strategy_digest
+    with caplog.at_level(logging.ERROR):
+        reconcile(world, [authored_active(world.sandbox, digest="sha256:" + "0" * 64)])
+    assert world.rt.ai_instances() == {} and "AUTHORED_DIGEST_MISMATCH" in caplog.text
+    world.rt._authored_deployments.send_retirements()
+    assert [(body["digest"], body["code"]) for body in retirements(world)] == [
+        (file_digest, "SANDBOX_DIGEST_MISMATCH")]
+
+
+@pytest.mark.parametrize("reply", [proof(passed=False), proof(image="sha256:" + "f" * 64),
+                                   {"found": False, "proof": None}])
+def test_no_passing_proof_for_the_running_image_loads_nothing_and_retires_nothing(world, reply, caplog):
+    world.query.answer("get_isolation_proof", reply)
+    with caplog.at_level(logging.ERROR):
+        reconcile(world, [authored_active(world.sandbox)])
+    assert world.rt.ai_instances() == {} and ISOLATION_ALARM in caplog.text
+    world.rt._authored_deployments.send_retirements()
+    assert retirements(world) == []
+
+
+def test_a_sandbox_rebuilt_after_the_load_gives_no_signal_until_its_build_is_proven(world):   # review r1 #6
+    reconcile(world, [authored_active(world.sandbox)])
+    instance = instance_of(world)
+    instance._dispatch_conid = CONID
+    world.sandbox.image_digest = "e4f5a6b-20261012T090000Z"              # build B replaced the proven build
+    world.query.answer("get_isolation_proof", {"found": False, "proof": None})   # B has no proof yet
+    frame = bars(3)
+    assert instance.on_prices(frame) is None and world.sandbox.sessions == []
+    assert world.rt.signal_record.read(0, 10).signals == ()
+    world.query.answer("get_isolation_proof", proof(image="e4f5a6b-20261012T090000Z"))
+    signal = instance.on_prices(frame)                                   # read fresh: no reconcile needed
+    world.rt._dispatch_once(instance, signal, CONID, frame)
+    assert len(world.rt.signal_record.read(0, 10).signals) == 1
+
+
+def test_a_failed_proof_for_the_same_build_before_first_open_gives_no_signal(world):      # review r2 #4
+    reconcile(world, [authored_active(world.sandbox)])                   # build A proven, no session opened yet
+    instance = instance_of(world)
+    instance._dispatch_conid = CONID
+    world.query.answer("get_isolation_proof", proof(passed=False))       # A's proof withdrawn; no reconcile
+    assert instance.on_prices(bars(3)) is None                          # the gate re-reads, so no first OPEN
+    assert world.sandbox.sessions == [] and world.rt.signal_record.read(0, 10).signals == ()
+
+
+def test_a_later_failing_proof_stops_the_running_instance_at_the_next_bar(world):         # review r2 #4
+    reconcile(world, [authored_active(world.sandbox)])
+    instance = instance_of(world)
+    instance._dispatch_conid = CONID
+    assert instance.on_prices(bars(3)) is not None                      # opened on the proven build
+    world.query.answer("get_isolation_proof", proof(passed=False))       # the same build's proof is withdrawn
+    assert instance.on_prices(bars(4)) is None and world.sandbox.open_sessions == []   # next bar re-reads, stops
+
+
+def test_a_trader_that_refuses_the_proof_read_loads_nothing(world, caplog):
+    world.query.answer("get_isolation_proof", TypedRpcRemoteError("PERMISSION_DENIED", "cli only"))
+    with caplog.at_level(logging.ERROR):
+        reconcile(world, [authored_active(world.sandbox)])
+    assert world.rt.ai_instances() == {} and "PERMISSION_DENIED" in caplog.text
+
+
+def test_an_unreachable_live_sandbox_waits_for_the_next_reconcile(world):
+    world.sandbox.unavailable = True
+    reconcile(world, [authored_active(world.sandbox)])
+    assert world.rt.ai_instances() == {}
+    world.sandbox.unavailable = False
+    reconcile(world, [authored_active(world.sandbox)])
+    assert isinstance(instance_of(world), AuthoredLiveStrategy)
+
+
+def test_a_fault_retires_once_and_the_file_never_reloads(world):
+    deployment = authored_active(world.sandbox, "faults_above_limit", "FaultsAboveLimit", params={"LIMIT": 104.5})
+    reconcile(world, [deployment])
+    instance = instance_of(world)
+    instance._dispatch_conid = CONID
+    assert instance.on_prices(bars(10)) is None                  # the warm-up reaches close 105: a fault
+    assert retirements(world) == []                              # nothing is sent on the tick thread
+    assert not source_unchanged(instance)
+    reconcile(world, [deployment])
+    world.rt._authored_deployments.send_retirements()
+    reconcile(world, [deployment])
+    world.rt._authored_deployments.send_retirements()
+    assert world.rt.ai_instances() == {}
+    assert [(body["digest"], body["code"]) for body in retirements(world)] == [
+        (deployment.strategy_digest, "SANDBOX_ERROR")]
+
+
+def test_a_lost_retirement_is_sent_again_next_reconcile(world):
+    world.command.answer("retire_authored_strategy", ConnectionError("trader down"), RETIRED)
+    world.rt._authored_deployments.request_retirement("sha256:" + "a" * 64, "SANDBOX_ERROR")
+    for _ in range(3):
+        world.rt._authored_deployments.send_retirements()
+    assert len(retirements(world)) == 2
+
+
+def test_a_final_refusal_stops_the_resend(world, caplog):
+    world.command.answer("retire_authored_strategy", {"status": "REFUSED", "code": "AUTHORED_STATE_CONFLICT",
+                                                      "detail": "not deployed", "retryable": False, "record": None})
+    world.rt._authored_deployments.request_retirement("sha256:" + "a" * 64, "SANDBOX_ERROR")
+    with caplog.at_level(logging.ERROR):
+        world.rt._authored_deployments.send_retirements()
+        world.rt._authored_deployments.send_retirements()
+    assert len(retirements(world)) == 1 and "AUTHORED_STATE_CONFLICT" in caplog.text
+
+
+def test_reconcile_sends_pending_retirements(world):
+    world.rt._config_mtime = None
+    world.rt._authored_deployments.request_retirement("sha256:" + "a" * 64, "SANDBOX_ERROR")
+    world.rt._reconcile_sync()
+    assert len(retirements(world)) == 1
+
+
+def test_is_proven_reads_the_trader_every_call_and_never_caches(world):                   # review r2 #4
+    deployments = world.rt._authored_deployments
+    world.query.answer("get_isolation_proof", proof(), proof(passed=False))   # pass once, then fail (repeats)
+    assert deployments.is_proven(IMAGE_DIGEST) is True
+    assert deployments.is_proven(IMAGE_DIGEST) is False                  # a second call re-reads, not cached
+    reads = [body for method, body in world.query.calls if method == "get_isolation_proof"]
+    assert reads[-2:] == [{"image_digest": IMAGE_DIGEST}, {"image_digest": IMAGE_DIGEST}]
+
+
+def test_unloading_closes_its_sessions(world):
+    reconcile(world, [authored_active(world.sandbox)])
+    instance = instance_of(world)
+    instance._dispatch_conid = CONID
+    instance.on_prices(bars(3))
+    world.rt.unload_strategy(instance.name)
+    assert world.sandbox.open_sessions == []
+
+
+def test_a_catalogue_and_an_authored_deployment_load_side_by_side(world):
+    catalogue = catalogue_active(world)
+    reconcile(world, [catalogue, authored_active(world.sandbox)])
+    assert set(world.rt.ai_instances()) == {ai_instance_name(CATALOGUE_VERSION), ai_instance_name(VERSION)}
+    assert source_unchanged(instance_of(world, CATALOGUE_VERSION))
+
+
+def test_proof_passes_needs_found_passed_and_the_same_image():
+    assert proof_passes(proof(), IMAGE_DIGEST)
+    assert not proof_passes({"found": True, "proof": {**proof()["proof"], "passed": "yes"}}, IMAGE_DIGEST)
+    assert not proof_passes({"found": True, "proof": None}, IMAGE_DIGEST)
+    assert not proof_passes({}, IMAGE_DIGEST)
+    assert not proof_passes(None, IMAGE_DIGEST)                          # not a mapping: fail closed
+
+
+# Task 10 rulings (controller, 2026-10-12)
+
+
+def test_a_proof_read_that_times_out_is_false_and_alarms_once(world, caplog):            # ruling 1
+    deployments = world.rt._authored_deployments
+    world.query.answer("get_isolation_proof", TimeoutError("no reply in 2000ms"))
+    with caplog.at_level(logging.ERROR):
+        assert deployments.is_proven(IMAGE_DIGEST) is False
+        assert deployments.is_proven(IMAGE_DIGEST) is False
+    assert [r.getMessage() for r in caplog.records].count(caplog.records[0].getMessage()) == 1
+    assert len([r for r in caplog.records if ISOLATION_ALARM in r.getMessage()]) == 1
+    assert world.query.timeouts[-1] == ("get_isolation_proof", PROOF_TIMEOUT_SECONDS) and PROOF_TIMEOUT_SECONDS == 2.0
+    world.query.answer("get_isolation_proof", proof())
+    assert deployments.is_proven(IMAGE_DIGEST) is True                   # the episode ends on a pass
+
+
+def test_a_proof_read_that_breaks_unexpectedly_is_false_and_does_not_raise(world):
+    world.query.answer("get_isolation_proof", RuntimeError("bug in the client"))
+    assert world.rt._authored_deployments.is_proven(IMAGE_DIGEST) is False
+
+
+def test_a_retryable_refusal_is_resent_at_most_the_cap_then_one_error(world, caplog):    # ruling 2
+    assert RETIRE_RESEND_CAP == 20
+    digest = "sha256:" + "a" * 64
+    world.command.answer("retire_authored_strategy", WITHDRAWAL_FAILED)
+    world.rt._authored_deployments.request_retirement(digest, "SANDBOX_ERROR")
+    with caplog.at_level(logging.ERROR):
+        for _ in range(RETIRE_RESEND_CAP + 5):
+            world.rt._authored_deployments.send_retirements()
+    assert len(retirements(world)) == RETIRE_RESEND_CAP
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1 and digest in errors[0] and "AUTHORED_WITHDRAWAL_FAILED" in errors[0]
+
+
+def test_an_unreachable_trader_does_not_count_toward_the_cap(world):                      # ruling 2
+    world.command.answer("retire_authored_strategy", ConnectionError("down"), TimeoutError("slow"),
+                         OSError("reset"), WITHDRAWAL_FAILED)
+    world.rt._authored_deployments.request_retirement("sha256:" + "a" * 64, "SANDBOX_ERROR")
+    for _ in range(RETIRE_RESEND_CAP + 10):
+        world.rt._authored_deployments.send_retirements()
+    assert len(retirements(world)) == 3 + RETIRE_RESEND_CAP
+
+
+def test_a_remote_error_on_retire_counts_toward_the_cap(world):
+    world.command.answer("retire_authored_strategy", TypedRpcRemoteError("PERMISSION_DENIED", "strategy only"))
+    world.rt._authored_deployments.request_retirement("sha256:" + "a" * 64, "SANDBOX_ERROR")
+    for _ in range(RETIRE_RESEND_CAP + 5):
+        world.rt._authored_deployments.send_retirements()
+    assert len(retirements(world)) == RETIRE_RESEND_CAP
+
+
+def test_a_digest_given_up_after_the_cap_never_reloads(world):
+    deployment = authored_active(world.sandbox, "faults_above_limit", "FaultsAboveLimit", params={"LIMIT": 104.5})
+    world.command.answer("retire_authored_strategy", WITHDRAWAL_FAILED)
+    reconcile(world, [deployment])
+    instance = instance_of(world)
+    instance._dispatch_conid = CONID
+    instance.on_prices(bars(10))                                         # a fault
+    for _ in range(RETIRE_RESEND_CAP + 1):
+        world.rt._authored_deployments.send_retirements()
+    reconcile(world, [deployment])
+    reconcile(world, [deployment])
+    assert world.rt.ai_instances() == {}
+
+
+@pytest.mark.parametrize("breaks", ["repeated_conids", "ping_protocol_error"])
+def test_an_authored_row_that_cannot_be_built_does_not_stop_a_catalogue_row(world, breaks, caplog):
+    if breaks == "repeated_conids":                                     # the proxy refuses a repeated conid
+        authored = authored_active(world.sandbox, conids=(CONID, CONID))
+    else:
+        authored = authored_active(world.sandbox)
+
+        def protocol_error():
+            raise SandboxProtocolError("bad PONG")
+        world.sandbox.ping = protocol_error
+    with caplog.at_level(logging.ERROR):
+        reconcile(world, [authored, catalogue_active(world)])          # the authored row comes first
+    assert set(world.rt.ai_instances()) == {ai_instance_name(CATALOGUE_VERSION)}
+    assert ai_instance_name(VERSION) in caplog.text
+
+
+def test_an_instance_dropped_after_a_failed_backfill_is_final(world):
+    def no_history(instance):
+        raise RuntimeError("IB down")
+    world.rt._load_ai_history = no_history
+    built = []
+    build = world.rt._authored_deployments.build
+    world.rt._authored_deployments.build = lambda *a, **k: built.append(build(*a, **k)) or built[-1]
+    reconcile(world, [authored_active(world.sandbox)])
+    assert world.rt.ai_instances() == {} and len(built) == 1
+    built[0]._dispatch_conid = CONID
+    assert built[0].on_prices(bars(3)) is None and world.sandbox.sessions == []
+
+
+# Ruling 3: an authored instance in ERROR is re-enabled with a growing wait, not every reconcile.
+
+
+def test_crash_backoff_doubles_and_is_capped_at_thirty_minutes():
+    assert [crash_backoff(n).total_seconds() for n in (1, 2, 3)] == [60, 120, 240]
+    assert crash_backoff(6).total_seconds() == 1800 and crash_backoff(50).total_seconds() == 1800
+
+
+def test_an_authored_instance_that_keeps_crashing_is_re_enabled_with_a_growing_wait(world):
+    clock = [dt.datetime(2024, 3, 4, 16, 0, tzinfo=dt.timezone.utc)]
+    world.rt._authored_deployments = AuthoredDeployments(client=world.sandbox, trader_query=world.query,
+                                                         trader_command=world.command, now=lambda: clock[0])
+    reconcile(world, [authored_active(world.sandbox)])
+    instance = instance_of(world)
+    world.rt._load_enabled = lambda name: True                           # an operator enabled it once
+    world.rt._maybe_check_exits = lambda *args: None
+    frames = iter(bars(n) for n in range(3, 40))
+    world.rt._strategy_frame = lambda conid, bar_size: next(frames)
+    real_open = world.sandbox.open_session
+
+    def broken_open(*args, **kwargs):
+        raise RuntimeError("unexpected")
+
+    def tick():
+        world.rt._on_tick_for_strategy(instance, CONID)
+
+    def after(seconds):
+        clock[0] += dt.timedelta(seconds=seconds)
+        world.rt._maybe_recover_from_instrument_error(instance)
+        return instance.state
+
+    world.sandbox.open_session = broken_open
+    tick()
+    assert instance.state == StrategyState.ERROR
+    assert after(30) == StrategyState.ERROR                             # 60 s after the first crash
+    assert after(31) == StrategyState.RUNNING
+    tick()
+    assert after(61) == StrategyState.ERROR                             # 120 s after the second
+    assert after(60) == StrategyState.RUNNING
+    world.sandbox.open_session = real_open
+    tick()                                                               # a clean bar resets the wait
+    assert instance.state == StrategyState.RUNNING
+    world.sandbox.open_sessions[0].bar = broken_open                     # the open session now breaks
+    tick()
+    assert after(59) == StrategyState.ERROR and after(2) == StrategyState.RUNNING

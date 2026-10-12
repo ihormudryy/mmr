@@ -21,8 +21,12 @@ import pandas as pd
 from trader.authored.api import Decision
 from trader.authored.sandbox_client import SandboxFault, SandboxProtocolError, SandboxUnavailable
 from trader.authored.streaming import OHLCV, BarStream, bar_fields, decision_signal
+from trader.messaging.typed_rpc import TypedRpcError, TypedRpcRemoteError
+from trader.objects import BarSize
+from trader.research.strategy_key import authored_digest_of_path
 from trader.sandbox.protocol import MAX_SESSION_CONIDS, SANDBOX_DIGEST_MISMATCH, SANDBOX_ERROR
-from trader.trading.strategy import Signal, Strategy
+from trader.strategy.ai_deployment_source import AI_HISTORY_DAYS
+from trader.trading.strategy import Signal, Strategy, StrategyContext
 
 logger = logging.getLogger(__name__)
 NEW_YORK = ZoneInfo("America/New_York")
@@ -37,6 +41,10 @@ STRATEGY_FAULT_CODES = frozenset({SANDBOX_ERROR, SANDBOX_DIGEST_MISMATCH})
 # Errors that end the session and are retried with a new session at a later bar. A protocol error reaching this
 # far is a session the sandbox already dropped, not a bad bar: BarStream skips those (pre-flight F1).
 _RETRYABLE_ERRORS = (SandboxUnavailable, SandboxProtocolError, OSError)
+# Task 10 ruling 3: an instance that raised an unexpected error is re-enabled only after this wait, doubled per
+# consecutive crash, so a broken instance does not reopen a session and replay its warm-up every reconcile.
+CRASH_BACKOFF_BASE = dt.timedelta(seconds=60)
+CRASH_BACKOFF_CAP = dt.timedelta(minutes=30)
 
 
 def _utc_now() -> dt.datetime:
@@ -65,6 +73,11 @@ def _unsent(prices: pd.DataFrame, last_sent: Optional[dt.datetime]) -> pd.DataFr
     index = pd.DatetimeIndex(prices.index)
     index = index.tz_localize("UTC") if index.tz is None else index.tz_convert("UTC")
     return prices[index > pd.Timestamp(last_sent)]
+
+
+def crash_backoff(consecutive_crashes: int) -> dt.timedelta:
+    doublings = max(0, min(consecutive_crashes - 1, 16))
+    return min(CRASH_BACKOFF_BASE * 2 ** doublings, CRASH_BACKOFF_CAP)
 
 
 def _bound_conids(conids: Sequence[int]) -> tuple[int, ...]:
@@ -98,6 +111,8 @@ class AuthoredLiveStrategy(Strategy):
         self._future_warned: set[tuple[int, dt.date]] = set()
         self._in_outage = False
         self._in_unproven = False
+        self._consecutive_crashes = 0
+        self._recover_after: Optional[dt.datetime] = None
 
     @property
     def bound_conids(self) -> tuple[int, ...]:
@@ -134,10 +149,12 @@ class AuthoredLiveStrategy(Strategy):
                 return None
             except BaseException:
                 self._end_session()        # an unexpected error must not keep one of the 3 live slots
+                self._note_crash()
                 raise
             else:
                 self._clear_outage_alarm()
                 self._in_unproven = False
+                self._consecutive_crashes, self._recover_after = 0, None
                 return decision_signal(decision, self.name)
         # Outside the lock: the callback may close the sessions or queue work for the reconcile thread.
         self._report_fault(strategy_fault)
@@ -147,6 +164,10 @@ class AuthoredLiveStrategy(Strategy):
         """The dispatch check (Plan 4 ruling 20): never after a fault, and only for the digest the deployment bound."""
         bound = getattr(self, "ai_source_digest", None)
         return not (self._faulted or self._closed) and isinstance(bound, str) and hmac.compare_digest(self.digest, bound)
+
+    def may_recover(self) -> bool:
+        """False while the wait after an unexpected error runs (ruling 3): the runtime does not re-enable it yet."""
+        return self._recover_after is None or self._now() >= self._recover_after
 
     def close_sessions(self) -> None:
         """Final: the reconcile thread unloads the instance, and a tick thread that still holds it opens nothing."""
@@ -209,6 +230,13 @@ class AuthoredLiveStrategy(Strategy):
         except Exception as exc:                                           # the session is dropped here either way
             logger.warning("authored strategy %s: closing its live session failed: %s", self.name, exc)
 
+    def _note_crash(self) -> None:
+        self._consecutive_crashes += 1
+        wait = crash_backoff(self._consecutive_crashes)
+        self._recover_after = self._now() + wait
+        logger.error("authored strategy %s raised an unexpected error (%d in a row); not re-enabled for %s",
+                     self.name, self._consecutive_crashes, wait)
+
     def _end_session_with_outage(self, exc: BaseException) -> None:
         self._end_session()
         self._raise_outage_alarm(exc)
@@ -242,3 +270,177 @@ class AuthoredLiveStrategy(Strategy):
         logger.error("%s: authored strategy %s (%s) failed in the sandbox (%s); it stops and is retired, open "
                      "positions keep their stops", alarm, self.name, self.digest, fault.code)
         self._on_fault(self.digest, str(fault.code))
+
+
+# The proof read runs on the tick thread before every bar: a short deadline bounds one bar's wait (ruling 1).
+PROOF_TIMEOUT_SECONDS = 2.0
+RETIRE_TIMEOUT_SECONDS = 15.0
+# Ruling 2: a retryable refusal (AUTHORED_WITHDRAWAL_FAILED, WITHDRAWAL_ENTRY_IN_FLIGHT) or a remote error is sent
+# again at most this often per digest; then the trader's own refresh() keeps withdrawing.
+RETIRE_RESEND_CAP = 20
+# The trader did not get the request: always sent again, never counted.
+UNREACHABLE_ERRORS = (ConnectionError, TimeoutError, OSError)
+RETIRE_DETAILS = {
+    SANDBOX_ERROR: "the live session failed in the sandbox",
+    SANDBOX_DIGEST_MISMATCH: "the deployment or the stored file is not the authored digest",
+}
+
+
+def proof_passes(reply: Any, image_digest: str) -> bool:
+    """Plan 3's get_isolation_proof reply; its shape wins and this is the one place that reads it."""
+    if not isinstance(reply, Mapping):
+        return False
+    proof = reply.get("proof")
+    return (reply.get("found") is True and isinstance(proof, Mapping) and proof.get("passed") is True
+            and proof.get("image_digest") == image_digest)
+
+
+class AuthoredDeployments:
+    """Builds the live proxy for an authored deployment behind the digest and isolation gates, and sends the
+    retirements its faults queue. No authored file is read or run in this process (SP3 spec 4)."""
+
+    def __init__(self, *, client: Any, trader_query: Any, trader_command: Any,
+                 now: Callable[[], dt.datetime] = _utc_now):
+        self._client, self._query, self._command, self._now = client, trader_query, trader_command, now
+        self._lock = threading.Lock()
+        self._retiring: dict[str, str] = {}           # digest -> fault code, until the trader answers
+        self._resends: dict[str, int] = {}            # digest -> refusals and remote errors so far
+        self._retired: set[str] = set()               # answered or given up: never loaded again here
+        self._gate_episode: Optional[tuple[str, str]] = None   # the failing (kind, build) last alarmed
+
+    def build(self, name: str, deployment: Any, *, storage: Any,
+              universe_accessor: Any) -> Optional[AuthoredLiveStrategy]:
+        """The instance for one active authored deployment, or None (logged) when a gate refuses it or it cannot
+        be built. Never raises: one authored row must not stop the other deployments' reconcile."""
+        try:
+            return self._build(name, deployment, storage=storage, universe_accessor=universe_accessor)
+        except Exception as exc:
+            logger.error("authored deployment %s (%s) is not loaded: %s: %s; the next reconcile retries", name,
+                         getattr(deployment, "version_digest", "?"), type(exc).__name__, exc)
+            return None
+
+    def _build(self, name: str, deployment: Any, *, storage: Any,
+               universe_accessor: Any) -> Optional[AuthoredLiveStrategy]:
+        digest = authored_digest_of_path(deployment.strategy_path)
+        if self._stopped(digest):
+            logger.info("authored deployment %s is not loaded: %s was retired in this process", name, digest)
+            return None
+        if not hmac.compare_digest(digest, deployment.strategy_digest):
+            logger.error("%s: deployment %s binds %s to %s; not loaded, the file is retired", DIGEST_ALARM,
+                         deployment.version_digest, deployment.strategy_digest, deployment.strategy_path)
+            self.request_retirement(digest, SANDBOX_DIGEST_MISMATCH)
+            return None
+        try:
+            build = self._client.ping().image_digest
+        except _RETRYABLE_ERRORS as exc:
+            logger.error("%s: the live sandbox does not answer (%s: %s); authored deployment %s waits",
+                         SANDBOX_UNAVAILABLE_ALARM, type(exc).__name__, exc, name)
+            return None
+        if not self.is_proven(build):                 # a fresh trader read; no cache (review r2 #4)
+            return None
+        instance = AuthoredLiveStrategy(client=self._client, digest=digest, class_name=deployment.class_name,
+                                        params=deployment.params, bar_size=deployment.bar_size,
+                                        conids=deployment.conids, on_fault=self.request_retirement,
+                                        proof_gate=self.is_proven, now=self._now)
+        instance.install(StrategyContext(
+            name=name, bar_size=BarSize.parse_str(deployment.bar_size), conids=list(deployment.conids),
+            universe=None, historical_days_prior=AI_HISTORY_DAYS, paper_only=True, storage=storage,
+            universe_accessor=universe_accessor, logger=logger, module=deployment.strategy_path,
+            class_name=deployment.class_name, description=f"authored AI deployment {deployment.version_digest}",
+            params=dict(deployment.params)))
+        instance.ai_deployment_version = deployment.version_digest
+        instance.ai_deployment_digest = deployment.base_digest
+        instance.ai_source_digest = deployment.strategy_digest
+        instance.ai_source_path = deployment.strategy_path
+        instance.enable()
+        return instance
+
+    def request_retirement(self, digest: str, code: str) -> None:
+        """Called on the tick thread: record only, never raise; the reconcile thread sends (Plan 4 ruling 18)."""
+        with self._lock:
+            if digest not in self._retired:
+                self._retiring.setdefault(digest, code)
+
+    def send_retirements(self) -> None:
+        with self._lock:
+            pending = list(self._retiring.items())
+        for digest, code in pending:
+            if self._send_retirement(digest, code):
+                with self._lock:
+                    self._retiring.pop(digest, None)
+                    self._resends.pop(digest, None)
+                    self._retired.add(digest)
+
+    def _stopped(self, digest: str) -> bool:
+        with self._lock:
+            return digest in self._retiring or digest in self._retired
+
+    def _send_retirement(self, digest: str, code: str) -> bool:
+        """Plan 3's retire_authored_strategy; True when no resend is due."""
+        body = {"digest": digest, "code": code, "detail": RETIRE_DETAILS[code]}
+        try:
+            reply = self._command.call("retire_authored_strategy", body, dict, timeout=RETIRE_TIMEOUT_SECONDS)
+        except UNREACHABLE_ERRORS as exc:
+            logger.warning("retire_authored_strategy for %s not delivered (%s); sent again next reconcile",
+                           digest, type(exc).__name__)
+            return False
+        except TypedRpcRemoteError as remote:
+            return self._resend_due(digest, remote.code, remote.message)
+        except TypedRpcError as exc:
+            return self._resend_due(digest, type(exc).__name__, str(exc))
+        if not isinstance(reply, Mapping):
+            return self._resend_due(digest, "MALFORMED_REPLY", repr(reply)[:200])
+        if reply.get("status") in ("UPDATED", "UNCHANGED"):
+            logger.info("authored strategy %s is retired at the trader (%s)", digest, reply.get("status"))
+            return True
+        if reply.get("retryable") is True:
+            return self._resend_due(digest, reply.get("code"), reply.get("detail"))
+        logger.error("%s: the trader refused to retire %s (%s: %s); not sent again", SANDBOX_FAULT_ALARM,
+                     digest, reply.get("code"), reply.get("detail"))
+        return True
+
+    def _resend_due(self, digest: str, code: Any, detail: Any) -> bool:
+        """Counts one answer that asks for a resend; True (give up) once the cap is reached."""
+        with self._lock:
+            sent = self._resends[digest] = self._resends.get(digest, 0) + 1
+        if sent < RETIRE_RESEND_CAP:
+            logger.warning("retire_authored_strategy for %s answered %s (%s); sent again next reconcile "
+                           "(%d of %d)", digest, code, detail, sent, RETIRE_RESEND_CAP)
+            return False
+        logger.error("%s: retire_authored_strategy for %s still answers %s (%s) after %d sends; not sent again "
+                     "from this process, the trader's refresh() keeps withdrawing it", SANDBOX_FAULT_ALARM,
+                     digest, code, detail, sent)
+        return True
+
+    def is_proven(self, build: Optional[str]) -> bool:
+        """Review r2 #4: the authoritative latest proof for ``build``, read from the trader on every call (no
+        cache), so a proof withdrawn for a build already running stops the next OPEN and the next bar. A read
+        failure, a refusal or a timeout is fail-closed (False), never raised, and alarms once per episode. The
+        live proxy holds this method as its gate: before every new session and on every bar."""
+        if build is None:
+            return False
+        try:
+            reply = self._query.call("get_isolation_proof", {"image_digest": build}, dict,
+                                     timeout=PROOF_TIMEOUT_SECONDS)
+        except TypedRpcRemoteError as remote:
+            self._gate_failed(("refused", build), "get_isolation_proof refused (%s: %s)", remote.code,
+                              remote.message)
+            return False
+        except Exception as exc:                      # a timeout, an unreachable trader or a client bug
+            self._gate_failed(("unreadable", build), "the isolation proof is not readable (%s: %s)",
+                              type(exc).__name__, exc)
+            return False
+        if not proof_passes(reply, build):
+            self._gate_failed(("unproven", build), "no passing isolation proof for sandbox build %s; run "
+                              "`mmr ai-author prove-isolation`", build)
+            return False
+        with self._lock:
+            self._gate_episode = None
+        return True
+
+    def _gate_failed(self, episode: tuple[str, str], message: str, *args: Any) -> None:
+        with self._lock:
+            first = self._gate_episode != episode
+            self._gate_episode = episode
+        if first:
+            logger.error("%s: " + message + "; authored deployments give no signal", ISOLATION_ALARM, *args)

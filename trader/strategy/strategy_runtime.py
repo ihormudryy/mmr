@@ -1,5 +1,4 @@
 from ib_async import Contract
-from ib_async.ib import IB
 from ib_async.ticker import Ticker
 from pydantic import BaseModel, ConfigDict
 from reactivex.observer import AutoDetachObserver
@@ -12,10 +11,10 @@ from trader.data.store import DateRange
 
 from trader.data.data_access import SecurityDefinition, TickStorage
 from trader.data.universe import UniverseAccessor
+from trader.authored.sandbox_client import SandboxClient
 from trader.listeners.ib_history_worker import IBHistoryWorker, IBConnectivityError, IBNoDataError
 from trader.messaging.clientserver import (
     MessageBusClient,
-    MultithreadedTopicPubSub,
     RPCServer,
     TopicPubSub
 )
@@ -34,6 +33,8 @@ from trader.messaging.typed_rpc import (
     _DispatchProblem,
 )
 from trader.objects import Action, BarSize, WhatToShow
+from trader.research.strategy_key import is_authored_path
+from trader.sandbox.protocol import LIVE_SOCKET
 from trader.data.event_store import EventStore, EventType, TradingEvent
 from trader.data.strategy_signal_record import (
     DEFAULT_RETENTION_DAYS,
@@ -51,6 +52,7 @@ from trader.strategy.ai_deployment_source import (
     ai_instance_name,
     source_unchanged,
 )
+from trader.strategy.authored_runtime import AuthoredDeployments, AuthoredLiveStrategy
 from trader.strategy.history_depth import (
     HISTORY_BELOW_WARMUP,
     HISTORY_DEPTH_CAPPED,
@@ -65,7 +67,7 @@ from trader.strategy.signal_hold import (
 )
 from trader.strategy.strategy_revisions import StrategyCommandReceipt, StrategyRevisionStore
 from trader.strategy.trader_gateway import StrategyTraderGateway
-from trader.trading.strategy import Signal, Strategy, StrategyConfig, StrategyContext, StrategyState
+from trader.trading.strategy import Strategy, StrategyConfig, StrategyContext, StrategyState
 from decimal import Decimal
 from typing import Any, cast, Dict, List, Optional, Set
 
@@ -717,6 +719,16 @@ class StrategyRuntime():
                 query_client=self._trader_query_client)
             self._ai_deployment_source = AiDeploymentSource(
                 runtime=self, read_active=self._read_active_ai_deployments, paper=bool(self.paper_trading))
+            # The isolation proof is read on the tick thread before every authored bar. Its own query socket:
+            # a call holds its client's lock until it ends, so on the shared client a bar would wait behind a
+            # reconcile read (up to 10 s) before its 2 s deadline even started.
+            self._proof_query_client = TypedRpcClient(
+                'query', self._rpc_identity, server='trader',
+                address=self.trader_typed_address, port=self.typed_query_port,
+            )
+            self._authored_deployments = AuthoredDeployments(
+                client=SandboxClient(LIVE_SOCKET), trader_query=self._proof_query_client,
+                trader_command=self._trader_command_client)
 
         # [M1-F3] Task 8: signal → PENDING proposal bridge for
             # auto_execute: 'propose' strategies. Live requires
@@ -825,6 +837,8 @@ class StrategyRuntime():
         strategy books recover without a manual restart."""
         if strategy.state != StrategyState.ERROR:
             return
+        if isinstance(strategy, AuthoredLiveStrategy) and not strategy.may_recover():
+            return          # each re-enable reopens a session and replays its warm-up: wait after a crash
         if self._load_enabled(strategy.name) is not True:
             return
         strategy.enable()
@@ -889,7 +903,7 @@ class StrategyRuntime():
             key: value for key, value in self._last_dispatched_bar.items() if key[1] != name}
         self._warmup_shortfalls = {
             key: value for key, value in self._warmup_shortfalls.items() if key[1] != name}
-        sys.modules.pop(f'_mmr_strategy_{name}', None)
+        self._drop_ai_instance(name, instance)
         return True
 
     def ai_instances(self) -> Dict[str, Strategy]:
@@ -913,13 +927,7 @@ class StrategyRuntime():
                 self._ai_backfills.discard(name)
 
     def _load_ai_instance(self, name: str, deployment) -> bool:
-        instance = self.load_strategy(
-            name=name, bar_size_str=deployment.bar_size, conids=list(deployment.conids), universe=None,
-            historical_days_prior=AI_HISTORY_DAYS, module=deployment.strategy_path.removeprefix('strategies/'),
-            class_name=deployment.class_name, description=f'AI deployment {deployment.version_digest}',
-            paper_only=True, auto_execute=False, params=dict(deployment.params),
-            ai_binding=AiInstanceBinding(deployment.version_digest, deployment.base_digest,
-                                         deployment.strategy_digest))
+        instance = self._build_ai_instance(name, deployment)
         if instance is None:
             return False
         try:
@@ -927,10 +935,44 @@ class StrategyRuntime():
         except Exception as ex:
             logging.error('AI_HISTORY_BACKFILL_FAILED: %s (conids %s, %s): %s; not loaded, the next reconcile '
                           'retries', name, instance.conids, instance.bar_size, ex)
-            sys.modules.pop(f'_mmr_strategy_{name}', None)
+            self._drop_ai_instance(name, instance)
             return False
         self.strategy_implementations.append(instance)
         return True
+
+    def _build_ai_instance(self, name: str, deployment) -> Optional[Strategy]:
+        if is_authored_path(deployment.strategy_path):
+            return self._build_authored_instance(name, deployment)
+        return self.load_strategy(
+            name=name, bar_size_str=deployment.bar_size, conids=list(deployment.conids), universe=None,
+            historical_days_prior=AI_HISTORY_DAYS, module=deployment.strategy_path.removeprefix('strategies/'),
+            class_name=deployment.class_name, description=f'AI deployment {deployment.version_digest}',
+            paper_only=True, auto_execute=False, params=dict(deployment.params),
+            ai_binding=AiInstanceBinding(deployment.version_digest, deployment.base_digest,
+                                         deployment.strategy_digest))
+
+    def _build_authored_instance(self, name: str, deployment) -> Optional[Strategy]:
+        """No file is read or run here: the authored code stays in the sandbox (SP3 spec 4, 7.6)."""
+        instance = self._authored_deployments.build(name, deployment, storage=self.storage,
+                                                    universe_accessor=self.universe_accessor)
+        if instance is None:
+            return None
+        try:
+            instance.history_depth = self._history_depth_for(instance, AI_HISTORY_DAYS)
+            if self._load_enabled(name) is False:
+                instance.disable()
+        except Exception as ex:
+            logging.error('authored deployment %s is not loaded: %s; the next reconcile retries', name, ex)
+            self._drop_ai_instance(name, instance)
+            return None
+        return instance
+
+    @staticmethod
+    def _drop_ai_instance(name: str, instance: Strategy) -> None:
+        """An instance that never joined the runtime: an authored one must not keep or open a live session."""
+        if isinstance(instance, AuthoredLiveStrategy):
+            instance.close_sessions()
+        sys.modules.pop(f'_mmr_strategy_{name}', None)
 
     def _load_ai_history(self, instance: Strategy) -> None:
         """Run the startup history step for one AI instance from the reconcile thread; raise when it fails."""
@@ -1545,7 +1587,7 @@ class StrategyRuntime():
         in config; the expected mode is ``"live"`` when ``automation_live_enabled``
         is True, otherwise ``"paper"``.
         """
-        from trader.automation.artifact_verifier import ArtifactVerifier, ArtifactVerifierError
+        from trader.automation.artifact_verifier import ArtifactVerifierError
         verifier = self._get_artifact_verifier()
         if verifier is None:
             # Automation not enabled or key ring not configured.  A strategy
@@ -1723,7 +1765,8 @@ class StrategyRuntime():
                 return None
             idx = df.index
             if idx.tz is None:
-                df = df.copy(); df.index = idx.tz_localize('UTC')
+                df = df.copy()
+                df.index = idx.tz_localize('UTC')
             return df
 
         hist = self._hist_bars.get(key)
@@ -2472,6 +2515,12 @@ class StrategyRuntime():
                 source.reconcile()
             except Exception as ex:
                 logging.warning('AI deployment reconcile failed (will retry next cycle): %s', ex)
+        authored = getattr(self, '_authored_deployments', None)
+        if authored is not None:
+            try:
+                authored.send_retirements()      # the proof is read fresh at each OPEN and bar, not cached
+            except Exception as ex:
+                logging.warning('authored retirements not sent (will retry next cycle): %s', ex)
 
         # 2. Re-subscribe all strategies (idempotent — only new conIds trigger publish_contract).
         # Only swallow the well-known transient failures (trader_service bouncing,
@@ -2883,6 +2932,7 @@ class StrategyRuntime():
         await self._serve_control_sockets()
         self._trader_command_client.connect()
         self._trader_query_client.connect()
+        self._proof_query_client.connect()
 
         self.zmq_subscriber = TopicPubSub[Ticker](
             self.zmq_pubsub_server_address,

@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Optional
 
+from trader.ai.author_schema import AUTHOR_MIGRATIONS
 from trader.ai.decision_schema import DECISION_MIGRATIONS
 from trader.ai.research_schema import RESEARCH_MIGRATIONS
 from trader.ai.schema import FOUNDATION_MIGRATIONS, Migration
@@ -76,7 +77,7 @@ RUNTIME_MIGRATIONS: tuple[Migration, ...] = (
 )
 
 ALL_MIGRATIONS: tuple[Migration, ...] = (
-    FOUNDATION_MIGRATIONS + RUNTIME_MIGRATIONS + DECISION_MIGRATIONS + RESEARCH_MIGRATIONS)
+    FOUNDATION_MIGRATIONS + RUNTIME_MIGRATIONS + DECISION_MIGRATIONS + RESEARCH_MIGRATIONS + AUTHOR_MIGRATIONS)
 
 
 def cursor_value_in_tx(conn: Any, name: str) -> int:

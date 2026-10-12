@@ -11,7 +11,7 @@ TABLES = {"ai_research_cycles", "ai_research_candidates", "ai_backtest_judgments
 
 def test_versions_are_30_to_34_and_appended_last():
     assert [m.version for m in RESEARCH_MIGRATIONS] == [30, 31, 32, 33, 34]
-    assert ALL_MIGRATIONS[-5:] == RESEARCH_MIGRATIONS
+    assert tuple(m for m in ALL_MIGRATIONS if 30 <= m.version <= 39) == RESEARCH_MIGRATIONS
 
 
 def test_tables_exist_and_a_second_migrate_is_a_no_op(tmp_path, clock):

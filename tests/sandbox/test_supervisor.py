@@ -122,6 +122,16 @@ def test_a_missing_store_file_is_a_digest_mismatch(tmp_path):
     assert reply["type"] == "ERROR" and reply["code"] == p.SANDBOX_DIGEST_MISMATCH
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
+def test_a_store_file_it_may_not_read_says_permission_not_missing(tmp_path):
+    sup = _supervisor(tmp_path)
+    digest = _store(tmp_path, GOOD)
+    (tmp_path / f"{digest.split(':')[1]}.py").chmod(0o000)
+    reply = sup.handle("live", 1, p.parse_request(_open_frame(digest)))
+    assert reply["code"] == p.SANDBOX_DIGEST_MISMATCH          # ruling 9: the sandbox cannot use the stored bytes
+    assert "unreadable (permission)" in reply["detail"] and "not found" not in reply["detail"]
+
+
 def test_a_tampered_store_file_is_a_digest_mismatch(tmp_path):
     sup = _supervisor(tmp_path)
     digest = _store(tmp_path, GOOD)

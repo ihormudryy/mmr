@@ -43,6 +43,7 @@ from trader.research.rulesets.paper_v1 import PAPER_V1
 from trader.research.schema import DatasetManifestRepository
 from trader.research.statistics import annualized_sharpe_ci, profit_factor
 from trader.research.validation import ValidationPlan, generate_walk_forward
+from trader.sandbox.protocol import RESEARCH_SOCKET
 
 COST_MULTIPLIERS = (1.0, 1.5, 2.0)
 # The image a run used is provenance (the report records it), not identity:
@@ -63,6 +64,8 @@ class EvaluationPaths:
     repo_root: Path
     reports_dir: Path
     summaries_dir: Path
+    # The research sandbox socket an authored strategy runs behind (Plan 4 ruling 13).
+    sandbox_socket: str = RESEARCH_SOCKET
 
 
 @dataclass(frozen=True)
@@ -90,7 +93,7 @@ class PointResult:
 def evaluate(spec: EvaluationSpec, *, research_db: Any, paths: EvaluationPaths,
              now: Callable[[], dt.datetime], max_workers: int = 1,
              ruleset: Ruleset = PAPER_V1) -> EvaluationResult:
-    repository_commit = _repository_commit(paths.repo_root, spec.strategy_file)
+    repository_commit = _commit_of(spec, paths.repo_root)
     registry = ExperimentRegistry(research_db)
     plan = generate_walk_forward((spec.period_start, spec.period_end), n_folds=spec.folds,
                                  embargo=spec.embargo_sessions, holdout=spec.holdout_sessions,
@@ -141,7 +144,8 @@ def run_environment(spec: EvaluationSpec, paths: EvaluationPaths) -> RunEnvironm
         strategy_file=str(spec.strategy_file), class_name=spec.class_name,
         conids=tuple(spec.conids), bar_size=spec.bar_size, order_notional=spec.order_notional,
         account_equity=spec.account_equity, max_gross_allocation=spec.max_gross_allocation,
-        regular_session_calendar=spec.calendar)
+        regular_session_calendar=spec.calendar, authored_digest=spec.authored_digest,
+        sandbox_socket=None if spec.authored_digest is None else paths.sandbox_socket)
 
 
 @dataclass(frozen=True)
@@ -325,6 +329,22 @@ def _dependency_lock_digest(repo_root: Path) -> str:
     return 'unknown'
 
 
+# An authored file is not in git; its digest pins it (the family's source digest).
+AUTHORED_COMMIT = 'authored'
+
+
+def _commit_of(spec: EvaluationSpec, repo_root: Path) -> str:
+    if spec.authored_digest is not None:
+        return AUTHORED_COMMIT
+    return _repository_commit(repo_root, spec.strategy_file)
+
+
+def _source_digest(spec: EvaluationSpec) -> str:
+    if spec.authored_digest is not None:
+        return spec.authored_digest.removeprefix('sha256:')
+    return compute_strategy_hash(str(spec.strategy_file))
+
+
 def _repository_commit(repo_root: Path, strategy_file: Path) -> str:
     """The last commit that touched the strategy file.
 
@@ -352,7 +372,7 @@ def _family(spec: EvaluationSpec, manifest_digest: str, repository_commit: str,
     return ExperimentFamily(
         strategy_path=spec.strategy_path, class_name=spec.class_name,
         repository_commit=repository_commit,
-        source_tree_digest=compute_strategy_hash(str(spec.strategy_file)),
+        source_tree_digest=_source_digest(spec),
         dependency_lock_digest=_dependency_lock_digest(paths.repo_root),
         container_digest=FAMILY_CONTAINER_DIGEST,
         dataset_manifest_digest=manifest_digest,

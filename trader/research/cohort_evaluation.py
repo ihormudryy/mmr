@@ -15,8 +15,8 @@ from trader.research.artifact import ARTIFACT_STATE_RETIRED
 from trader.research.cohort import CohortSpec, previously_revealed, require_fresh_holdout
 from trader.research.eligibility import evaluate_eligibility
 from trader.research.evaluation import (
-    COST_MULTIPLIERS, EvaluationError, EvaluationPaths, HoldoutOutcome, PointResult, _day_end, _day_start, _family, _finish,
-    _fold_specs, _period_session_dates, _point_key, _refuse_if_holdout_opened, _repository_commit, _run_point,
+    COST_MULTIPLIERS, EvaluationError, EvaluationPaths, HoldoutOutcome, PointResult, _commit_of, _day_end, _day_start, _family, _finish,
+    _fold_specs, _period_session_dates, _point_key, _refuse_if_holdout_opened, _run_point,
     _walk_forward_evidence, point_market_context, run_environment, run_holdout)
 from trader.research.evaluation_data import load_bars, load_benchmark_closes, qualify_dataset
 from trader.research.evaluation_store import STAGE_COMPLETE, STAGE_HOLDOUT_FAILED, STAGE_PRE_HOLDOUT
@@ -118,7 +118,7 @@ def evaluate_cohort(spec: CohortSpec, *, research_db: Any, paths: EvaluationPath
     holdout_start = pd.Timestamp(plan.holdout.start).date()
     windows = registry.opened_holdout_windows(base.strategy_path, base.class_name)
     require_fresh_holdout(windows, holdout_start)
-    repository_commit = _repository_commit(paths.repo_root, base.strategy_file)
+    repository_commit = _commit_of(base, paths.repo_root)
     bars = load_bars(paths.history_db, base.conids, base.bar_size, _day_start(base.period_start),
                      _day_end(base.period_end), calendar_name=base.calendar)
     benchmark_closes = load_benchmark_closes(paths.history_db, base)

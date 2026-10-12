@@ -13,6 +13,11 @@ from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Literal, Mapping, Optional
 
+from trader.automation.authored_config import (
+    AuthoredStrategiesConfig,
+    AuthoredStrategiesConfigError,
+    load_authored_strategies_config,
+)
 from trader.automation.backtest_judge_config import (
     BacktestJudgeConfig,
     BacktestJudgeConfigError,
@@ -31,7 +36,7 @@ _REFUSED_ENV_PREFIXES = ("AI_PAPER", "MMR_AI_PAPER")
 _PARSED_KEYS = (
     "enabled", "styles", "limits_ceiling", "experiment_kill_drawdown_pct", "experiment_kill_basis",
     "broker_outage_pause_seconds", "acceptance_probe", "model_budget_usd_per_day",
-    "backtest_judge",
+    "backtest_judge", "authored_strategies",
 )
 _RAW_ONLY_KEYS = ("telegram",)  # parsed by Plan 5
 
@@ -53,6 +58,8 @@ class AiPaperConfig:
     model_budget_usd_per_day: float = DEFAULT_MODEL_BUDGET_USD_PER_DAY
     # SP2c Plan 1 (spec 6.1): evaluation and deployment limits; operator only.
     backtest_judge: BacktestJudgeConfig = field(default_factory=BacktestJudgeConfig)
+    # SP3 Plan 3 (spec 6): the owner switch and the cap for AI-written strategies; operator only.
+    authored_strategies: AuthoredStrategiesConfig = field(default_factory=AuthoredStrategiesConfig)
     raw_section: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
     def style_enabled(self, style: str) -> bool:
@@ -80,6 +87,9 @@ def load_ai_paper_config(
     ceiling = _parse_ceiling(raw.get("limits_ceiling", {}), code_maximum)
     kill_pct = _parse_kill(raw.get("experiment_kill_drawdown_pct"))
     _check_drawdown_guard(ceiling, kill_pct)
+    authored = _parse_authored_strategies(raw.get("authored_strategies"))
+    if authored.enabled and not enabled:
+        raise AiPaperConfigError("ai_paper.authored_strategies.enabled: true requires ai_paper.enabled: true")
     return AiPaperConfig(
         enabled=enabled,
         styles=_parse_styles(raw.get("styles", ["intraday_long"])),
@@ -90,6 +100,7 @@ def load_ai_paper_config(
         acceptance_probe=acceptance_probe,
         model_budget_usd_per_day=_parse_budget(raw.get("model_budget_usd_per_day", DEFAULT_MODEL_BUDGET_USD_PER_DAY)),
         backtest_judge=_parse_backtest_judge(raw.get("backtest_judge")),
+        authored_strategies=authored,
         raw_section=MappingProxyType(copy.deepcopy(dict(raw))),
     )
 
@@ -187,6 +198,13 @@ def _parse_backtest_judge(value: object) -> BacktestJudgeConfig:
     try:
         return load_backtest_judge_config(value)
     except BacktestJudgeConfigError as exc:
+        raise AiPaperConfigError(str(exc)) from None
+
+
+def _parse_authored_strategies(value: object) -> AuthoredStrategiesConfig:
+    try:
+        return load_authored_strategies_config(value)
+    except AuthoredStrategiesConfigError as exc:
         raise AiPaperConfigError(str(exc)) from None
 
 

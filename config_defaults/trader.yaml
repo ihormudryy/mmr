@@ -186,6 +186,10 @@ ai_paper:
     max_cohort_points: 3             # parameter points per evaluation (1-10)
     shadow_warmup_sessions: 5        # sessions of bars that only warm up a shadow replay
     strategy_allowlist: []           # strategies/<file>.py:<Class>; empty = nothing may be evaluated
+  authored_strategies:               # SP3: AI-written strategies; operator only, no env override; restart the trader
+    enabled: false                   # the owner switch: new authored files, their evaluations and their entries
+    max_active: 3                    # authored strategies in STORED, EVALUATING, SHADOW or DEPLOYED (1-3)
+    bar_sizes: [1 min, 5 mins, 15 mins]   # bar sizes an authored file may use; each at most 15 mins
 
 # research service (SP2c): evaluation defaults for AI-proposed candidates. Operator only.
 research_service:

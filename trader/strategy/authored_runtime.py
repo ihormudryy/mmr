@@ -234,7 +234,7 @@ class AuthoredLiveStrategy(Strategy):
         self._consecutive_crashes += 1
         wait = crash_backoff(self._consecutive_crashes)
         self._recover_after = self._now() + wait
-        logger.error("authored strategy %s raised an unexpected error (%d in a row); not re-enabled for %s",
+        logger.warning("authored strategy %s raised an unexpected error (%d in a row); not re-enabled for %s",
                      self.name, self._consecutive_crashes, wait)
 
     def _end_session_with_outage(self, exc: BaseException) -> None:

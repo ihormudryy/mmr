@@ -8,8 +8,10 @@ from types import SimpleNamespace
 
 import pandas as pd
 import pytest
+import zmq
 
 from tests.authored.fake_sandbox import IMAGE_DIGEST, FakeSandbox, caller_source
+from tests.rpc_identity_fixtures import free_port, make_identities
 from tests.test_strategy_artifact_soft_load import _make_runtime, _write_strategy
 from trader.authored.sandbox_client import SandboxProtocolError
 from trader.data.backtest_store import compute_strategy_hash
@@ -18,10 +20,20 @@ from trader.data.strategy_signal_record import StrategySignalRecord
 from trader.messaging.ai_deployment_wire import ActiveAiDeployment
 from trader.messaging.typed_rpc import TypedRpcRemoteError
 from trader.research.strategy_key import authored_strategy_path
-from trader.strategy.ai_deployment_source import AiDeploymentSource, ai_instance_name, source_unchanged
-from trader.strategy.authored_runtime import (ISOLATION_ALARM, PROOF_TIMEOUT_SECONDS, RETIRE_RESEND_CAP,
-                                              AuthoredDeployments, AuthoredLiveStrategy, crash_backoff,
-                                              proof_passes)
+from trader.strategy.ai_deployment_source import (
+    AiDeploymentSource,
+    ai_instance_name,
+    source_unchanged,
+)
+from trader.strategy.authored_runtime import (
+    ISOLATION_ALARM,
+    PROOF_TIMEOUT_SECONDS,
+    RETIRE_RESEND_CAP,
+    AuthoredDeployments,
+    AuthoredLiveStrategy,
+    crash_backoff,
+    proof_passes,
+)
 from trader.trading.strategy import StrategyState
 
 VERSION, CATALOGUE_VERSION = "sha256:" + "d" * 64, "sha256:" + "f" * 64
@@ -293,6 +305,18 @@ def test_a_proof_read_that_times_out_is_false_and_alarms_once(world, caplog):   
     assert world.query.timeouts[-1] == ("get_isolation_proof", PROOF_TIMEOUT_SECONDS) and PROOF_TIMEOUT_SECONDS == 2.0
     world.query.answer("get_isolation_proof", proof())
     assert deployments.is_proven(IMAGE_DIGEST) is True                   # the episode ends on a pass
+
+
+def test_the_proof_client_bounds_its_send_and_its_reply_by_the_proof_timeout(world):     # ruling 1
+    world.rt._rpc_identity = make_identities()["strategy"]
+    world.rt.trader_typed_address, world.rt.typed_query_port = "tcp://127.0.0.1", free_port()
+    client = world.rt._new_proof_query_client()
+    client.connect()
+    try:
+        assert client.timeout == PROOF_TIMEOUT_SECONDS
+        assert client.socket.getsockopt(zmq.SNDTIMEO) == int(PROOF_TIMEOUT_SECONDS * 1000)
+    finally:
+        client.socket.close(linger=0)
 
 
 def test_a_proof_read_that_breaks_unexpectedly_is_false_and_does_not_raise(world):

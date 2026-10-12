@@ -52,7 +52,7 @@ from trader.strategy.ai_deployment_source import (
     ai_instance_name,
     source_unchanged,
 )
-from trader.strategy.authored_runtime import AuthoredDeployments, AuthoredLiveStrategy
+from trader.strategy.authored_runtime import PROOF_TIMEOUT_SECONDS, AuthoredDeployments, AuthoredLiveStrategy
 from trader.strategy.history_depth import (
     HISTORY_BELOW_WARMUP,
     HISTORY_DEPTH_CAPPED,
@@ -719,13 +719,7 @@ class StrategyRuntime():
                 query_client=self._trader_query_client)
             self._ai_deployment_source = AiDeploymentSource(
                 runtime=self, read_active=self._read_active_ai_deployments, paper=bool(self.paper_trading))
-            # The isolation proof is read on the tick thread before every authored bar. Its own query socket:
-            # a call holds its client's lock until it ends, so on the shared client a bar would wait behind a
-            # reconcile read (up to 10 s) before its 2 s deadline even started.
-            self._proof_query_client = TypedRpcClient(
-                'query', self._rpc_identity, server='trader',
-                address=self.trader_typed_address, port=self.typed_query_port,
-            )
+            self._proof_query_client = self._new_proof_query_client()
             self._authored_deployments = AuthoredDeployments(
                 client=SandboxClient(LIVE_SOCKET), trader_query=self._proof_query_client,
                 trader_command=self._trader_command_client)
@@ -751,6 +745,15 @@ class StrategyRuntime():
                 TraderConnectionException,
                 message='strategy_runtime.connect() exception', inner=ex
             )
+
+    def _new_proof_query_client(self) -> TypedRpcClient:
+        """The isolation proof is read on the tick thread before every authored bar, so it gets its own socket:
+        a call holds its client's lock until it ends, and on the shared client a bar would wait behind a
+        reconcile read. The client timeout also bounds the send to a trader that is down (SNDTIMEO)."""
+        return TypedRpcClient(
+            'query', self._rpc_identity, server='trader',
+            address=self.trader_typed_address, port=self.typed_query_port, timeout=PROOF_TIMEOUT_SECONDS,
+        )
 
     def _read_active_ai_deployments(self):
         return self._trader_query_client.call(
@@ -903,7 +906,7 @@ class StrategyRuntime():
             key: value for key, value in self._last_dispatched_bar.items() if key[1] != name}
         self._warmup_shortfalls = {
             key: value for key, value in self._warmup_shortfalls.items() if key[1] != name}
-        self._drop_ai_instance(name, instance)
+        self._release_instance(name, instance)
         return True
 
     def ai_instances(self) -> Dict[str, Strategy]:
@@ -935,7 +938,7 @@ class StrategyRuntime():
         except Exception as ex:
             logging.error('AI_HISTORY_BACKFILL_FAILED: %s (conids %s, %s): %s; not loaded, the next reconcile '
                           'retries', name, instance.conids, instance.bar_size, ex)
-            self._drop_ai_instance(name, instance)
+            self._release_instance(name, instance)
             return False
         self.strategy_implementations.append(instance)
         return True
@@ -963,13 +966,14 @@ class StrategyRuntime():
                 instance.disable()
         except Exception as ex:
             logging.error('authored deployment %s is not loaded: %s; the next reconcile retries', name, ex)
-            self._drop_ai_instance(name, instance)
+            self._release_instance(name, instance)
             return None
         return instance
 
     @staticmethod
-    def _drop_ai_instance(name: str, instance: Strategy) -> None:
-        """An instance that never joined the runtime: an authored one must not keep or open a live session."""
+    def _release_instance(name: str, instance: Strategy) -> None:
+        """Called for every instance that leaves the runtime or never joined it: an authored one must not keep
+        or open a live session."""
         if isinstance(instance, AuthoredLiveStrategy):
             instance.close_sessions()
         sys.modules.pop(f'_mmr_strategy_{name}', None)

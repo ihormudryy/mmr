@@ -247,6 +247,10 @@ All other rulings:
 - Plan 1, all other rulings: see the plan's Rulings section.
 - Plan 2, all other rulings: see the plan's Rulings section.
 - Plan 3, all other rulings: see the plan's Rulings section.
+- Plan 3, made during the build (2026-10-12):
+  - Retirement, refresh and proof writes take the trader journal's write lock, the same lock as the saga's SUBMITTING write, so a retirement and a send (or a failed proof and the seal) never commit without seeing each other under DuckDB snapshot isolation.
+  - A retirement whose withdrawal fails for a reason other than an SP2c refusal replies `REFUSED AUTHORED_WITHDRAWAL_FAILED` with `retryable: true` and the record already `RETIRED`; `refresh()` withdraws again; Plan 4's resend loop caps its resends.
+  - `tests/fullstack/test_prove_isolation_in_research.py` is written but not run: Plan 2's runner starts no `research` service. Plan 5's acceptance runs it.
 - Plan 4, all other rulings: see the plan's Rulings section (R1-R6 in its "Cross-plan requirements" are settled).
 - Plan 5, all other rulings: see the plan's Rulings section.
 
@@ -254,6 +258,7 @@ All other rulings:
 
 - Per task: targeted pytest. Full suite once per plan in its last task, under the shared
   lock (`/private/tmp/mmr-suite.lock`), `-n 8 --timeout=120`.
-- No real model, IB or network calls. Container tests (Plan 2 Task 11, Plan 3's
-  `tests/fullstack/test_prove_isolation_in_research.py`) run in the `fullstack-tests` compose profile against the
-  real `sandbox` stanza (`scripts/run_sandbox_fullstack.sh`), never against the live stack.
+- No real model, IB or network calls. Plan 2's container tests run in the `fullstack-tests` compose profile against
+  the real `sandbox` stanza (`scripts/run_sandbox_fullstack.sh`), never against the live stack. Plan 3's
+  `tests/fullstack/test_prove_isolation_in_research.py` needs a `research` service that runner does not start; Plan 5's
+  acceptance runs it.

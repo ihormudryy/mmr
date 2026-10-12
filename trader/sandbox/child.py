@@ -313,6 +313,7 @@ class SpawnSpec:
 
 
 class ChildHandle(Protocol):
+    """One session's child. Any ChildError from ``send_bar`` ends the session: the caller must ``close()``."""
     pid: int
 
     def send_bar(self, conid: int, t: datetime, ohlcv: Mapping[str, float]) -> dict: ...
@@ -343,7 +344,7 @@ class ForkSpawner:
             _kill_and_reap(pid)
             parent_sock.close()
             raise ChildError(getattr(exc, "detail", f"child load failed: {exc}")) from exc
-        return _ForkedChild(pid=pid, sock=parent_sock, reply_timeout_s=self._bar_timeout)
+        return _ForkedChild(pid=pid, pipe=_ChildPipe(sock=parent_sock, reply_timeout_s=self._bar_timeout))
 
 
 def _run_forked_child(spec: SpawnSpec, sock: socket.socket) -> None:
@@ -469,11 +470,19 @@ def _serve_session(spec: SpawnSpec, sock: socket.socket) -> int:
 def _bar_request(request: Mapping[str, Any]) -> tuple[int, datetime, Any]:
     try:
         return int(request["conid"]), datetime.fromisoformat(request["t"]), request["ohlcv"]
-    except (KeyError, TypeError, ValueError) as exc:
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
         raise ChildError(f"malformed bar request: {type(exc).__name__}") from exc
 
 
+def _require_child_pid(pid: Any) -> int:
+    """One real child: kill(0) would signal the process group and kill(-1) every process the uid owns."""
+    if type(pid) is not int or pid <= 0:
+        raise ValueError(f"pid must be a positive int, got {pid!r}")
+    return pid
+
+
 def _kill_and_reap(pid: int) -> None:
+    _require_child_pid(pid)
     try:
         os.kill(pid, 9)   # SIGKILL: this is what CAP_KILL is for (own children only)
     except ProcessLookupError:
@@ -485,23 +494,48 @@ def _kill_and_reap(pid: int) -> None:
 
 
 @dataclass
-class _ForkedChild:
-    pid: int
+class _ChildPipe:
+    """The parent's end of one child's socket. After any failure it stays dead: a later bar fails fast."""
     sock: socket.socket
     reply_timeout_s: float
+    dead: bool = False
 
     def send_bar(self, conid: int, t: datetime, ohlcv: Mapping[str, float]) -> dict:
+        if self.dead:
+            raise ChildError("child is no longer usable after an earlier failure")
         try:
             send_frame(self.sock, {"type": "BAR", "conid": conid,
                                    "t": t.astimezone(timezone.utc).isoformat(), "ohlcv": dict(ohlcv)})
             return signal_from_reply(recv_frame(self.sock, self.reply_timeout_s))
+        except ChildError:
+            self.dead = True
+            raise
         except OSError as exc:   # the child died or was killed mid-bar
+            self.dead = True
             raise ChildError(f"child pipe failed: {exc}") from exc
 
     def close(self) -> None:
-        # Kill first: a child looping or ignoring CLOSE must die so its slot and pid free (CAP_KILL).
-        _kill_and_reap(self.pid)
+        self.dead = True
         try:
             self.sock.close()
         except OSError:
             pass
+
+
+@dataclass
+class _ForkedChild:
+    """A forked child. On any ChildError from ``send_bar`` the caller must ``close()`` it: a fault, a timeout
+    or a dead pipe all end the session, and only ``close()`` kills the process and frees the slot."""
+    pid: int
+    pipe: _ChildPipe
+
+    def __post_init__(self) -> None:
+        _require_child_pid(self.pid)
+
+    def send_bar(self, conid: int, t: datetime, ohlcv: Mapping[str, float]) -> dict:
+        return self.pipe.send_bar(conid, t, ohlcv)
+
+    def close(self) -> None:
+        # Kill first: a child looping or ignoring CLOSE must die so its slot and pid free (CAP_KILL).
+        _kill_and_reap(self.pid)
+        self.pipe.close()

@@ -554,12 +554,65 @@ def test_a_silent_peer_times_out():
 def test_a_bar_reply_has_one_deadline_too():
     left, right = socket.socketpair()
     with left, right:
-        handle = child_module._ForkedChild(pid=-1, sock=right, reply_timeout_s=0.3)
+        pipe = child_module._ChildPipe(sock=right, reply_timeout_s=0.3)
         _trickle(left)
         started = time.monotonic()
         with pytest.raises(ChildError, match="timed out"):
-            handle.send_bar(C1, T0, BAR)
+            pipe.send_bar(C1, T0, BAR)
         assert time.monotonic() - started < 0.3 + 0.2
+
+
+def test_a_pipe_that_failed_once_fails_fast_after():
+    left, right = socket.socketpair()
+    with left, right:
+        pipe = child_module._ChildPipe(sock=right, reply_timeout_s=0.2)
+        with pytest.raises(ChildError, match="timed out"):
+            pipe.send_bar(C1, T0, BAR)
+        child_module.send_frame(left, {"ok": True, "signal": {"action": None, "probability": None}})
+        started = time.monotonic()
+        with pytest.raises(ChildError, match="no longer usable"):
+            pipe.send_bar(C1, T0 + timedelta(minutes=1), BAR)
+        assert time.monotonic() - started < 0.05
+
+
+def test_a_pipe_that_got_a_fault_reply_fails_fast_after():
+    left, right = socket.socketpair()
+    with left, right:
+        pipe = child_module._ChildPipe(sock=right, reply_timeout_s=1.0)
+        child_module.send_frame(left, {"ok": False, "detail": "on_bar raised ZeroDivisionError"})
+        with pytest.raises(ChildError, match="ZeroDivisionError"):
+            pipe.send_bar(C1, T0, BAR)
+        with pytest.raises(ChildError, match="no longer usable"):
+            pipe.send_bar(C1, T0 + timedelta(minutes=1), BAR)
+
+
+@pytest.mark.parametrize("pid", [0, -1, -42, True, 1.5])
+def test_a_handle_refuses_a_pid_that_is_not_one_child(pid, monkeypatch):
+    # kill(-1) signals every process the uid owns; kill(0) the whole process group.
+    monkeypatch.setattr(child_module.os, "kill", lambda *args: pytest.fail("os.kill was called"))
+    left, right = socket.socketpair()
+    with left, right:
+        with pytest.raises(ValueError, match="pid"):
+            child_module._ForkedChild(pid=pid, pipe=child_module._ChildPipe(sock=right, reply_timeout_s=1.0))
+
+
+@pytest.mark.parametrize("pid", [0, -1, True])
+def test_kill_and_reap_refuses_a_pid_that_is_not_one_child(pid, monkeypatch):
+    monkeypatch.setattr(child_module.os, "kill", lambda *args: pytest.fail("os.kill was called"))
+    monkeypatch.setattr(child_module.os, "waitpid", lambda *args: pytest.fail("os.waitpid was called"))
+    with pytest.raises(ValueError, match="pid"):
+        child_module._kill_and_reap(pid)
+
+
+@pytest.mark.parametrize("request_body", [
+    {"conid": float("inf"), "t": T0.isoformat(), "ohlcv": BAR},
+    {"conid": float("nan"), "t": T0.isoformat(), "ohlcv": BAR},
+    {"conid": C1, "t": 5, "ohlcv": BAR},
+    {"t": T0.isoformat(), "ohlcv": BAR},
+])
+def test_a_malformed_bar_request_is_a_clean_fault(request_body):
+    with pytest.raises(ChildError, match="malformed bar request"):
+        child_module._bar_request(request_body)
 
 
 def test_a_long_child_detail_is_truncated():

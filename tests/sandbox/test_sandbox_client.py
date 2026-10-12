@@ -252,6 +252,14 @@ def test_a_digest_mismatch_is_a_fault_with_its_code(stack):
     assert exc.value.code == p.SANDBOX_DIGEST_MISMATCH
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
+def test_an_unreadable_store_file_is_unavailable_not_a_fault(stack):          # ruling 34
+    digest = stack.store(GOOD)
+    (stack.store_dir / f"{digest.split(':')[1]}.py").chmod(0o000)
+    with pytest.raises(SandboxUnavailable, match="unreadable"):
+        SandboxClient(stack.live).open_session(digest, "Counter", {}, "1 min", [C1])
+
+
 def test_a_static_rejection_is_a_sandbox_error_fault(stack):
     bad = "import os\nfrom trader.authored.api import AuthoredStrategy, Decision\n" \
           "class S(AuthoredStrategy):\n    LOOKBACK_BARS = 2\n" \

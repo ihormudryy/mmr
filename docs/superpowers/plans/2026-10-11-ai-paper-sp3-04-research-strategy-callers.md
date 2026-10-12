@@ -64,7 +64,7 @@ What Plan 2 shipped that this plan's code and tests must follow:
 - A sandbox-side failure (fork or socketpair, the child's privilege drop, rlimits or setup, an internal error) is the new code `SANDBOX_UNAVAILABLE` (Plan 2 ruling 34); `SandboxClient` raises `SandboxUnavailable` for it, as for `SANDBOX_BUSY`. Only `SANDBOX_ERROR` and `SANDBOX_DIGEST_MISMATCH` are faults of the strategy (rulings 8, 9 here are unchanged).
 - An in-process harness that calls `Supervisor.handle` must give each session its own `conn_id` (one session per connection, Plan 2 ruling 7) and pass `wiper=lambda slot: True` (the real wiper forks a helper); Task 11's harness (`tests/authored/test_orb_equivalence.py`) does both.
 - A harness that serves sockets (`trader.sandbox.server.serve`) must pass `socket_gid=os.getgid()` and use a short socket directory (`tempfile.mkdtemp(prefix="sbx", dir="/tmp")`): macOS caps a Unix socket path at 104 bytes.
-- Plan 3 writes store files as regular 0644 files: the sandbox opens them with `O_NOFOLLOW` and refuses a symlink, a FIFO or an unreadable file (`SANDBOX_DIGEST_MISMATCH`, Plan 2 ruling 9).
+- Plan 3 writes store files as regular 0644 files: the sandbox opens them with `O_NOFOLLOW` and refuses a symlink or a FIFO (`SANDBOX_DIGEST_MISMATCH`, Plan 2 ruling 9); a file it may not read is `SANDBOX_UNAVAILABLE` (an operations problem, Plan 2 ruling 34).
 
 ## Cross-plan requirements
 

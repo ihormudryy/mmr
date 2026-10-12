@@ -266,7 +266,7 @@ The `sandbox` service (`trader/sandbox_service.py`, `trader/sandbox/`) runs code
 - `OPEN {digest, class, params, bar_size, conids}` gives `OPENED {session, image_digest}`. `OPEN_PROBE {kind, name, conids}` is the same for the isolation checks. It loads a file from the image only (`trader/sandbox/probes/` or `tests/authored/escapes/`), by a name that matches `[a-z0-9_]{1,64}`, and only on the research socket. It is the only path that skips the static check, and it is refused `SANDBOX_BUSY` while a live session is open.
 - `BAR {session, conid, t, open, high, low, close, volume}` gives `SIGNAL {action, probability}`. Times are UTC ISO-8601 and must strictly increase per conid.
 - `CLOSE {session}` gives `CLOSED`.
-- Errors carry a code: `SANDBOX_ERROR` (the strategy failed: its load, `on_bar`, output or time, or the static check), `SANDBOX_DIGEST_MISMATCH` (store file missing, unreadable or not a regular file, bytes do not match, or class differs), `SANDBOX_BUSY` (no free slot), `SANDBOX_UNAVAILABLE` (the sandbox itself failed: fork, the child's privilege drop, rlimits or setup, an internal error; ruling 34), `SANDBOX_BAD_REQUEST` (a caller mistake).
+- Errors carry a code: `SANDBOX_ERROR` (the strategy failed: its load, `on_bar`, output or time, or the static check), `SANDBOX_DIGEST_MISMATCH` (store file missing or not a regular file, bytes do not match, or class differs), `SANDBOX_BUSY` (no free slot), `SANDBOX_UNAVAILABLE` (the sandbox itself failed: fork, the child's privilege drop, rlimits or setup, a store file it may not read, an internal error; ruling 34), `SANDBOX_BAD_REQUEST` (a caller mistake).
 
 **Pools and sockets.**
 

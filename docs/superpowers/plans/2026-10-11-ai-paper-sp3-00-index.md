@@ -187,9 +187,9 @@ Security:
 - Plan 2 ruling 6: the 2 s step limit covers the class load at `OPEN` as well as each `BAR`.
 - Plan 2 ruling 7: one session per connection; the child is killed when the caller's connection closes, so a crashed caller cannot leak a slot.
 - Plan 2 ruling 8: new code `SANDBOX_BAD_REQUEST` for caller mistakes (client: `SandboxProtocolError`); it is neither availability nor a strategy fault.
-- Plan 2 ruling 9: a missing store file or a class that differs from the file's class is `SANDBOX_DIGEST_MISMATCH`; a static rejection at `OPEN` is `SANDBOX_ERROR` with `AUTHORED_STATIC_REJECTED:<rule>`.
+- Plan 2 ruling 9: a missing store file, one that is not a regular file, bytes that do not match or a class that differs from the file's class is `SANDBOX_DIGEST_MISMATCH` (a store file the sandbox may not read is `SANDBOX_UNAVAILABLE`, ruling 34); a static rejection at `OPEN` is `SANDBOX_ERROR` with `AUTHORED_STATIC_REJECTED:<rule>`.
 - Plan 2 ruling 10: `PONG` carries `image_digest`, `boot_id`, `pid`, `pool`, `free`, `size`, `live_open` and `posture`; `SandboxInfo` carries the same fields except `pid` (additive to the index).
-- Plan 2 ruling 34 (final review, controller ruling 2026-10-12, spec 8): a sandbox-side failure (fork or socketpair, the child's privilege drop, rlimits or setup, an internal error) is the new code `SANDBOX_UNAVAILABLE`, which the client raises as `SandboxUnavailable`; only a fault the strategy caused stays `SANDBOX_ERROR` or `SANDBOX_DIGEST_MISMATCH`.
+- Plan 2 ruling 34 (final review, controller ruling 2026-10-12, spec 8): a sandbox-side failure (fork or socketpair, the child's privilege drop, rlimits or setup, a store file it may not read, an internal error) is the new code `SANDBOX_UNAVAILABLE`, which the client raises as `SandboxUnavailable`; only a fault the strategy caused stays `SANDBOX_ERROR` or `SANDBOX_DIGEST_MISMATCH`.
 - Plan 2 ruling 12: the fake child is a `Supervisor` test argument only; the service always uses `ForkSpawner` and no option, env var or argument can change it; a test pins that no `trader/` module imports `tests`.
 - Plan 2 ruling 13: a failed tmpfs wipe quarantines the slot (never reused, logged at ERROR, `PONG.free` drops).
 - Plan 2 ruling 14: `init: true` and `ipc: none`; `entrypoint` replaces `docker-entrypoint.sh`.

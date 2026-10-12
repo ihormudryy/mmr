@@ -355,11 +355,13 @@ def _static_rejected(rules: str) -> dict:
 
 def _read_regular_file(path: Path, max_bytes: int) -> bytes:
     """Read a store file the trader wrote: a regular file only (no symlink, no FIFO that would block), and
-    no more than ``max_bytes``. A missing, unreadable or wrong-kind file is a digest mismatch (ruling 9)."""
+    no more than ``max_bytes``. A missing or wrong-kind file is a digest mismatch (ruling 9). A file the sandbox may
+    not read (EACCES, EPERM) is an operations problem, not the strategy's: availability (ruling 34)."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except PermissionError:   # Plan 3 writes 0644 files: a mode or owner problem, not a missing file
-        raise _OpenRefused(proto.SANDBOX_DIGEST_MISMATCH, "store file unreadable (permission)") from None
+        log.error("store file %s is unreadable (permission)", path.name)
+        raise _OpenRefused(proto.SANDBOX_UNAVAILABLE, "store file unreadable (permission)") from None
     except OSError:
         raise _OpenRefused(proto.SANDBOX_DIGEST_MISMATCH, "store file not found or not a regular file") from None
     try:

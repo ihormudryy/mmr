@@ -128,8 +128,37 @@ def test_a_store_file_it_may_not_read_says_permission_not_missing(tmp_path):
     digest = _store(tmp_path, GOOD)
     (tmp_path / f"{digest.split(':')[1]}.py").chmod(0o000)
     reply = sup.handle("live", 1, p.parse_request(_open_frame(digest)))
-    assert reply["code"] == p.SANDBOX_DIGEST_MISMATCH          # ruling 9: the sandbox cannot use the stored bytes
+    assert reply["code"] == p.SANDBOX_UNAVAILABLE              # ruling 34: an operations problem, not the strategy
     assert "unreadable (permission)" in reply["detail"] and "not found" not in reply["detail"]
+    assert sup.pong("live")["free"] == 3
+
+
+def test_a_store_file_refused_with_eperm_is_also_unavailable(tmp_path, monkeypatch):
+    sup = _supervisor(tmp_path)
+    digest = _store(tmp_path, GOOD)
+    real_open = os.open
+
+    def refuse(path, *args, **kwargs):
+        if str(path).endswith(".py"):
+            raise PermissionError(1, "Operation not permitted")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", refuse)
+    reply = sup.handle("live", 1, p.parse_request(_open_frame(digest)))
+    assert reply["code"] == p.SANDBOX_UNAVAILABLE and "unreadable (permission)" in reply["detail"]
+
+
+def test_a_store_path_that_is_a_symlink_or_not_a_file_stays_a_digest_mismatch(tmp_path):     # ruling 9
+    sup = _supervisor(tmp_path)
+    digest = _store(tmp_path, GOOD)
+    stored = tmp_path / f"{digest.split(':')[1]}.py"
+    target = tmp_path / "elsewhere.py"
+    stored.rename(target)
+    stored.symlink_to(target)
+    assert sup.handle("live", 1, p.parse_request(_open_frame(digest)))["code"] == p.SANDBOX_DIGEST_MISMATCH
+    stored.unlink()
+    stored.mkdir()
+    assert sup.handle("live", 2, p.parse_request(_open_frame(digest)))["code"] == p.SANDBOX_DIGEST_MISMATCH
 
 
 def test_a_tampered_store_file_is_a_digest_mismatch(tmp_path):

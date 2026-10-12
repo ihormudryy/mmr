@@ -77,7 +77,7 @@ Shapes this plan uses, as Plans 1–4 wrote them on 2026-10-11 (the owner plan's
 - Its socket directory is short, `tempfile.mkdtemp(prefix="sbx", dir="/tmp")`, not under `tmp_path`: macOS caps a Unix socket path at 104 bytes.
 - One session per connection (Plan 2 ruling 7): every session opens its own `SandboxClient` connection, so it gets its own `conn_id`; a second `OPEN` on one connection is `SANDBOX_BAD_REQUEST`.
 - A sandbox-side failure is the new code `SANDBOX_UNAVAILABLE` (Plan 2 ruling 34), raised by the client as `SandboxUnavailable` like `SANDBOX_BUSY`; only `SANDBOX_ERROR` and `SANDBOX_DIGEST_MISMATCH` are faults of the strategy.
-- Plan 3 writes store files as regular 0644 files; the sandbox refuses a symlink, a FIFO or an unreadable file (`SANDBOX_DIGEST_MISMATCH`, Plan 2 ruling 9).
+- Plan 3 writes store files as regular 0644 files; the sandbox refuses a symlink or a FIFO (`SANDBOX_DIGEST_MISMATCH`, Plan 2 ruling 9); a file it may not read is `SANDBOX_UNAVAILABLE` (an operations problem, Plan 2 ruling 34).
 
 **Plan 4 (research and strategy):** research connects through `trader.research.authored_backtest.connect_sandbox(socket_path)` on `EvaluationPaths.sandbox_socket` (default `RESEARCH_SOCKET`; this plan's acceptance world sets that field, decision D7); the strategy service's authored loader builds `SandboxClient(LIVE_SOCKET)` in `trader/strategy/authored_runtime.py` and checks `get_isolation_proof` before it loads. Research takes the cohort's point-0 names as the tunables and trusts the trader's claim for names and ranges (Plan 4 ruling 5).
 

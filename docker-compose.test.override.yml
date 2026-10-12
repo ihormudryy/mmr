@@ -32,3 +32,8 @@ services:
     command: ["python", "-m", "trader.trader_service", "--simulation", "True"]
     environment:
       MMR_FAKE_BROKER: "1"
+  # Ruling 18: the container tests use research's real socket mount without its real service
+  # (which needs keys and a trader), so research joins the test profile and just sleeps.
+  research:
+    profiles: ["ai", "test"]
+    command: ["sleep", "infinity"]

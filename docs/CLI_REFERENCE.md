@@ -207,6 +207,8 @@ ai-deployment register-discretionary --operator owner --statement "x" --stock-ty
 ai-deployment show sha256:...                # a sealed deployment, its kind and provenance
 ai-deployment version sha256:...             # a judged deployment version and its state; exit 1 if unknown
 ai-deployment withdraw sha256:... --reason "x"   # operator; ends that version for good; exit 1 on a refusal
+ai-author list                               # PAPER AI-written strategies: states, switch, cap, judged count (cli or dashboard)
+ai-author prove-isolation                    # operator, host only: isolation checks on the running sandbox build, recorded as cli; exit 1 unless all pass
 scoreboard                                   # PAPER scoreboard of the latest experiment ('-' = unknown)
 --json scoreboard --experiment exp-<20 hex>  # the report as JSON: {"data": ..., "title": "Scoreboard (paper)"}
 scoreboard verify                            # rebuild every number from stored inputs; exit 1 on any mismatch
@@ -269,6 +271,34 @@ by a new broker plan. It returns `{"version_digest", "withdrawn": true,
 `DEPLOYMENT_VERSION_UNKNOWN`, `PERMISSION_DENIED`) prints the code and exits 1. A version that was already renewed
 is refused with `VERSION_SUPERSEDED`, which names its successor: withdraw that version instead. A withdrawn version cannot be renewed; trading the strategy again needs a new DEPLOY judgment and registration.
 
+### `ai-author` (SP3 AI-written strategies)
+
+The `ai` service's `author` role writes at most one strategy file per night. The trader stores it by its
+sha256 digest and keeps one record per file: `STORED`, `EVALUATING`, `SHADOW`, `DEPLOYED` (these count toward
+`ai_paper.authored_strategies.max_active`, at most 3), or the final `REJECTED`, `RETIRED`, `EXPIRED`, `FAILED`
+with a reason (`SANDBOX_ERROR`, `SANDBOX_UNAVAILABLE`, `JEV_REJECT`, `JEV_NO_VERDICT`, `OWNER_RETIRED`,
+`SHADOW_EXPIRED`, `DEPLOY_EXPIRED`, `RENEWAL_ENDED`). A `SHADOW` record with reason `AWAITING_REGISTRATION`
+was judged DEPLOY and waits for an isolation proof.
+
+`list` (typed `list_authored_strategies`) prints `{"enabled", "max_active", "counted", "room", "judged_count",
+"bar_sizes", "records"}`.
+
+`prove-isolation` runs on the host only. It runs `mmr ai-author prove-isolation --in-container` inside the
+`research` container (`docker compose exec -T research`, the research socket and pool). That step runs the
+sandbox checks: the supervisor's posture from `PONG` (capabilities SETUID/SETGID/KILL only, seccomp, no-new-privileges,
+network none, read-only root, pids limit 64, no provider variables), a benign session and every hostile escape. It
+prints one JSON proof with the build id the sandbox reports. The step refuses with `LIVE_SESSIONS_OPEN` (exit 3, nothing
+printed) while the sandbox reports an open live session, before or after the run. The host checks the JSON and records it
+with typed `record_isolation_proof` as `cli`. The newest proof of a build is the run that ran last (`ran_at`); a failing
+run at the same moment as a pass wins. A proof whose `ran_at` is more than 5 minutes after the trader's clock is
+refused with the RPC error `PROOF_FROM_THE_FUTURE` and not stored. Until every build research reported `STARTED` on the record's evaluation, and the
+build it reported last, has a passing newest proof, the trader refuses an authored registration with
+`AUTHORED_ISOLATION_UNPROVEN`. A record past its `SHADOW` window is refused `AUTHORED_STATE_CONFLICT` even before a
+`list` expires it. A rebuilt image needs a new run. The strategy service's own check at load (the build id its `PING`
+sees must have a passing proof) arrives with SP3 Plan 4; until then an authored path does not load in the strategy
+service at all.
+`--compose "podman compose"` uses another compose command.
+
 ## Command Service Requirements
 
 **No service needed** (fully local / REST keys only):
@@ -291,6 +321,7 @@ is refused with `VERSION_SUPERSEDED`, which names its successor: withdraw that v
 - `experiment status|start|pause|resume|stop` (SP1 experiments; paper only)
 - `ai-policy show|publish` (SP2 operator AI risk policy; paper only; `publish` signs as `cli`)
 - `ai-deployment register-discretionary|show|version|withdraw` (SP2 discretionary deployment and SP2c judged versions; paper only; `register-discretionary` and `withdraw` sign as `cli`)
+- `ai-author list|prove-isolation` (SP3 authored strategies; paper only; `prove-isolation` runs on the host and signs as `cli`)
 - `experiment acceptance preflight|run|finish` (SP1 acceptance, host only; `run` and `finish` sign with the `ai_supervisor` key, plus `cli` with `--place-orders`; a real `run` needs `--deployment-version`); `experiment acceptance status|verify-report` are local
 - `flatten --reason TEXT [--wait] [--yes]` (paper only; typed `liquidate_account`, prints `FLAT` only on broker evidence)
 - `scoreboard`, `scoreboard verify` (SP1 scoreboard; reads the journal, not IB, so no IB-upstream check)

@@ -22,6 +22,7 @@ from trader.automation.ai_paper_config import SUPPORTED_STYLES
 from trader.data.schema_migrations import SchemaMigrator
 from trader.objects import BarSize
 from trader.research.canonical import canonical_json_bytes
+from trader.research.strategy_key import is_authored_path
 
 AI_DEPLOYMENT_MIGRATION_VERSION = 55
 STRATEGY_DIGEST_PROVENANCE = "CLAIMED_NOT_VERIFIED"
@@ -80,6 +81,13 @@ def _evidence_ref(name: str, value: Any) -> str:
     return value
 
 
+def _strategy_path(name: str, value: Any) -> str:
+    """A catalogue file under strategies/, or an authored file named by its digest (SP3 Plan 3 ruling 1)."""
+    if isinstance(value, str) and (_PATH.fullmatch(value) or is_authored_path(value)):
+        return value
+    raise _invalid(name, f"must match {_PATH.pattern} or ^authored:sha256:[0-9a-f]{{64}}$")
+
+
 def _positive_number(name: str, value: Any) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
         raise _invalid(name, "must be a finite number > 0")
@@ -115,7 +123,7 @@ def _params(name: str, value: Any) -> Mapping[str, Any]:
 
 
 _VALIDATORS: dict[str, Callable[[str, Any], Any]] = {
-    "strategy_path": _matching(_PATH),
+    "strategy_path": _strategy_path,
     "strategy_digest": _matching(_SHA256),
     "class_name": _matching(_CLASS),
     "params": _params,

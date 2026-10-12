@@ -276,7 +276,7 @@ The `sandbox` service (`trader/sandbox_service.py`, `trader/sandbox/`) runs code
 | research | `/run/sandbox-research/sandbox.sock` | 4 | exactly 1 |
 
 - Each socket sits in its own named volume (`mmr_sandbox_live`, `mmr_sandbox_research`). The supervisor joins group `trader` (gid 1000), sets the directory to root:trader 0750 and the socket to mode 0660. A child never sees a socket.
-- Who mounts them: `sandbox` mounts both. `strategy` mounts the live volume. `research` mounts the research volume. `sandbox` also mounts the read-only authored store (`mmr_authored_strategies` at `/store`). Nothing else.
+- Who mounts them: `sandbox` mounts both. `strategy` mounts the live volume. `research` mounts the research volume. `sandbox` also mounts the authored store (`mmr_authored_strategies` at `/store`) read-only; `trader` mounts it read-write at the same path and is its only writer (SP3 Plan 3). Nothing else.
 - One session per connection. When the connection closes, for any reason, the child is killed and the slot is wiped and freed.
 
 **At OPEN (store path).** The supervisor reads `/store/<hex>.py`, re-hashes the bytes against the digest, runs `require_clean` (the static check) on exactly those bytes, and checks that the class in the file is the requested class. Only then does it fork. A static refusal is `SANDBOX_ERROR` with detail `AUTHORED_STATIC_REJECTED:<rule>`.

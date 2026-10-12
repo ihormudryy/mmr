@@ -1700,6 +1700,7 @@ def register_ai_paper_authority(registry: TypedRpcRegistry, coordinator: Trading
     _register_ai_deployment_versions(registry, coordinator, ai_paper, account_id=account_id)
     _register_ai_discovery(registry, ai_paper)
     _register_backtest_judge(registry, ai_paper)
+    _register_authored(registry, ai_paper)
 
 
 def _register_ai_deployment_versions(registry: TypedRpcRegistry, coordinator: TradingCommandCoordinator,
@@ -1736,6 +1737,15 @@ def _register_backtest_judge(registry: TypedRpcRegistry, ai_paper) -> None:
         raise RuntimeError(f"the ai_paper stack is missing its backtest-judge services: {', '.join(missing)}")
     register_backtest_judge_surface(registry, claims=ai_paper.claims, judgments=ai_paper.judgments,
                                     forward_evidence=ai_paper.forward_evidence)
+
+
+def _register_authored(registry: TypedRpcRegistry, ai_paper) -> None:
+    """SP3 Plan 3: authored strategies, only on an enabled ai_paper stack, which is paper only."""
+    from trader.messaging.authored_surface import register_authored_surface
+    missing = [name for name in ("authored", "proofs") if getattr(ai_paper, name, None) is None]
+    if missing:
+        raise RuntimeError(f"the ai_paper stack is missing its authored-strategy services: {', '.join(missing)}")
+    register_authored_surface(registry, authored=ai_paper.authored, proofs=ai_paper.proofs)
 
 
 def _register_ai_discovery(registry: TypedRpcRegistry, ai_paper) -> None:

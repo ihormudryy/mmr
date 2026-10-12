@@ -15,7 +15,8 @@ def test_default_rpc_keys_dir_is_isolated_in_tests():
 
 def test_peers_follow_the_trust_matrix():
     assert principals.peers_for("trader") == {"cli", "dashboard", "strategy", "ai_supervisor", "ai_research",
-                                              "research"}
+                                              "research", "ai_author"}
+    assert principals.peers_for("ai_author") == {"trader"}
     assert principals.peers_for("research") == {"trader", "ai_research", "cli"}
     assert principals.peers_for("strategy") == {"cli", "dashboard", "trader"}
     assert principals.peers_for("ai_research") == {"trader", "research"}

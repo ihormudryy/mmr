@@ -28,7 +28,8 @@ from trader.research.rulesets.paper_v1 import PAPER_V1
 from trader.research.signing import (
     AttestationSigner, BadSignature, InvalidKeyType, MalformedKey, load_verify_key, public_key_id, verify_bytes,
 )
-from trader.research.strategy_key import is_strategy_key
+from trader.authored.keys import is_authored_key, parse_authored_key
+from trader.research.strategy_key import is_evaluation_key
 
 CASE_DOMAIN = "mmr.research.evaluation-case.v1"
 INITIAL_STAGES = ("PRE_HOLDOUT_FAILED", "HOLDOUT_FAILED", "COMPLETE", "FAILED")
@@ -99,8 +100,10 @@ class EvaluationCase(_Strict):
 
     @model_validator(mode="after")
     def _shape(self) -> "EvaluationCase":
-        if not is_strategy_key(self.strategy_key):
-            raise ValueError("strategy_key must be strategies/<file>.py:<Class>")
+        if not is_evaluation_key(self.strategy_key):
+            raise ValueError("strategy_key must be strategies/<file>.py:<Class> or authored:sha256:<hex>:<Class>")
+        if is_authored_key(self.strategy_key) and parse_authored_key(self.strategy_key)[0] != self.strategy_file_hash:
+            raise ValueError("strategy_file_hash must equal the authored key's digest")
         if not _DIGEST.fullmatch(self.strategy_file_hash):
             raise ValueError("strategy_file_hash must be sha256:<hex>")
         check_cohort(self.cohort)

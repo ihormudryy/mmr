@@ -28,7 +28,9 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
-from trader.messaging.principals import KNOWN_PRINCIPALS, is_valid_principal_name, peers_for
+from trader.messaging.principals import (
+    KNOWN_PRINCIPALS, is_valid_principal_name, peers_for, service_principals,
+)
 from trader.research.key_purpose import (
     KeyPurposeError,
     bundle_public_raw,
@@ -171,9 +173,9 @@ def load_identity_material(
 # Long-lived compose services and the principals each signs as. A rotated
 # principal's key lives in its own service and in every service that has it
 # as a peer; all of them must restart together (owner answer 7).
+_LONG_LIVED_SERVICES = ("trader", "strategy", "dashboard", "ai", "research")
 _LONG_LIVED_SERVICE_PRINCIPALS: Mapping[str, tuple[str, ...]] = {
-    "trader": ("trader",), "strategy": ("strategy",), "dashboard": ("dashboard",),
-    "ai": ("ai_supervisor", "ai_research"), "research": ("research",),
+    service: service_principals(service) for service in _LONG_LIVED_SERVICES
 }
 
 

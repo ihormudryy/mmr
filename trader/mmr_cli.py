@@ -1445,6 +1445,23 @@ def build_parser() -> argparse.ArgumentParser:
     withdraw_p.add_argument('version_digest')
     withdraw_p.add_argument('--reason', required=True)
 
+    # ai-author (SP3 Plan 3, spec 7.9): authored-strategy records and the isolation proof (operator)
+    ai_author_p = sub.add_parser(
+        'ai-author',
+        help='PAPER AI-written strategies: list, prove-isolation (operator, host only)',
+        epilog='Examples:\n'
+               '  ai-author list\n'
+               '  ai-author prove-isolation\n'
+               '  ai-author prove-isolation --compose "podman compose"',
+        formatter_class=fmt)
+    ai_author_sub = ai_author_p.add_subparsers(dest='ai_author_action')
+    ai_author_sub.add_parser('list', help='Authored strategies, their states, the switch and the cap')
+    prove_p = ai_author_sub.add_parser(
+        'prove-isolation', help='Run the isolation checks against the running sandbox and record them (host only)')
+    prove_p.add_argument('--compose', default='docker compose', help='Compose command, as docker.sh uses it')
+    prove_p.add_argument('--in-container', action='store_true',
+                         help=argparse.SUPPRESS)   # the step the host runs inside research; prints JSON only
+
     # scoreboard (SP1 Plan 5)
     scoreboard_p = sub.add_parser(
         'scoreboard', help='PAPER scoreboard of the ai_paper experiment (read only)',
@@ -2693,6 +2710,8 @@ def dispatch(mmr: MMR, args: argparse.Namespace) -> bool:
 
         elif cmd == 'ai-deployment':
             _handle_ai_deployment(mmr, args)
+        elif cmd == 'ai-author':
+            _handle_ai_author(mmr, args)
 
         elif cmd == 'flatten':
             _handle_flatten(mmr, args)
@@ -3437,6 +3456,54 @@ def _withdraw_ai_deployment(mmr: MMR, version_digest: str, reason: str):
         print_status(f'ai-deployment withdraw failed: {result.error or result.exception}', success=False)
         sys.exit(1)
     print_json_result(result.obj or {}, title='AI deployment version withdrawn (paper)')
+
+
+def _handle_ai_author(mmr: MMR, args: argparse.Namespace):
+    action = getattr(args, 'ai_author_action', None)
+    if action == 'list':
+        print_json_result(mmr.authored_strategies(), title='AI-written strategies (paper)')
+        return
+    if action != 'prove-isolation':
+        print_status('ai-author: choose list or prove-isolation', success=False)
+        sys.exit(1)
+    _prove_isolation(mmr, args.compose)
+
+
+def _prove_isolation_in_container() -> int:
+    """SP3 D3: run inside research; print the proof body; no key, no trader call."""
+    import trader.authored.prove_isolation as prove_isolation
+    import trader.messaging.keys_cli as keys_cli
+
+    if not keys_cli.running_in_container():
+        print_status('--in-container runs inside the research container only; run it without the flag',
+                     success=False)
+        sys.exit(2)
+    return prove_isolation.run_in_container()
+
+
+def _prove_isolation(mmr: MMR, compose: str):
+    """SP3 spec 7.9 (D3, ruling 15): the in-container step in research, checked here, recorded as cli."""
+    import trader.authored.isolation_host as isolation_host
+    import trader.messaging.keys_cli as keys_cli
+    from trader.messaging.typed_rpc import TypedRpcRemoteError
+
+    if keys_cli.running_in_container():
+        print_status('ai-author prove-isolation runs on the host only (it drives docker compose)', success=False)
+        sys.exit(2)
+    try:
+        proof = isolation_host.prove_isolation(isolation_host.compose_command(compose))
+    except isolation_host.ProveIsolationError as ex:
+        print_status(f'ai-author prove-isolation could not run: {ex}', success=False)
+        sys.exit(1)
+    try:
+        reply = mmr.record_isolation_proof(proof)
+    except TypedRpcRemoteError as ex:
+        print_status(f'record_isolation_proof rejected: {ex.code}: {ex.message}', success=False)
+        sys.exit(1)
+    print_json_result(reply, title='Isolation proof (paper)')
+    if not proof['passed']:
+        print_status('the sandbox image is NOT proven: authored deployments stay refused', success=False)
+        sys.exit(1)
 
 
 def _handle_experiment(mmr: MMR, args: argparse.Namespace):
@@ -12675,7 +12742,7 @@ _LOCAL_ONLY_COMMANDS = {
     'risk-limits', 'rl', 'reconcile', 'diagnose', 'approve', 'listen',
     'ideas', 'scan-ideas',
     'market-hours', 'mh', 'session', 'group', 'research', 'scoreboard', 'flatten', 'ai-policy',
-    'ai-deployment',
+    'ai-deployment', 'ai-author',
 }
 # strategies list/enable/disable/reload hit strategy typed ports; create/deploy
 # etc. are YAML-local. Legacy connect is never needed for strategies/*.
@@ -12699,6 +12766,8 @@ def main():
         cmd = getattr(args, 'command', None)
         if cmd == 'keys':
             sys.exit(_handle_keys(args))
+        if cmd == 'ai-author' and getattr(args, 'in_container', False):
+            sys.exit(_prove_isolation_in_container())
         is_local = cmd in _LOCAL_ONLY_COMMANDS
         if cmd == 'experiment' and getattr(args, 'experiment_action', None) == 'acceptance':
             is_local = True          # typed RPC with its own keys, or the local journal: no legacy connect

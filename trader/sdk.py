@@ -2100,6 +2100,18 @@ class MMR:
         """``get_ai_deployment_version``: ``{found, version}`` with the version's state."""
         return self._typed_query.call('get_ai_deployment_version', {'version_digest': version_digest}, dict)
 
+    def authored_strategies(self) -> dict:
+        """``list_authored_strategies``: the PAPER authored-strategy records, the switch and the cap."""
+        return self._typed_query.call('list_authored_strategies', {}, dict)
+
+    def record_isolation_proof(self, proof: dict) -> dict:
+        """``record_isolation_proof`` as the operator (``cli``): one run of ``mmr ai-author prove-isolation``."""
+        return self._typed_command.call('record_isolation_proof', proof, dict)
+
+    def isolation_proof(self, image_digest: Optional[str] = None) -> dict:
+        """``get_isolation_proof``: the newest proof of ``image_digest``, or the newest of all."""
+        return self._typed_query.call('get_isolation_proof', {'image_digest': image_digest}, dict)
+
     def ai_policy_view(self) -> dict:
         """The PAPER AI risk policy: published, effective and queued limits."""
         return self._typed_query.call('get_ai_risk_policy', {}, dict)

@@ -677,3 +677,21 @@ def test_a_crash_on_the_worker_stops_the_bars_queued_behind_it(world, service_lo
     assert idle.wait(timeout=5)
     assert len(opens) == 1 and authored.state == StrategyState.ERROR    # the second bar did not reopen
     assert world.rt.signal_record.read(0, 10).signals == ()
+
+
+def test_a_fault_callback_on_the_worker_may_close_the_sessions_without_a_deadlock(world, service_loop):
+    reconcile(world, [authored_active(world.sandbox, "faults_above_limit", "FaultsAboveLimit",
+                                      params={"LIMIT": 104.5})])
+    authored = instance_of(world)
+    world.rt._strategy_frame = lambda conid, bar_size: bars(10)           # close 109 > 104.5: a fault
+    faults, reported = [], threading.Event()
+
+    def close_from_the_worker(digest, code):
+        authored.close_sessions()
+        faults.append((threading.current_thread() is authored._worker._thread, code))
+        reported.set()
+    authored._on_fault = close_from_the_worker
+    on_loop(service_loop, world.rt._on_tick_for_strategy, authored, CONID).result(timeout=2)
+    assert reported.wait(timeout=5) and faults == [(True, "SANDBOX_ERROR")]
+    authored._worker._thread.join(timeout=5)
+    assert not authored._worker._thread.is_alive() and world.sandbox.open_sessions == []

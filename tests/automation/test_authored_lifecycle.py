@@ -14,7 +14,7 @@ from tests.automation.backtest_judge_fixtures import NOW
 from trader.automation.ai_deployment_versions import WITHDRAWAL_ENTRY_IN_FLIGHT
 from trader.automation.ai_deployments import DeploymentRefused
 from trader.automation.authored_strategies import (
-    AUTHORED_RETIRE_REASON, SHADOW, DeploymentLines, authored_retire_command_id, withdraw_with,
+    AUTHORED_RETIRE_REASON, RETIRED, SHADOW, DeploymentLines, authored_retire_command_id, withdraw_with,
 )
 from trader.automation.authored_wire import RetireAuthoredStrategyRequest
 
@@ -259,3 +259,53 @@ def test_without_lines_a_superseded_refusal_is_final(tmp_path):
     w = authored_world(tmp_path, withdraw=superseded)
     reply = w.store.retire(retire_request(deployed(w)))
     assert (reply["code"], reply["retryable"], reply["record"]["state"]) == ("VERSION_SUPERSEDED", False, "RETIRED")
+
+
+class FailsFirst:
+    """A withdraw port whose first call raises (the trader lost the SP2c write after RETIRED committed)."""
+
+    def __init__(self, error: Exception, failures: int = 1):
+        self.calls, self.error, self.failures = [], error, failures
+
+    def __call__(self, version_digest):
+        self.calls.append(version_digest)
+        if self.failures:
+            self.failures -= 1
+            raise self.error
+        return True
+
+
+def test_refresh_withdraws_a_retired_line_whose_withdrawal_was_lost(tmp_path):            # fix round 1
+    withdrawals = FailsFirst(RuntimeError("journal unreachable"))
+    lines = line_of({VERSION: "ACTIVE"}, VERSION)
+    w = authored_world(tmp_path, withdraw=withdrawals, lines=lambda: lines)
+    digest = deployed(w)
+    with pytest.raises(RuntimeError):
+        w.store.retire(retire_request(digest))
+    assert w.store.get(digest).state.value == "RETIRED"
+    record = w.store.overview()["records"][0]
+    assert withdrawals.calls == [VERSION, VERSION]
+    assert (record["state"], record["reason"]) == ("RETIRED", "SANDBOX_ERROR")
+
+
+def test_refresh_does_not_withdraw_an_owner_retired_line(tmp_path):
+    withdrawals = FakeWithdrawals()
+    lines = line_of({VERSION: "ACTIVE"}, VERSION)
+    w = authored_world(tmp_path, withdraw=withdrawals, lines=lambda: lines)
+    digest = deployed(w)
+    moved(w, digest, RETIRED, reason="OWNER_RETIRED")
+    w.store.overview()
+    assert withdrawals.calls == []
+
+
+@pytest.mark.parametrize("error", [RuntimeError("journal unreachable"),
+                                   DeploymentRefused("VERSION_SUPERSEDED", "renewed"),
+                                   DeploymentRefused(WITHDRAWAL_ENTRY_IN_FLIGHT, "an entry is being sent")])
+def test_a_failed_withdrawal_on_refresh_breaks_neither_reads_nor_submits(tmp_path, error):
+    lines = line_of({VERSION: "ACTIVE"}, VERSION)
+    w = authored_world(tmp_path, withdraw=FailsFirst(error, failures=99), lines=lambda: lines)
+    digest = deployed(w)
+    moved(w, digest, RETIRED, reason="SANDBOX_ERROR")
+    assert w.store.overview()["records"][0]["state"] == "RETIRED"
+    assert w.store.submit(submit_request(source(16)))["status"] == "STORED"
+    assert (w.store.get(digest).state.value, w.store.get(digest).reason) == ("RETIRED", "SANDBOX_ERROR")

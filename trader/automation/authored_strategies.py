@@ -485,9 +485,13 @@ class AuthoredStrategyStore:
 
     def refresh(self) -> None:
         """Ruling 11: a SHADOW or DEPLOYED record leaves the count when its window ends. Other stores are read
-        first, outside the transaction; each record moves only if it did not move meanwhile."""
+        first, outside the transaction; each record moves only if it did not move meanwhile. A line the strategy
+        retired is withdrawn again while it still has a live version (its first withdrawal may have been lost)."""
         now = utc(self._now())
         records = self._db.transaction(records_in_tx)
+        for record in records:
+            if record.state == RETIRED and record.reason == SANDBOX_ERROR:
+                self._withdraw_again(record)
         endings = [(record, ending) for record in records if (ending := self._ending(record, now)) is not None]
         if not endings:
             return
@@ -499,6 +503,22 @@ class AuthoredStrategyStore:
                         and current.state_changed_at == record.state_changed_at:
                     move_in_tx(conn, current, target, event="WINDOW_ENDED", reason=reason, now=now)
         self._db.transaction(write)
+
+    def _withdraw_again(self, record: AuthoredRecord) -> None:
+        """Best effort: the record stays RETIRED whatever happens, and a failure never breaks a read or a submit.
+        Its entries are refused by the RETIRED state already; this frees the version's SP2c slot."""
+        if self._lines is None or self._withdraw is None or record.deployment_version is None:
+            return
+        try:
+            version = self._lines().live_version(record.deployment_version)
+            if version is not None:
+                self._withdraw(version)
+        except DeploymentRefused as refused:
+            if refused.code != VERSION_SUPERSEDED:   # superseded: the next refresh finds the newer version
+                logger.error("authored strategy %s is RETIRED; withdrawing its line again refused: %s",
+                             record.digest, refused)
+        except Exception:
+            logger.exception("authored strategy %s is RETIRED; withdrawing its line again failed", record.digest)
 
     def _ending(self, record: AuthoredRecord, now: dt.datetime) -> Optional[tuple[AuthoredState, str]]:
         if record.state == SHADOW:

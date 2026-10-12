@@ -12,7 +12,7 @@ from typing import Any, Mapping, Optional
 from trader.research.evaluation_case import (
     CASE_DOMAIN, FULL_MENU, EvaluationCase, offered_menu, renewal_forward_complete,
 )
-from trader.research.strategy_key import split_strategy_key
+from trader.research.strategy_key import split_evaluation_key
 
 STAGE_NAMES = {"pre_holdout": "PRE_HOLDOUT_FAILED", "holdout_failed": "HOLDOUT_FAILED", "complete": "COMPLETE"}
 
@@ -140,7 +140,7 @@ def _renewal_order_notional(case: EvaluationCase) -> float:
 def evaluation_summary(case: EvaluationCase, *, order_notional: float) -> dict:
     """Plan 4's EvaluationSummary: the code-computed view Jev's BacktestCase is built from."""
     evidence = case.evidence
-    path, class_name = split_strategy_key(case.strategy_key)
+    path, class_name = split_evaluation_key(case.strategy_key)
     points = evidence.get("points") or []
     shown = _replayed_point(evidence)
     return {

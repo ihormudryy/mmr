@@ -90,6 +90,25 @@ class PointResult:
     outcomes: dict = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class TrialDenominator:
+    """The multiple-testing denominator of one strategy key: the trials it counts and their Sharpes."""
+    count: int
+    sharpes: tuple[float, ...]
+
+
+def trial_denominator(registry: ExperimentRegistry, spec: EvaluationSpec,
+                      authored_judged_count: int = 0) -> TrialDenominator:
+    """A catalogue key counts its own trials. An authored key also counts every authored file the trader has
+    judged (SP3 spec 7.7, Plan 4 ruling 12)."""
+    if spec.authored_digest is None and authored_judged_count:
+        raise ValueError("a judged authored count belongs to an authored key only")
+    own = registry.strategy_trials(spec.strategy_path, spec.class_name)
+    sharpes = tuple(t.metrics['daily_sharpe'] for t in own
+                    if isinstance(t.metrics.get('daily_sharpe'), (int, float)))
+    return TrialDenominator(authored_judged_count + len(own), sharpes)
+
+
 def evaluate(spec: EvaluationSpec, *, research_db: Any, paths: EvaluationPaths,
              now: Callable[[], dt.datetime], max_workers: int = 1,
              ruleset: Ruleset = PAPER_V1) -> EvaluationResult:
@@ -116,8 +135,7 @@ def evaluate(spec: EvaluationSpec, *, research_db: Any, paths: EvaluationPaths,
                              rerun_existing=False) for point in neighbour_points(spec)]
     context = point_market_context(spec, plan, main, benchmark_closes, bars)
     evidence = _walk_forward_evidence(
-        spec, main, neighbours, registry.strategy_trials(spec.strategy_path, spec.class_name),
-        context.regimes, context.liquidity)
+        spec, main, neighbours, trial_denominator(registry, spec), context.regimes, context.liquidity)
     gate = ev.pre_holdout_outcome(evaluate_eligibility(ruleset, evidence))
     finish = dict(family_id=family_id, main=main, neighbours=neighbours,
                   market_context=context.market_context, missing_causes=context.missing_causes)
@@ -490,7 +508,7 @@ def _run_point(registry: ExperimentRegistry, family_id: str, env: RunEnvironment
 
 
 def _walk_forward_evidence(spec: EvaluationSpec, main: PointResult,
-                           neighbours: Sequence[PointResult], strategy_trials,
+                           neighbours: Sequence[PointResult], trials: TrialDenominator,
                            regimes: mcx.RegimeEvidence,
                            liquidity: mcx.LiquidityEnvelope) -> EligibilityEvidence:
     trips = {m: _round_trips(main.outcomes[m]) for m in COST_MULTIPLIERS}
@@ -498,8 +516,6 @@ def _walk_forward_evidence(spec: EvaluationSpec, main: PointResult,
     returns = ev.session_returns([o.equity_series() for o in main.outcomes[1.0]],
                                  starting_equity=spec.account_equity)
     sharpe_ci = annualized_sharpe_ci(returns, periods_per_year=ev.TRADING_DAYS_PER_YEAR, seed=0)
-    trial_sharpes = [t.metrics['daily_sharpe'] for t in strategy_trials
-                     if isinstance(t.metrics.get('daily_sharpe'), (int, float))]
     return EligibilityEvidence(
         n_round_trips=len(baseline),
         n_instruments=len(set(spec.conids)),
@@ -507,7 +523,7 @@ def _walk_forward_evidence(spec: EvaluationSpec, main: PointResult,
         expectancy_bps_1_5x=ev.dollar_weighted_expectancy_bps(trips[1.5]),
         expectancy_bps_2x=ev.dollar_weighted_expectancy_bps(trips[2.0]),
         selection_adjusted_confidence=ev.selection_confidence(
-            returns, n_trials=len(strategy_trials), trial_sharpes=trial_sharpes),
+            returns, n_trials=trials.count, trial_sharpes=list(trials.sharpes)),
         annualized_sharpe_ci_low=None if sharpe_ci is None else sharpe_ci.low,
         profit_factor=profit_factor([rt.pnl for rt in baseline]) if baseline else None,
         walk_forward_positive_fraction=ev.positive_fold_fraction(main.metrics['fold_net_pnls']),

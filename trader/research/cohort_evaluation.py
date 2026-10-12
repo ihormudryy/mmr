@@ -17,7 +17,8 @@ from trader.research.eligibility import evaluate_eligibility
 from trader.research.evaluation import (
     COST_MULTIPLIERS, EvaluationError, EvaluationPaths, HoldoutOutcome, PointResult, _commit_of, _day_end, _day_start, _family, _finish,
     _fold_specs, _period_session_dates, _point_key, _refuse_if_holdout_opened, _run_point,
-    _walk_forward_evidence, point_market_context, run_environment, run_holdout)
+    TrialDenominator, _walk_forward_evidence, point_market_context, run_environment, run_holdout,
+    trial_denominator)
 from trader.research.evaluation_data import load_bars, load_benchmark_closes, qualify_dataset
 from trader.research.evaluation_store import STAGE_COMPLETE, STAGE_HOLDOUT_FAILED, STAGE_PRE_HOLDOUT
 from trader.research.experiment_registry import ExperimentRegistry
@@ -70,7 +71,8 @@ def replay_index(verdicts: Sequence[PointVerdict], selected: Optional[PointVerdi
     return max(scored, key=lambda v: (_statistic(v), -v.index)).index if scored else 0
 
 
-def _verdict(index, base, plan, point, neighbours, trials, benchmark_closes, bars, ruleset) -> PointVerdict:
+def _verdict(index, base, plan, point, neighbours, trials: TrialDenominator, benchmark_closes, bars,
+             ruleset) -> PointVerdict:
     context = point_market_context(base, plan, point, benchmark_closes, bars)
     evidence = _walk_forward_evidence(base, point, neighbours, trials, context.regimes, context.liquidity)
     decision = evaluate_eligibility(ruleset, evidence)
@@ -107,7 +109,8 @@ def _record_evaluation(research_db, base, paths, now, result: CohortResult, verd
 
 
 def evaluate_cohort(spec: CohortSpec, *, research_db: Any, paths: EvaluationPaths,
-                    now: Callable[[], dt.datetime], ruleset=PAPER_V1, max_workers: int = 1) -> CohortResult:
+                    now: Callable[[], dt.datetime], ruleset=PAPER_V1, max_workers: int = 1,
+                    authored_judged_count: int = 0) -> CohortResult:
     base = spec.base
     if not spec.cohort:
         raise EvaluationError("the cohort has no points")
@@ -135,11 +138,11 @@ def evaluate_cohort(spec: CohortSpec, *, research_db: Any, paths: EvaluationPath
                          rerun_existing=True) for p in spec.cohort]
     neighbours = [[_run_point(registry, family_id, env, plan, dict(n), (1.0,), now, max_workers,
                               rerun_existing=False) for n in ns] for ns in spec.neighbours]
-    trials = registry.strategy_trials(base.strategy_path, base.class_name)   # one denominator for all points
+    trials = trial_denominator(registry, base, authored_judged_count)   # one denominator for all points
     verdicts = tuple(_verdict(i, base, plan, p, ns, trials, benchmark_closes, bars, ruleset)
                      for i, (p, ns) in enumerate(zip(points, neighbours, strict=True)))
     selected = select_point(verdicts)
-    common = dict(family_id=family_id, verdicts=verdicts, strategy_trials=len(trials),
+    common = dict(family_id=family_id, verdicts=verdicts, strategy_trials=trials.count,
                   replay_index=replay_index(verdicts, selected),
                   previously_revealed=previously_revealed(windows, _pre_holdout_sessions(base, plan)),
                   holdouts_opened_before=len(windows))

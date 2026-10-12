@@ -19,6 +19,7 @@ import os
 import re
 import socket as _socket
 import stat
+import struct
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -123,26 +124,49 @@ def _sandbox_container(client):
 
 _EXEC_BEGIN = "__sbxtest_exec_begin__"
 _EXEC_DONE = "__sbxtest_exec_done__"
-_EXEC_ATTEMPTS = 10
+_EXEC_ATTEMPTS = 5
+_FRAME_HEADER = struct.Struct(">BxxxI")   # docker's multiplexed stream: stream id, 3 pad bytes, payload size
 
 
 def _exec(container, command: list[str], *, user: str = "") -> tuple[int, str]:
-    """Run an idempotent read in the container: (exit code, output).
+    """Run an idempotent read in the container: (exit code, stdout and stderr).
 
-    On Docker Desktop, docker exec can drop what a short command writes before the output stream is attached
-    (phase 2: `cat` and `stat` answered exit 0 with no output). So the command runs between two markers: a reply
-    that lacks either one may have lost output, and the command is run again."""
+    Phase 2 lost the whole output of short commands (exit 0, no bytes) through docker-py's exec_run: it reads
+    the hijacked raw socket and so misses bytes already buffered with the response headers. `_exec_reply` reads
+    the response body instead. The command also runs between two markers, and a reply without both (output lost
+    some other way) is run again."""
     script = f'printf "{_EXEC_BEGIN}\\n"; "$@"; status=$?; printf "\\n{_EXEC_DONE}%d\\n" "$status"'
+    text = ""
     for attempt in range(_EXEC_ATTEMPTS):
-        result = container.exec_run(["sh", "-c", script, "sh", *command], user=user, demux=False)
-        text = (result.output or b"").decode("utf-8", errors="replace")
+        text = _exec_reply(container, ["sh", "-c", script, "sh", *command], user=user)
         _, begin, rest = text.partition(_EXEC_BEGIN + "\n")
         output, done, status = rest.rpartition("\n" + _EXEC_DONE)
         if begin and done:
             return int(status.strip()), output
         time.sleep(0.1 * (attempt + 1))
     pytest.fail(f"docker exec lost the output of {command[:2]} {_EXEC_ATTEMPTS} times; "
-                f"last exit {result.exit_code}, {len(text)} chars: {text[:300]!r} ... {text[-300:]!r}")
+                f"last reply {len(text)} chars: {text[:300]!r} ... {text[-300:]!r}")
+
+
+def _exec_reply(container, command: list[str], *, user: str = "") -> str:
+    """Start an exec without the connection upgrade and read the whole response body: docker closes it when the
+    command ends, so every byte arrives, also those that came in with the headers."""
+    api = container.client.api
+    exec_id = api.exec_create(container.id, command, user=user)["Id"]
+    response = api._post_json(api._url("/exec/{0}/start", exec_id), data={"Detach": False, "Tty": False},
+                              timeout=120)
+    api._raise_for_status(response)
+    return _demultiplex(response.content).decode("utf-8", errors="replace")
+
+
+def _demultiplex(raw: bytes) -> bytes:
+    payload, offset = [], 0
+    while offset + _FRAME_HEADER.size <= len(raw):
+        _, size = _FRAME_HEADER.unpack_from(raw, offset)
+        offset += _FRAME_HEADER.size
+        payload.append(raw[offset:offset + size])
+        offset += size
+    return b"".join(payload)
 
 
 def _python(container, source: str, *, user: str = "") -> tuple[int, str]:

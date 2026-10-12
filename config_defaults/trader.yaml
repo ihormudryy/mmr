@@ -202,6 +202,7 @@ research_service:
   max_gross_allocation: 0.05
   queue_max: 20               # a full queue refuses before any claim (at most 1000)
   shadow_incomplete_after_hours: 16   # hours after the close before a row without data goes INCOMPLETE (at most 720)
+  authored_evaluation_sessions: 302   # SP3: AI-written strategies use the most recent N sessions (holdout scaled; at most period_sessions)
 
 # Massive.com (formerly Polygon.io)
 massive_api_key: ''

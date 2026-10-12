@@ -17,6 +17,7 @@ from trader.research.evaluation_request import EvaluationRequestBody, evaluation
 from trader.research.evaluation_spec import (MIN_INSTRUMENTS, EvaluationSpec, EvaluationSpecError,
                                              build_evaluation_spec, declared_tunables)
 from trader.research.neighbours import NEIGHBOUR_SHARE, neighbours_of  # noqa: F401  re-exported
+from trader.research.service_config import authored_walk_forward
 from trader.research.strategy_key import split_evaluation_key
 from trader.research.validation import generate_walk_forward
 
@@ -101,6 +102,8 @@ def _require_bars(history_db: str, base: EvaluationSpec) -> None:
 def build_cohort_spec(body: EvaluationRequestBody, *, config: Any, judge: Any, universe_accessor: Any,
                       costs_config: Any, repo_root: Path, registry: Any, history_db: str) -> CohortSpec:
     authored_digest = parse_authored_key(body.strategy_key)[0] if is_authored_key(body.strategy_key) else None
+    if authored_digest is not None:
+        config = authored_walk_forward(config)          # owner ruling: 302 recent sessions, SP2c proportions
     # An authored key is claimed under the owner switch, not the allowlist (Plan 4 ruling 5).
     if authored_digest is None and not judge.allows(body.strategy_key):
         raise RequestRefused("STRATEGY_NOT_ALLOWED", f"{body.strategy_key} is not on the allowlist")

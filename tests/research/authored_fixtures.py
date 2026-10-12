@@ -24,7 +24,8 @@ NOW = dt.datetime(2024, 3, 29, 14, tzinfo=dt.timezone.utc)          # 10:00 New 
 RESEARCH_DAY = "2024-03-29"
 POINT = {"ENTRY_MINUTE": 600, "EXIT_MINUTE": 660}
 CATALOGUE_KEY = "strategies/time_of_day.py:TimeOfDay"
-CONFIG = ResearchServiceConfig(period_sessions=38, folds=2, embargo_sessions=1, holdout_sessions=5)
+CONFIG = ResearchServiceConfig(period_sessions=38, folds=2, embargo_sessions=1, holdout_sessions=5,
+                               authored_evaluation_sessions=38)   # equal to the period: Tasks 3-8 keep their windows
 
 
 def install_fake_sandbox(monkeypatch) -> FakeSandbox:
@@ -44,7 +45,7 @@ def request_body(key: str, cohort=(POINT,)) -> EvaluationRequestBody:
          "bar_size": "15 mins", "research_day": RESEARCH_DAY})
 
 
-def research_world(tmp_path, tmp_duckdb_path, *, drift: float = 0.0006) -> SimpleNamespace:
+def research_world(tmp_path, tmp_duckdb_path, *, drift: float = 0.0006, config=CONFIG) -> SimpleNamespace:
     write_universe(tmp_duckdb_path)
     write_trend_bars(tmp_duckdb_path, drift=drift)
     build_spec_file(tmp_path)                                        # the catalogue TimeOfDay, for comparisons
@@ -58,7 +59,7 @@ def research_world(tmp_path, tmp_duckdb_path, *, drift: float = 0.0006) -> Simpl
     judge = BacktestJudgeConfig(strategy_allowlist=(CATALOGUE_KEY,), max_cohort_points=3)
 
     def build_body(body: EvaluationRequestBody):
-        return build_cohort_spec(body, config=CONFIG, judge=judge,
+        return build_cohort_spec(body, config=config, judge=judge,
                                  universe_accessor=UniverseAccessor(tmp_duckdb_path, "Universes"),
                                  costs_config=load_execution_costs_config(str(costs_path)), repo_root=tmp_path,
                                  registry=registry, history_db=tmp_duckdb_path)

@@ -27,8 +27,10 @@ from trader.strategy.ai_deployment_source import (
 )
 from trader.strategy.authored_runtime import (
     ISOLATION_ALARM,
+    PROOF_OUTAGE_HOLD,
     PROOF_TIMEOUT_SECONDS,
     RETIRE_RESEND_CAP,
+    STORE_UNAVAILABLE,
     AuthoredDeployments,
     AuthoredLiveStrategy,
     crash_backoff,
@@ -91,8 +93,10 @@ def world(tmp_path, tmp_duckdb_path):
     sandbox = FakeSandbox(research=False)                           # the live pool (Task 9 ruling)
     query = FakeTraderRpc(get_isolation_proof=[proof()])
     command = FakeTraderRpc(retire_authored_strategy=[RETIRED])
-    rt._authored_deployments = AuthoredDeployments(client=sandbox, trader_query=query, trader_command=command)
-    return SimpleNamespace(rt=rt, sandbox=sandbox, query=query, command=command)
+    clock = [dt.datetime(2024, 3, 4, 16, 0, tzinfo=dt.timezone.utc)]
+    rt._authored_deployments = AuthoredDeployments(client=sandbox, trader_query=query, trader_command=command,
+                                                   now=lambda: clock[0])
+    return SimpleNamespace(rt=rt, sandbox=sandbox, query=query, command=command, clock=clock)
 
 
 def authored_active(sandbox, name="counts_bars", class_name="CountsBars", *, params=None, digest=None,
@@ -304,6 +308,7 @@ def test_a_proof_read_that_times_out_is_false_and_alarms_once(world, caplog):   
     assert len([r for r in caplog.records if ISOLATION_ALARM in r.getMessage()]) == 1
     assert world.query.timeouts[-1] == ("get_isolation_proof", PROOF_TIMEOUT_SECONDS) and PROOF_TIMEOUT_SECONDS == 2.0
     world.query.answer("get_isolation_proof", proof())
+    world.clock[0] += PROOF_OUTAGE_HOLD
     assert deployments.is_proven(IMAGE_DIGEST) is True                   # the episode ends on a pass
 
 
@@ -322,6 +327,34 @@ def test_the_proof_client_bounds_its_send_and_its_reply_by_the_proof_timeout(wor
 def test_a_proof_read_that_breaks_unexpectedly_is_false_and_does_not_raise(world):
     world.query.answer("get_isolation_proof", RuntimeError("bug in the client"))
     assert world.rt._authored_deployments.is_proven(IMAGE_DIGEST) is False
+
+
+def proof_reads(world):
+    return len([method for method, _ in world.query.calls if method == "get_isolation_proof"])
+
+
+@pytest.mark.parametrize("failure", [ConnectionError("down"), TimeoutError("slow"),
+                                     TypedRpcRemoteError("INTERNAL_ERROR", "boom")])
+def test_a_failed_proof_read_shuts_the_gate_without_asking_for_the_hold(world, failure):  # fix round 1
+    assert PROOF_OUTAGE_HOLD == dt.timedelta(seconds=20)
+    deployments = world.rt._authored_deployments
+    world.query.answer("get_isolation_proof", failure, proof())
+    assert deployments.is_proven(IMAGE_DIGEST) is False and proof_reads(world) == 1
+    for _ in range(5):
+        world.clock[0] += dt.timedelta(seconds=3)
+        assert deployments.is_proven(IMAGE_DIGEST) is False
+    assert proof_reads(world) == 1                                       # 15 s: no call reached the trader
+    world.clock[0] += dt.timedelta(seconds=5)                            # 20 s after the failure
+    assert deployments.is_proven(IMAGE_DIGEST) is True and proof_reads(world) == 2
+
+
+@pytest.mark.parametrize("answer", [proof(), {"found": False, "proof": None}, proof(passed=False),
+                                    proof(image="sha256:" + "f" * 64)])
+def test_an_answer_is_never_cached(world, answer):                       # pass or definite answer: re-read
+    deployments = world.rt._authored_deployments
+    world.query.answer("get_isolation_proof", answer)
+    first, second = deployments.is_proven(IMAGE_DIGEST), deployments.is_proven(IMAGE_DIGEST)
+    assert first == second == (answer == proof()) and proof_reads(world) == 2
 
 
 def test_a_retryable_refusal_is_resent_at_most_the_cap_then_one_error(world, caplog):    # ruling 2
@@ -344,6 +377,25 @@ def test_an_unreachable_trader_does_not_count_toward_the_cap(world):            
     for _ in range(RETIRE_RESEND_CAP + 10):
         world.rt._authored_deployments.send_retirements()
     assert len(retirements(world)) == 3 + RETIRE_RESEND_CAP
+
+
+def test_a_store_outage_on_retire_does_not_count_toward_the_cap(world):                  # fix round 1
+    digest = "sha256:" + "a" * 64
+    outage = TypedRpcRemoteError(STORE_UNAVAILABLE, "journal locked")
+    world.command.answer("retire_authored_strategy", *([outage] * 25), RETIRED)
+    world.rt._authored_deployments.request_retirement(digest, "SANDBOX_ERROR")
+    for _ in range(30):
+        world.rt._authored_deployments.send_retirements()
+    assert len(retirements(world)) == 26
+    assert world.rt._authored_deployments._stopped(digest)
+    world.rt._authored_deployments.request_retirement(digest, "SANDBOX_ERROR")   # retired: never queued again
+    world.rt._authored_deployments.send_retirements()
+    assert len(retirements(world)) == 26
+
+
+def test_the_store_outage_code_is_the_traders():
+    from trader.messaging.authored_surface import STORE_UNAVAILABLE as TRADER_CODE
+    assert STORE_UNAVAILABLE == TRADER_CODE
 
 
 def test_a_remote_error_on_retire_counts_toward_the_cap(world):

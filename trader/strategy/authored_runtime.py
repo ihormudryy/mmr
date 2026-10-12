@@ -275,11 +275,17 @@ class AuthoredLiveStrategy(Strategy):
 # The proof read runs on the tick thread before every bar: a short deadline bounds one bar's wait (ruling 1).
 PROOF_TIMEOUT_SECONDS = 2.0
 RETIRE_TIMEOUT_SECONDS = 15.0
+# After a proof read that failed for want of an answer (the trader down, slow or erroring), the gate stays shut
+# this long without asking: the read runs on the service loop, and a 2 s wait per bar per conid would stall it.
+PROOF_OUTAGE_HOLD = dt.timedelta(seconds=20)
 # Ruling 2: a retryable refusal (AUTHORED_WITHDRAWAL_FAILED, WITHDRAWAL_ENTRY_IN_FLIGHT) or a remote error is sent
-# again at most this often per digest; then the trader's own refresh() keeps withdrawing.
+# again at most this often per digest.
 RETIRE_RESEND_CAP = 20
 # The trader did not get the request: always sent again, never counted.
 UNREACHABLE_ERRORS = (ConnectionError, TimeoutError, OSError)
+# The trader's journal was unavailable before the record moved (trader.messaging.authored_surface, not imported:
+# it brings the trader's stores into this process). The record is still DEPLOYED: always sent again, never counted.
+STORE_UNAVAILABLE = "AUTHORED_STORE_UNAVAILABLE"
 RETIRE_DETAILS = {
     SANDBOX_ERROR: "the live session failed in the sandbox",
     SANDBOX_DIGEST_MISMATCH: "the deployment or the stored file is not the authored digest",
@@ -303,10 +309,13 @@ class AuthoredDeployments:
                  now: Callable[[], dt.datetime] = _utc_now):
         self._client, self._query, self._command, self._now = client, trader_query, trader_command, now
         self._lock = threading.Lock()
+        # In memory only (Plan 4 ruling 18 accepts it): after a restart before delivery the record is still
+        # DEPLOYED, so the file loads again, and a deterministic fault fires and queues the retirement again.
         self._retiring: dict[str, str] = {}           # digest -> fault code, until the trader answers
         self._resends: dict[str, int] = {}            # digest -> refusals and remote errors so far
         self._retired: set[str] = set()               # answered or given up: never loaded again here
         self._gate_episode: Optional[tuple[str, str]] = None   # the failing (kind, build) last alarmed
+        self._gate_shut_until: Optional[dt.datetime] = None     # no proof read before this, after a failed read
 
     def build(self, name: str, deployment: Any, *, storage: Any,
               universe_accessor: Any) -> Optional[AuthoredLiveStrategy]:
@@ -316,7 +325,7 @@ class AuthoredDeployments:
             return self._build(name, deployment, storage=storage, universe_accessor=universe_accessor)
         except Exception as exc:
             logger.error("authored deployment %s (%s) is not loaded: %s: %s; the next reconcile retries", name,
-                         getattr(deployment, "version_digest", "?"), type(exc).__name__, exc)
+                         getattr(deployment, "version_digest", "?"), type(exc).__name__, exc, exc_info=True)
             return None
 
     def _build(self, name: str, deployment: Any, *, storage: Any,
@@ -385,6 +394,10 @@ class AuthoredDeployments:
                            digest, type(exc).__name__)
             return False
         except TypedRpcRemoteError as remote:
+            if remote.code == STORE_UNAVAILABLE:
+                logger.warning("retire_authored_strategy for %s: the trader's store is unavailable (%s); sent "
+                               "again next reconcile", digest, remote.message)
+                return False
             return self._resend_due(digest, remote.code, remote.message)
         except TypedRpcError as exc:
             return self._resend_due(digest, type(exc).__name__, str(exc))
@@ -408,28 +421,34 @@ class AuthoredDeployments:
                            "(%d of %d)", digest, code, detail, sent, RETIRE_RESEND_CAP)
             return False
         logger.error("%s: retire_authored_strategy for %s still answers %s (%s) after %d sends; not sent again "
-                     "from this process, the trader's refresh() keeps withdrawing it", SANDBOX_FAULT_ALARM,
+                     "and not loaded again by this process. Check the record at the trader (`mmr ai-author "
+                     "list`): it may not be RETIRED or its version may still be active", SANDBOX_FAULT_ALARM,
                      digest, code, detail, sent)
         return True
 
     def is_proven(self, build: Optional[str]) -> bool:
         """Review r2 #4: the authoritative latest proof for ``build``, read from the trader on every call (no
-        cache), so a proof withdrawn for a build already running stops the next OPEN and the next bar. A read
-        failure, a refusal or a timeout is fail-closed (False), never raised, and alarms once per episode. The
-        live proxy holds this method as its gate: before every new session and on every bar."""
-        if build is None:
+        cache of a pass or of any answer), so a proof withdrawn for a build already running stops the next OPEN
+        and the next bar. A read failure, a refusal or a timeout is fail-closed (False), never raised, alarms once
+        per episode, and shuts the gate for PROOF_OUTAGE_HOLD without asking again. The live proxy holds this
+        method as its gate: before every new session and on every bar."""
+        if build is None or self._gate_shut():
             return False
         try:
             reply = self._query.call("get_isolation_proof", {"image_digest": build}, dict,
                                      timeout=PROOF_TIMEOUT_SECONDS)
         except TypedRpcRemoteError as remote:
+            self._shut_gate()
             self._gate_failed(("refused", build), "get_isolation_proof refused (%s: %s)", remote.code,
                               remote.message)
             return False
         except Exception as exc:                      # a timeout, an unreachable trader or a client bug
+            self._shut_gate()
             self._gate_failed(("unreadable", build), "the isolation proof is not readable (%s: %s)",
                               type(exc).__name__, exc)
             return False
+        with self._lock:
+            self._gate_shut_until = None              # the trader answered: every next call reads again
         if not proof_passes(reply, build):
             self._gate_failed(("unproven", build), "no passing isolation proof for sandbox build %s; run "
                               "`mmr ai-author prove-isolation`", build)
@@ -437,6 +456,14 @@ class AuthoredDeployments:
         with self._lock:
             self._gate_episode = None
         return True
+
+    def _gate_shut(self) -> bool:
+        with self._lock:
+            return self._gate_shut_until is not None and self._now() < self._gate_shut_until
+
+    def _shut_gate(self) -> None:
+        with self._lock:
+            self._gate_shut_until = self._now() + PROOF_OUTAGE_HOLD
 
     def _gate_failed(self, episode: tuple[str, str], message: str, *args: Any) -> None:
         with self._lock:

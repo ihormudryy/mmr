@@ -30,6 +30,21 @@ def test_sandbox_uids_are_not_in_sudo_or_trader():
     assert "-G" not in line and "sudo" not in line and "trader" not in line
 
 
+def test_sandbox_uids_have_no_login_shell():
+    line = next(text for text in DOCKERFILE.splitlines() if 'useradd -u "$uid"' in text)
+    assert "-s /usr/sbin/nologin" in line
+
+
+def test_nothing_later_adds_a_sandbox_user_to_a_group():
+    instructions = DOCKERFILE.replace("\\\n", " ")
+    for line in instructions.splitlines():
+        if line.lstrip().startswith("#") or 'useradd -u "$uid"' in line:
+            continue
+        group_change = re.search(r"\b(usermod|gpasswd|adduser|addgroup)\b", line) or re.search(r"\buseradd\b.*\s-[a-zA-Z]*G\b", line)
+        touches_sandbox = re.search(r"sbx|sbxchild|\$uid|2000[0-7]", line)
+        assert not (group_change and touches_sandbox), line
+
+
 def test_the_build_id_is_baked_and_labelled():
     assert "ARG MMR_BUILD_ID" in DOCKERFILE
     assert "/etc/mmr-build-id" in DOCKERFILE

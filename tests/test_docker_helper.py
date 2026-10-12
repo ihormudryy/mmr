@@ -143,7 +143,7 @@ exit 0
         (private / "signing.pem").write_text("test signing key placeholder\n")
 
     def run(self, *args: str, env: dict[str, str] | None = None,
-            stdin: str = "") -> DockerHelperResult:
+            stdin: str = "", cwd: Path | None = None) -> DockerHelperResult:
         process_env = os.environ.copy()
         process_env.update(
             {
@@ -157,7 +157,7 @@ exit 0
             process_env.update(env)
         completed = subprocess.run(
             [str(self.root / "docker.sh"), *args],
-            cwd=self.root,
+            cwd=cwd or self.root,
             env=process_env,
             text=True,
             input=stdin,
@@ -228,18 +228,22 @@ def test_build_keeps_a_build_id_the_operator_already_set(fake_docker: FakeDocker
 def test_compose_runs_from_the_repo_root_so_relative_seccomp_paths_resolve(fake_docker: FakeDocker, tmp_path):
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
-    pwd_probe = fake_docker.bin_dir / "docker"
-    pwd_probe.write_text(pwd_probe.read_text().replace(
-        "printf '%s\\n' \"$*\" >>", "printf '%s\\n' \"PWD=$PWD $*\" >>"))
-    completed = subprocess.run(
-        [str(fake_docker.root / "docker.sh"), "-b"], cwd=elsewhere, text=True, capture_output=True,
-        env={**os.environ, "HOME": str(fake_docker.home), "MMR_CONTAINER_RUNTIME": "docker",
-             "PATH": f"{fake_docker.bin_dir}{os.pathsep}{os.environ['PATH']}",
-             "MMR_FAKE_DOCKER_LOG": str(fake_docker.log_path)},
-    )
+    pwd_logger = fake_docker.bin_dir / "docker"
+    pwd_logger.write_text(pwd_logger.read_text().replace('"$*" >>', '"PWD=$PWD $*" >>'))
 
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert f"PWD={fake_docker.root.resolve()} compose" in fake_docker.log_path.read_text()
+    result = fake_docker.run("-b", cwd=elsewhere)
+
+    assert result.returncode == 0, result.stdout
+    assert f"PWD={fake_docker.root.resolve()} compose" in result.log
+
+
+def test_build_rejects_a_build_id_the_sandbox_would_refuse(fake_docker: FakeDocker):
+    for bad_id in ("has space", "-leading-dash", "x" * 129, "semi;colon"):
+        result = fake_docker.run("-b", env={"MMR_BUILD_ID": bad_id})
+
+        assert result.returncode == 1, bad_id
+        assert "MMR_BUILD_ID" in result.stdout and "invalid" in result.stdout.lower()
+        assert "build" not in result.log, bad_id
 
 
 def test_build_reclaims_dangling_cache_after_success(fake_docker: FakeDocker):
@@ -416,16 +420,38 @@ def test_k_restore_resolves_a_relative_archive_against_the_invocation_directory(
     workdir = tmp_path / "operator"
     workdir.mkdir()
     (workdir / "keys.tar.age").write_text("archive")
-    completed = subprocess.run(
-        [str(fake_docker.root / "docker.sh"), "-k", "--restore", "keys.tar.age"],
-        cwd=workdir, text=True, input="AGE-SECRET-KEY-TEST\n", capture_output=True,
-        env={**os.environ, "HOME": str(fake_docker.home), "MMR_CONTAINER_RUNTIME": "docker",
-             "PATH": f"{fake_docker.bin_dir}{os.pathsep}{os.environ['PATH']}",
-             "MMR_FAKE_DOCKER_LOG": str(fake_docker.log_path)},
-    )
 
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert f"{workdir.resolve()}/keys.tar.age:/restore/archive.tar.age:ro" in fake_docker.log_path.read_text()
+    result = fake_docker.run("-k", "--restore", "keys.tar.age", stdin="AGE-SECRET-KEY-TEST\n", cwd=workdir)
+
+    assert result.returncode == 0, result.stdout
+    assert f"{workdir.resolve()}/keys.tar.age:/restore/archive.tar.age:ro" in result.log
+
+
+def test_k_backup_resolves_a_relative_recipient_against_the_invocation_directory(fake_docker: FakeDocker, tmp_path):
+    fake_docker.write_keys()
+    workdir = tmp_path / "operator"
+    workdir.mkdir()
+    (workdir / "recipient.txt").write_text("age1xyz")
+
+    result = fake_docker.run("-k", "--backup", "--recipient", "recipient.txt", cwd=workdir)
+
+    assert result.returncode == 0, result.stdout
+    assert f"{workdir.resolve()}/recipient.txt:/recipient.txt:ro" in result.log
+
+
+def test_news_resolves_a_relative_news_dir_against_the_invocation_directory(fake_docker: FakeDocker, tmp_path):
+    workdir = tmp_path / "operator"
+    news = workdir / "news"
+    news.mkdir(parents=True)
+    ran_in = tmp_path / "news_ran_in"
+    script = news / "docker.sh"
+    script.write_text(f'#!/bin/sh\npwd -P > "{ran_in}"\n')
+    script.chmod(0o755)
+
+    result = fake_docker.run("-n", env={"NEWS_DIR": "news"}, cwd=workdir)
+
+    assert result.returncode == 0, result.stdout
+    assert ran_in.read_text().strip() == str(news.resolve())
 
 
 def test_k_backup_without_a_recipient_fails_with_instructions(fake_docker: FakeDocker):

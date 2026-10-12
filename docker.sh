@@ -111,6 +111,8 @@ done
 _abs() { case "$1" in /*) printf '%s' "$1";; *) printf '%s/%s' "$INVOCATION_DIR" "$1";; esac; }
 [[ -n "$KEYS_ARCHIVE" ]] && KEYS_ARCHIVE="$(_abs "$KEYS_ARCHIVE")"
 [[ -n "$KEYS_IDENTITY_FILE" ]] && KEYS_IDENTITY_FILE="$(_abs "$KEYS_IDENTITY_FILE")"
+[[ -n "$KEYS_RECIPIENT" ]] && KEYS_RECIPIENT="$(_abs "$KEYS_RECIPIENT")"
+NEWS_DIR="$(_abs "$NEWS_DIR")"
 # Compose reads relative paths (such as the sandbox seccomp profile) against the
 # current directory, so always run it from the repo root (SP3 Plan 2 ruling 17).
 cd "$BUILDDIR"
@@ -632,6 +634,12 @@ _export_build_id() {
         sha=$(git -C "$BUILDDIR" rev-parse --short HEAD 2>/dev/null || echo nogit)
         stamp=$(date -u +%Y%m%dT%H%M%SZ)
         export MMR_BUILD_ID="${sha}-${stamp}"
+    fi
+    # Same format the sandbox accepts (BUILD_ID_RE in trader/sandbox/protocol.py).
+    if [[ ! "$MMR_BUILD_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$ ]]; then
+        echo "Error: MMR_BUILD_ID is invalid: '${MMR_BUILD_ID}'"
+        echo "  Use 1-128 characters from A-Z a-z 0-9 . _ : + -, starting with a letter or digit."
+        exit 1
     fi
     echo "MMR_BUILD_ID=${MMR_BUILD_ID}"
 }

@@ -232,6 +232,44 @@ def test_a_missing_or_unknown_posture_value_fails_its_check(key, value, check):
     assert check_of(result, check).passed is False
 
 
+_DOWN = {"operstate": "down", "flags": 0x80, "ipv4": False, "ipv6": False}
+_LO = {"operstate": "unknown", "flags": 0x9, "ipv4": True, "ipv6": True}
+
+
+def test_only_lo_passes_the_network_check():
+    result = ic.run_isolation_checks(_with_posture(interfaces=["lo"], interface_state={"lo": _LO}))
+    assert check_of(result, "network_none").passed is True
+
+
+def test_lo_and_down_fallback_tunnels_without_addresses_pass():                         # ruling 33
+    result = ic.run_isolation_checks(_with_posture(
+        interfaces=["ip6tnl0", "lo", "tunl0"],
+        interface_state={"lo": _LO, "tunl0": _DOWN, "ip6tnl0": dict(_DOWN)}))
+    assert check_of(result, "network_none").passed is True and result.passed is True
+
+
+@pytest.mark.parametrize("interfaces,state", [
+    (["lo", "tunl0"], {"tunl0": {**_DOWN, "operstate": "up"}}),           # tunnel up
+    (["lo", "tunl0"], {"tunl0": {**_DOWN, "flags": 0x81}}),               # IFF_UP set
+    (["lo", "tunl0"], {"tunl0": {**_DOWN, "ipv4": True}}),                # has an IPv4 address
+    (["lo", "tunl0"], {"tunl0": {**_DOWN, "ipv6": True}}),                # has an IPv6 address
+    (["eth0", "lo"], {"eth0": _DOWN}),                                    # not a fallback tunnel
+    (["lo", "tunl0"], {"tunl0": {**_DOWN, "operstate": None}}),           # unreadable state
+    (["lo", "tunl0"], {"tunl0": {**_DOWN, "flags": None}}),
+    (["lo", "tunl0"], {"tunl0": {**_DOWN, "ipv4": None}}),
+    (["lo", "tunl0"], {"tunl0": {**_DOWN, "ipv6": None}}),
+    (["lo", "tunl0"], {"tunl0": {**_DOWN, "flags": True}}),
+    (["lo", "tunl0"], {}),                                                # no state for the device
+    (["lo", "tunl0"], _DROP),                                             # no state at all
+    (["lo", "tunl0"], "down"),
+    (["tunl0"], {"tunl0": _DOWN}),                                        # no lo
+    (["lo", ["tunl0"]], {"tunl0": _DOWN}),                                # not a name
+])
+def test_any_other_interface_or_an_up_addressed_or_unknown_tunnel_fails(interfaces, state):
+    result = ic.run_isolation_checks(_with_posture(interfaces=interfaces, interface_state=state))
+    assert result.passed is False and check_of(result, "network_none").passed is False
+
+
 def test_the_store_mount_is_the_only_mount_allowed():
     result = ic.run_isolation_checks(_with_posture(home_mounts=["/store"]))
     assert result.passed is True and check_of(result, "no_home_mounts").passed

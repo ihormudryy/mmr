@@ -19,6 +19,11 @@ from trader.sandbox.protocol import BUILD_ID_RE, PROBE_CONID, SANDBOX_ERROR
 EXPECTED_CAP_EFF = "00000000000000e0"   # exactly KILL + SETGID + SETUID (ruling 2)
 EXPECTED_PIDS_MAX = "64"                # compose pids_limit (spec 7.5)
 BENIGN_PROBE = "benign_orb"
+# Ruling 33: devices some kernels (Docker Desktop's LinuxKit) create in every network namespace. Allowed beside
+# lo only while down and without an address.
+FALLBACK_TUNNEL_DEVICES = frozenset({"tunl0", "sit0", "ip6tnl0", "ip6gre0", "gre0", "gretap0", "erspan0",
+                                     "ip_vti0", "ip6_vti0"})
+_IFF_UP = 0x1
 _ALLOWED_MOUNT = "/store"               # the authored store (ruling 22); nothing under /home or /root
 
 # Plan 1's escape files, one per spec section 10 hostile behaviour (see the cross-plan note, D9).
@@ -96,7 +101,8 @@ def _posture_checks(posture: Mapping[str, Any]) -> list[CheckResult]:
         CheckResult("seccomp", _is_int(posture.get("seccomp"), 2), f"seccomp={_short(posture.get('seccomp'))}"),
         CheckResult("no_new_privs", _is_int(posture.get("no_new_privs"), 1),
                     f"no_new_privs={_short(posture.get('no_new_privs'))}"),
-        CheckResult("network_none", interfaces == ["lo"], f"interfaces={_short(interfaces)}"),
+        CheckResult("network_none", _network_is_none(interfaces, posture.get("interface_state")),
+                    f"interfaces={_short(interfaces)} state={_short(posture.get('interface_state'))}"),
         CheckResult("no_forbidden_env", forbidden_env == [], f"forbidden_env={_short(forbidden_env)}"),
         CheckResult("no_home_mounts", _only_the_store_is_mounted(mounts), f"home_mounts={_short(mounts)}"),
         CheckResult("read_only_root", posture.get("root_read_only") is True,
@@ -108,6 +114,27 @@ def _posture_checks(posture: Mapping[str, Any]) -> list[CheckResult]:
 
 def _is_int(value: Any, expected: int) -> bool:
     return type(value) is int and value == expected   # True is not 1, 2.0 is not 2
+
+
+def _network_is_none(interfaces: Any, states: Any) -> bool:
+    """lo, plus only fallback tunnels that are down and hold no address (ruling 33). Unknown state fails."""
+    if (not isinstance(interfaces, list) or not all(isinstance(name, str) for name in interfaces)
+            or "lo" not in interfaces):
+        return False
+    others = [name for name in interfaces if name != "lo"]
+    if not others:
+        return True
+    if not isinstance(states, Mapping):
+        return False
+    return all(name in FALLBACK_TUNNEL_DEVICES and _tunnel_is_down(states.get(name)) for name in others)
+
+
+def _tunnel_is_down(state: Any) -> bool:
+    if not isinstance(state, Mapping):
+        return False
+    flags = state.get("flags")
+    return (state.get("operstate") == "down" and type(flags) is int and not flags & _IFF_UP
+            and state.get("ipv4") is False and state.get("ipv6") is False)
 
 
 def _only_the_store_is_mounted(mounts: Any) -> bool:

@@ -83,3 +83,44 @@ def test_an_unreadable_proc_status_reports_unknown_not_zero(monkeypatch):
     monkeypatch.setattr(posture, "_proc_status", lambda: {"Seccomp": "two", "NoNewPrivs": "1"})
     out = posture.read_posture()
     assert out["seccomp"] is None and out["no_new_privs"] == 1
+
+
+# ── per-interface state for the fallback tunnel devices (ruling 33) ─────────
+
+def _net_dir(tmp_path, devices):
+    net = tmp_path / "net"
+    for name, (operstate, flags) in devices.items():
+        (net / name).mkdir(parents=True)
+        if operstate is not None:
+            (net / name / "operstate").write_text(operstate + "\n")
+        if flags is not None:
+            (net / name / "flags").write_text(flags + "\n")
+    return net
+
+
+def test_interface_state_reads_operstate_flags_and_addresses(tmp_path):
+    net = _net_dir(tmp_path, {"lo": ("unknown", "0x9"), "tunl0": ("down", "0x80")})
+    if_inet6 = tmp_path / "if_inet6"
+    if_inet6.write_text("00000000000000000000000000000001 01 80 10 80       lo\n")
+    states = posture.interface_states(["lo", "tunl0"], net_dir=str(net), if_inet6_path=str(if_inet6),
+                                      ipv4_reader=lambda name: name == "lo")
+    assert states["tunl0"] == {"operstate": "down", "flags": 0x80, "ipv4": False, "ipv6": False}
+    assert states["lo"] == {"operstate": "unknown", "flags": 0x9, "ipv4": True, "ipv6": True}
+
+
+def test_unreadable_interface_state_is_unknown_never_clean(tmp_path):
+    net = _net_dir(tmp_path, {"tunl0": (None, "junk")})
+    states = posture.interface_states(["tunl0"], net_dir=str(net), if_inet6_path=str(tmp_path / "none"),
+                                      ipv4_reader=lambda name: None)
+    assert states["tunl0"] == {"operstate": None, "flags": None, "ipv4": None, "ipv6": None}
+
+
+def test_the_ipv4_reader_reports_unknown_for_a_device_it_cannot_ask():
+    assert posture.has_ipv4_address("nosuchif0") is None
+    assert posture.has_ipv4_address("x" * 16) is None       # too long: never truncated onto another device
+    assert posture.has_ipv4_address("") is None
+
+
+def test_read_posture_reports_interface_state():
+    out = posture.read_posture()
+    assert isinstance(out["interface_state"], dict)

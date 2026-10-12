@@ -6,7 +6,11 @@ never as a clean value: the checks fail on unknown.
 """
 from __future__ import annotations
 
+import errno
+import fcntl
 import os
+import socket
+import struct
 
 UNREADABLE = "<unreadable>"   # a list entry no isolation check accepts
 
@@ -17,6 +21,8 @@ _FORBIDDEN_PREFIXES = ("ALPACA_", "MASSIVE_", "TWELVEDATA_", "IB_", "TWS_", "OPE
 _FORBIDDEN_NAMES = frozenset({"MMR_WEB_TOKEN", "MMR_SERVICE_HMAC_KEY_FILE", "MMR_RPC_KEYS_DIR"})
 # Mount targets the posture reports: secrets live under /home and /root, authored files under /store.
 _REPORTED_MOUNT_ROOTS = ("/home", "/store", "/root")
+_SIOCGIFADDR = 0x8915   # Linux ioctl: a device's primary IPv4 address
+_IFNAMSIZ = 16          # a device name is at most 15 bytes plus NUL
 
 
 def _proc_status() -> dict[str, str]:
@@ -32,9 +38,9 @@ def _proc_status() -> dict[str, str]:
     return out
 
 
-def _int_or_none(text: str | None) -> int | None:
+def _int_or_none(text: str | None, base: int = 10) -> int | None:
     try:
-        return int(text)
+        return int(text, base)
     except (TypeError, ValueError):
         return None
 
@@ -62,6 +68,54 @@ def interfaces(net_dir: str = "/sys/class/net") -> list[str]:
         return sorted(os.listdir(net_dir))
     except OSError:
         return [UNREADABLE]
+
+
+def has_ipv4_address(name: str) -> bool | None:
+    """Whether ``name`` holds an IPv4 address, up or down (SIOCGIFADDR); None when it cannot be asked.
+
+    A device with no primary IPv4 address has none at all: a secondary needs a primary."""
+    try:
+        raw_name = name.encode()
+    except UnicodeError:
+        return None
+    if not 0 < len(raw_name) < _IFNAMSIZ or b"\0" in raw_name:   # never truncate into another device's name
+        return None
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            fcntl.ioctl(probe.fileno(), _SIOCGIFADDR, struct.pack("256s", raw_name))
+    except OSError as exc:
+        return False if exc.errno == errno.EADDRNOTAVAIL else None
+    return True
+
+
+def ipv6_devices(if_inet6_path: str = "/proc/net/if_inet6") -> set[str] | None:
+    """Every device that holds an IPv6 address; None when the table cannot be read."""
+    try:
+        with open(if_inet6_path) as table:
+            return {fields[-1] for fields in (line.split() for line in table) if len(fields) == 6}
+    except OSError:
+        return None
+
+
+def interface_states(names: list[str], *, net_dir: str = "/sys/class/net",
+                     if_inet6_path: str = "/proc/net/if_inet6",
+                     ipv4_reader=has_ipv4_address) -> dict[str, dict]:
+    """Per device (ruling 33): operstate, the flags word (IFF_UP is bit 0) and whether it holds an IPv4 or
+    IPv6 address. A value that cannot be read is None."""
+    with_ipv6 = ipv6_devices(if_inet6_path)
+    return {name: {"operstate": _read_text(os.path.join(net_dir, name, "operstate")),
+                   "flags": _int_or_none(_read_text(os.path.join(net_dir, name, "flags")), base=16),
+                   "ipv4": ipv4_reader(name),
+                   "ipv6": None if with_ipv6 is None else name in with_ipv6}
+            for name in names if name != UNREADABLE}
+
+
+def _read_text(path: str) -> str | None:
+    try:
+        with open(path) as stream:
+            return stream.read().strip()
+    except OSError:
+        return None
 
 
 def home_mounts(mounts_path: str = "/proc/mounts") -> list[str]:
@@ -99,13 +153,15 @@ def pids_max(paths: tuple[str, ...] = ("/sys/fs/cgroup/pids.max", "/sys/fs/cgrou
 
 def read_posture() -> dict:
     status = _proc_status()
+    names = interfaces()
     return {
         "cap_eff": status.get("CapEff", ""),
         "seccomp": _int_or_none(status.get("Seccomp")),
         "no_new_privs": _int_or_none(status.get("NoNewPrivs")),
         "uid": os.getuid(),
         "pid": os.getpid(),
-        "interfaces": interfaces(),
+        "interfaces": names,
+        "interface_state": interface_states(names),
         "forbidden_env": forbidden_env_names(),
         "home_mounts": home_mounts(),
         "root_read_only": root_read_only(),

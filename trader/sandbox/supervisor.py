@@ -21,6 +21,7 @@ from trader.authored.keys import source_digest
 from trader.authored.static_check import (MAX_SOURCE_BYTES, AuthoredStaticRejected, _parse_quietly,
                                           require_clean)
 from trader.sandbox import protocol as proto
+from trader.sandbox.caps import SLOT_DIR_MODE, slot_dir
 from trader.sandbox.child import (SBXCHILD_GID, SLOT_UIDS, ChildError, ChildHandle, SpawnSpec, Spawner,
                                   _kill_and_reap, close_fds_except)
 
@@ -329,7 +330,7 @@ def _build_pool(name: str, size: int, spawners: Mapping[str, Spawner]) -> Pool:
     uids = _POOL_UIDS[name]
     if type(size) is not int or not 0 <= size <= len(uids):
         raise ValueError(f"pool {name!r} has {len(uids)} slot uids, cannot size it {size!r}")
-    slots = [Slot(uid=uid, directory=f"/tmp/s{uid}") for uid in uids[:size]]
+    slots = [Slot(uid=uid, directory=slot_dir(uid)) for uid in uids[:size]]
     return Pool(name=name, free_slots=slots, size=size)
 
 
@@ -399,7 +400,7 @@ def wipe_slot_as_owner(slot: Slot, *, timeout_s: float = _WIPE_TIMEOUT_S) -> boo
 
     The serving supervisor has only SETUID, SETGID and KILL: no CAP_CHOWN or CAP_DAC_*, so it cannot read a
     0700 directory its child owns. A short-lived helper forked and dropped to the slot uid can. It runs only
-    unlink/rmdir, then exits; its exit status is the answer. A failure quarantines the slot (ruling 13)."""
+    chmod (on dirs it owns), unlink and rmdir, then exits; its exit status is the answer. A failure quarantines the slot (ruling 13)."""
     if not Path(slot.directory).exists():
         return True
     pid = os.fork()
@@ -412,6 +413,7 @@ def wipe_slot_as_owner(slot: Slot, *, timeout_s: float = _WIPE_TIMEOUT_S) -> boo
             os.setgroups([])
             os.setresgid(SBXCHILD_GID, SBXCHILD_GID, SBXCHILD_GID)
             os.setresuid(slot.uid, slot.uid, slot.uid)
+            _unlock_tree(slot.directory)
             _empty(slot.directory)
             code = 0
         except BaseException:  # noqa: BLE001 — any failure is a dirty slot
@@ -437,6 +439,22 @@ def _helper_succeeded(pid: int, timeout_s: float) -> bool:
             _kill_and_reap(pid)
             return False
         time.sleep(_WIPE_POLL_S)
+
+
+def _unlock_tree(directory: str) -> None:
+    """Give the slot dir and every dir under it mode 0700 again, top-down, so the wipe can list and empty them.
+
+    The child owns its slot and may chmod it to 000 or set the sticky bit; the helper is the same owner, so this
+    needs no capability. A dir another uid owns cannot be changed: that raises, and the slot is quarantined."""
+    def fail(error: OSError) -> None:
+        raise error
+
+    os.chmod(directory, SLOT_DIR_MODE)
+    for root, dirs, _files in os.walk(directory, onerror=fail, followlinks=False):
+        for name in dirs:   # before os.walk lists them
+            path = os.path.join(root, name)
+            if not os.path.islink(path):
+                os.chmod(path, SLOT_DIR_MODE)
 
 
 def _empty(directory: str) -> None:

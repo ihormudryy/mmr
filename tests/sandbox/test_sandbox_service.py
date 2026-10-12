@@ -191,3 +191,95 @@ def test_main_health_exits_by_the_answer(service, monkeypatch):
     with pytest.raises(SystemExit) as down:
         service.main(["--health"])
     assert down.value.code == 1
+
+
+class _FakeServer:
+    def __init__(self, calls):
+        self.calls = calls
+
+    async def close(self):
+        self.calls.append("close")
+
+
+@pytest.fixture
+def startup(service, monkeypatch):
+    """_amain with every privileged step replaced by a recorder (a test must never drop its own capabilities)."""
+    import signal
+
+    from trader.sandbox import caps
+
+    calls = []
+    monkeypatch.setattr(service, "_join_trader_group", lambda: calls.append("join"))
+    monkeypatch.setattr(caps, "prepare_slot_dirs", lambda uids: calls.append(("prepare", tuple(uids))))
+    monkeypatch.setattr(caps, "drop_capability", lambda bit: calls.append(("drop", bit)))
+    monkeypatch.setattr(caps, "require_serving_caps", lambda: calls.append("require"))
+    monkeypatch.setattr(service, "read_build_id", lambda: "build-x")
+    monkeypatch.setattr(service, "read_posture", lambda: calls.append("posture") or {"uid": 0})
+
+    async def fake_serve(supervisor, sockets):
+        calls.append(("serve", tuple(sorted(sockets))))
+        os.kill(os.getpid(), signal.SIGTERM)   # as docker stop sends it, once the sockets listen
+        return _FakeServer(calls)
+
+    monkeypatch.setattr(service, "serve", fake_serve)
+    return calls
+
+
+def _run_with_timeout(service):
+    import asyncio
+
+    async def bounded():
+        await asyncio.wait_for(service._amain(), timeout=10)
+
+    asyncio.run(bounded())
+
+
+def test_chown_is_dropped_before_the_posture_is_read_and_sigterm_closes_the_server(service, startup):    # ruling 2
+    # The posture is read once: read before the drop, every PONG would show CHOWN and every proof would fail.
+    # SIGTERM (docker stop) must close the server: stop listening, end every session, kill its child.
+    from trader.sandbox import caps
+    from trader.sandbox.child import SLOT_UIDS
+
+    _run_with_timeout(service)
+    assert startup == ["join", ("prepare", tuple(SLOT_UIDS)), ("drop", caps.CAP_CHOWN), "require", "posture",
+                       ("serve", ("live", "research")), "close"]
+
+
+def test_sigint_also_closes_the_server(service, startup, monkeypatch):
+    import signal
+
+    async def serve_then_interrupt(supervisor, sockets):
+        startup.append("serve")
+        os.kill(os.getpid(), signal.SIGINT)
+        return _FakeServer(startup)
+
+    monkeypatch.setattr(service, "serve", serve_then_interrupt)
+    _run_with_timeout(service)
+    assert startup[-2:] == ["serve", "close"]
+
+
+@pytest.mark.parametrize("failing_step", ["prepare_slot_dirs", "drop_capability", "require_serving_caps"])
+def test_a_failed_slot_setup_or_drop_never_serves(service, startup, monkeypatch, failing_step):
+    from trader.sandbox import caps
+
+    def fail(*args):
+        raise (OSError(1, "Operation not permitted") if failing_step == "prepare_slot_dirs"
+               else caps.CapabilityError("capability 0 is still effective"))
+
+    monkeypatch.setattr(caps, failing_step, fail)
+    with pytest.raises(SystemExit, match="refuses to start"):
+        _run_with_timeout(service)
+    assert "posture" not in startup and not any(isinstance(c, tuple) and c[0] == "serve" for c in startup)
+
+
+def test_nothing_that_runs_while_serving_needs_chown():    # carry-forward: CHOWN is gone once serving
+    # The socket dirs and sockets are chgrp'd only (the owner, in group trader, needs no capability); the
+    # supervisor and the child never chown. Only caps.prepare_slot_dirs does, before the drop.
+    chowns = {}
+    for name in ("server.py", "supervisor.py", "child.py"):
+        source = (REPO / "trader" / "sandbox" / name).read_text()
+        chowns[name] = [ast.unparse(node) for node in ast.walk(ast.parse(source))
+                        if isinstance(node, ast.Call)
+                        and ast.unparse(node.func) in ("os.chown", "os.fchown", "os.lchown")]
+    assert chowns["supervisor.py"] == [] and chowns["child.py"] == []
+    assert chowns["server.py"] and all(", -1, " in call for call in chowns["server.py"]), chowns

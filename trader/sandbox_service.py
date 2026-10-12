@@ -7,12 +7,15 @@ for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ[_var] = "1"
 
 import asyncio  # noqa: E402
+import contextlib  # noqa: E402
 import logging  # noqa: E402
+import signal  # noqa: E402
 import socket  # noqa: E402
 import sys  # noqa: E402
 
+from trader.sandbox import caps  # noqa: E402
 from trader.sandbox import protocol as proto  # noqa: E402
-from trader.sandbox.child import ChildError, ForkSpawner, recv_frame  # noqa: E402
+from trader.sandbox.child import SLOT_UIDS, ChildError, ForkSpawner, recv_frame  # noqa: E402
 from trader.sandbox.posture import read_posture  # noqa: E402  (Task 6)
 from trader.sandbox.server import TRADER_GID, serve  # noqa: E402
 from trader.sandbox.supervisor import LIVE_POOL_SIZE, RESEARCH_POOL_SIZE, Supervisor  # noqa: E402
@@ -22,6 +25,7 @@ log = logging.getLogger("mmr.sandbox")
 BUILD_ID_FILE = "/etc/mmr-build-id"
 HEALTH_TIMEOUT_S = 2.0
 _USAGE = "usage: python -m trader.sandbox_service [--health]"
+_STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
 
 
 def read_build_id(path: str = BUILD_ID_FILE) -> str:
@@ -68,12 +72,42 @@ def _join_trader_group() -> None:
         raise SystemExit(f"sandbox refuses to start: cannot join group trader ({TRADER_GID}): {exc}") from exc
 
 
+def _prepare_slots_then_drop_chown() -> None:
+    """Ruling 2: CAP_CHOWN only gives each slot its own directory, and is gone before anything is served."""
+    try:
+        caps.prepare_slot_dirs(SLOT_UIDS)
+        caps.drop_capability(caps.CAP_CHOWN)
+        caps.require_serving_caps()
+    except (OSError, RuntimeError) as exc:
+        raise SystemExit(f"sandbox refuses to start: {exc}") from exc
+
+
+@contextlib.contextmanager
+def _stop_on_signals():
+    """An event set by SIGTERM (docker stop, through docker-init: ruling 14) or SIGINT."""
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+    for stop_signal in _STOP_SIGNALS:
+        loop.add_signal_handler(stop_signal, stop.set)
+    try:
+        yield stop
+    finally:
+        for stop_signal in _STOP_SIGNALS:
+            loop.remove_signal_handler(stop_signal)
+
+
 async def _amain() -> None:
     _join_trader_group()
-    supervisor = build_supervisor()
-    await serve(supervisor, {"live": proto.LIVE_SOCKET, "research": proto.RESEARCH_SOCKET})
-    log.info("sandbox serving live=%s research=%s", proto.LIVE_SOCKET, proto.RESEARCH_SOCKET)
-    await asyncio.Event().wait()   # serve forever
+    _prepare_slots_then_drop_chown()
+    supervisor = build_supervisor()   # reads the posture once, so only after the drop: PONG shows the serving caps
+    with _stop_on_signals() as stop:
+        server = await serve(supervisor, {"live": proto.LIVE_SOCKET, "research": proto.RESEARCH_SOCKET})
+        log.info("sandbox serving live=%s research=%s", proto.LIVE_SOCKET, proto.RESEARCH_SOCKET)
+        try:
+            await stop.wait()
+        finally:
+            await server.close()   # stop listening, end every session and kill its child
+    log.info("sandbox stopped")
 
 
 def main(argv: list[str] | None = None) -> None:

@@ -229,6 +229,29 @@ def test_the_wipe_helper_empties_the_directory_as_the_slot_uid(tmp_path, monkeyp
     assert list(directory.iterdir()) == [] and seen.read_text() == "(20001, 20001, 20001)"
 
 
+def test_the_wipe_helper_undoes_a_hostile_chmod_on_its_slot(tmp_path, monkeypatch):
+    # A child owns its slot dir, so it may chmod it (or a subdir) to 000 or add the sticky bit. The helper is that
+    # same owner: it restores 0700 instead of failing, so one session cannot quarantine its slot for good.
+    from trader.sandbox.supervisor import Slot, wipe_slot_as_owner
+
+    directory = tmp_path / "s20003"
+    (directory / "locked" / "inner").mkdir(parents=True)
+    (directory / "locked" / "inner" / "deep.txt").write_text("y")
+    (directory / "locked" / "kept.txt").write_text("x")
+    (directory / "locked" / "inner").chmod(0)
+    (directory / "locked").chmod(0o500)
+    directory.chmod(0o1000)
+    for name in ("setgroups", "setresgid", "setresuid"):
+        monkeypatch.setattr(os, name, lambda *args: None, raising=False)       # a unit test is not root
+    try:
+        assert wipe_slot_as_owner(Slot(uid=20003, directory=str(directory))) is True
+        assert list(directory.iterdir()) == [] and (directory.stat().st_mode & 0o7777) == 0o700
+    finally:
+        for path in (directory, directory / "locked", directory / "locked" / "inner"):
+            if path.exists():
+                path.chmod(0o700)   # let pytest clean up after a failure
+
+
 def test_a_helper_that_cannot_become_the_slot_uid_leaves_a_dirty_slot(tmp_path, monkeypatch):
     from trader.sandbox.supervisor import Slot, wipe_slot_as_owner
 

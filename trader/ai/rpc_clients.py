@@ -1,6 +1,7 @@
 """Method-restricted typed RPC clients of the ai service (SP2 spec 4, Plan 5 Rulings 1-3).
 
-Two principals in one process (spec 4 accepted limit: not process isolation).
+Three principals in one process (ai_supervisor, ai_research and, when authoring is on, ai_author; spec 4
+accepted limit: not process isolation).
 Each client refuses a method outside its set before anything is signed or
 sent. TypedRpcClient is blocking and holds a lock per call, so every call runs
 on a worker thread, and the 90 s discovery read has its own socket.
@@ -17,10 +18,13 @@ SUPERVISOR_QUERIES = frozenset({
     "read_ai_signals", "get_ai_paper_decision", "get_experiment", "get_experiment_trips", "get_ai_risk_policy",
     "get_ai_deployment", "get_snapshot", "get_positions", "get_ai_model_budget",
     "get_account_values", "get_ai_entry_quote",                           # SP2 Plan 6 Ruling 4
-    "get_broker_order_evidence"})                                          # a waiting exit's proof (PR #86)
+    "get_broker_order_evidence",                                          # a waiting exit's proof (PR #86)
+    "get_scoreboard"})                                                    # the author's prompt (SP3 Plan 5)
 SUPERVISOR_SLOW_QUERIES: Mapping[str, float] = {"discover_ai_candidates": 90.0}
 RESEARCH_COMMANDS = frozenset({"register_ai_deployment", "record_backtest_judgment"})    # ai_research -> trader
 RESEARCH_QUERIES = frozenset({"get_ai_deployment", "get_backtest_judgment", "get_ai_deployment_version"})
+AUTHOR_COMMANDS = frozenset({"submit_authored_strategy"})                 # ai_author -> trader (SP3 spec 5)
+AUTHOR_QUERIES = frozenset({"get_authored_strategies"})
 LAB_COMMANDS = frozenset({"submit_evaluation", "attest_from_judgment"})                   # ai_research -> research
 LAB_QUERIES = frozenset({"get_evaluation"})
 EPOCH_METHODS = frozenset({"submit_ai_paper_decision", "read_ai_signals", "get_ai_paper_decision"})
@@ -130,11 +134,12 @@ class AiRpcClients:
     supervisor: PrincipalClient
     research: PrincipalClient                         # ai_research at the trader
     lab: PrincipalClient                              # ai_research at the research server
+    author: Optional[PrincipalClient] = None          # ai_author at the trader; None while authoring is off
 
     @classmethod
     def from_sockets(cls, *, supervisor_command: Any, supervisor_query: Any, supervisor_discovery: Any,
                      research_command: Any, research_query: Any, lab_command: Any, lab_query: Any,
-                     timeout: float) -> "AiRpcClients":
+                     timeout: float, author_command: Any = None, author_query: Any = None) -> "AiRpcClients":
         supervisor = PrincipalClient("ai_supervisor", command=supervisor_command, query=supervisor_query,
                                      slow_query=supervisor_discovery, commands=SUPERVISOR_COMMANDS,
                                      queries=SUPERVISOR_QUERIES, slow_queries=SUPERVISOR_SLOW_QUERIES,
@@ -143,16 +148,22 @@ class AiRpcClients:
                                    commands=RESEARCH_COMMANDS, queries=RESEARCH_QUERIES, timeout=timeout)
         lab = PrincipalClient("ai_research", command=lab_command, query=lab_query, commands=LAB_COMMANDS,
                               queries=LAB_QUERIES, timeout=timeout, unreachable_code="RESEARCH_UNREACHABLE")
-        return cls(supervisor, research, lab)
+        author = None
+        if author_command is not None and author_query is not None:
+            author = PrincipalClient("ai_author", command=author_command, query=author_query,
+                                     commands=AUTHOR_COMMANDS, queries=AUTHOR_QUERIES, timeout=timeout)
+        return cls(supervisor, research, lab, author)
 
     @classmethod
     def connect(cls, *, keys_dir: Optional[str], address: str, query_port: int, command_port: int,
                 research_address: str, research_query_port: int, research_command_port: int,
-                timeout: float) -> "AiRpcClients":
-        """Load both key pairs (startup only) and open seven sockets. ZMQ connects lazily: no server needed yet."""
+                timeout: float, author: bool = False) -> "AiRpcClients":
+        """Load the key pairs (startup only) and open seven sockets, nine with authoring on. ZMQ connects lazily:
+        no server needed yet. The ai_author key loads only when ``author`` is true."""
         from trader.messaging.typed_rpc import ServiceIdentity, TypedRpcClient
 
-        identities = {p: ServiceIdentity.load(p, keys_dir) for p in ("ai_supervisor", "ai_research")}
+        principals = ("ai_supervisor", "ai_research") + (("ai_author",) if author else ())
+        identities = {p: ServiceIdentity.load(p, keys_dir) for p in principals}
 
         def trader_socket(principal: str, role: str) -> Any:
             return open_socket(principal, role, "trader", address, command_port if role == "command" else query_port)
@@ -172,9 +183,13 @@ class AiRpcClients:
             supervisor_discovery=trader_socket("ai_supervisor", "query"),
             research_command=trader_socket("ai_research", "command"),
             research_query=trader_socket("ai_research", "query"),
-            lab_command=research_socket("command"), lab_query=research_socket("query"), timeout=timeout)
+            lab_command=research_socket("command"), lab_query=research_socket("query"), timeout=timeout,
+            author_command=trader_socket("ai_author", "command") if author else None,
+            author_query=trader_socket("ai_author", "query") if author else None)
 
     def close(self) -> None:
         self.supervisor.close()
         self.research.close()
         self.lab.close()
+        if self.author is not None:
+            self.author.close()

@@ -5,7 +5,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 FORBIDDEN = ("ib_async", "trader.trading", "trader.trader_service", "trader.data_providers", "trader.scoreboard",
-             "trader.strategy", "trader.simulation", "alpaca")
+             "trader.strategy", "trader.simulation", "alpaca",
+             # SP3 Plan 5 (G14): no authored-strategy store and no sandbox in the ai service
+             "trader.sandbox", "trader.automation.authored")
 # SP2c Plan 4: the research menu reads strategy files as text through the AST scanner, nothing else.
 ALLOWED = ("trader.strategy", "trader.strategy.inspect")
 MODULES = ("trader.ai.ids", "trader.ai.runtime_schema", "trader.ai.rpc_clients", "trader.ai.leadership",
@@ -16,7 +18,9 @@ MODULES = ("trader.ai.ids", "trader.ai.runtime_schema", "trader.ai.rpc_clients",
            "trader.ai.roles", "trader.ai.baselines", "trader.ai.decision_engine", "trader.ai.decision_replay",
            # SP2c Plan 4
            "trader.ai.research_cycle", "trader.ai.research_menu", "trader.ai.research_roles",
-           "trader.ai.research_wire", "trader.ai.backtest_judge")
+           "trader.ai.research_wire", "trader.ai.backtest_judge",
+           # SP3 Plan 5
+           "trader.ai.author_schema", "trader.ai.author_wire")
 
 
 def test_the_runtime_stays_clear_of_the_trading_runtime():

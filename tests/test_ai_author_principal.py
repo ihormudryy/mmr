@@ -64,7 +64,9 @@ def test_compose_mounts_follow_the_principal_tables():
     assert "ai_author.pub" in visible_rpc_files(services["trader"])
     for name, service in services.items():
         if name not in ("ai", "keygen"):
-            assert "ai_author.key" not in (visible_rpc_files(service) or set()), name
+            visible = visible_rpc_files(service)
+            assert visible is not None, f"{name} sees the whole host key directory"
+            assert "ai_author.key" not in visible, name
 
 
 def test_rotation_restarts_the_ai_service_and_the_trader():

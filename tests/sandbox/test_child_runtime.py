@@ -846,3 +846,75 @@ def test_a_forked_child_runs_as_its_slot_uid_and_answers_a_bar(tmp_path):
         assert int(fields["CapEff"].strip(), 16) == 0
     finally:
         handle.close()
+
+
+class _Exited(BaseException):
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+def test_a_forked_child_resets_its_signals_before_anything_else(monkeypatch):
+    # The fork seam: run the child's path in process with every step recorded and os._exit turned into an exception.
+    calls = []
+    monkeypatch.setattr(child_module, "reset_signals_after_fork", lambda: calls.append("reset"))
+    monkeypatch.setattr(child_module, "close_fds_except", lambda keep: calls.append("close_fds"))
+    monkeypatch.setattr(child_module, "_drop_privileges", lambda spec: calls.append("drop"))
+    monkeypatch.setattr(child_module, "_set_child_rlimits", lambda spec: calls.append("rlimits"))
+    monkeypatch.setattr(child_module, "_serve_session", lambda spec, sock: calls.append("serve") or 0)
+
+    def exit_now(code):
+        raise _Exited(code)
+
+    monkeypatch.setattr(child_module.os, "_exit", exit_now)
+    parent, child = socket.socketpair()
+    with parent, child, pytest.raises(_Exited) as exited:
+        child_module._run_forked_child(_spec(), child)
+    assert calls == ["reset", "close_fds", "drop", "rlimits", "serve"] and exited.value.code == 0
+
+
+def test_a_child_that_cannot_reset_its_signals_runs_nothing(monkeypatch):
+    calls = []
+
+    def refuse():
+        raise ValueError("signal only works in main thread")
+
+    monkeypatch.setattr(child_module, "reset_signals_after_fork", refuse)
+    monkeypatch.setattr(child_module, "close_fds_except", lambda keep: calls.append("close_fds"))
+    monkeypatch.setattr(child_module, "_drop_privileges", lambda spec: calls.append("drop"))
+    monkeypatch.setattr(child_module.os, "_exit", lambda code: (_ for _ in ()).throw(_Exited(code)))
+    parent, child = socket.socketpair()
+    with parent, child, pytest.raises(_Exited) as exited:
+        child_module._run_forked_child(_spec(), child)
+    assert calls == [] and exited.value.code == child_module._EXIT_CHILD_CRASHED
+
+
+_RESET_PROBE = '''
+import asyncio, json, os, signal
+from trader.sandbox.child import reset_signals_after_fork
+
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+loop.add_signal_handler(signal.SIGTERM, lambda: None)   # what the serving supervisor installs
+loop.add_signal_handler(signal.SIGINT, lambda: None)
+signal.signal(signal.SIGUSR1, lambda *args: None)
+reset_signals_after_fork()
+print(json.dumps({
+    "term": signal.getsignal(signal.SIGTERM) is signal.SIG_DFL,
+    "int": signal.getsignal(signal.SIGINT) is signal.SIG_DFL,
+    "usr1": signal.getsignal(signal.SIGUSR1) is signal.SIG_DFL,
+    "pipe_still_ignored": signal.getsignal(signal.SIGPIPE) is signal.SIG_IGN,
+    "wakeup_fd": signal.set_wakeup_fd(-1),
+}))
+'''
+
+
+def test_the_reset_restores_default_handlers_and_clears_the_wakeup_fd():
+    # In a subprocess: the reset must not touch pytest's own handlers.
+    import json
+    import subprocess
+
+    out = subprocess.run([sys.executable, "-c", _RESET_PROBE], cwd=Path(__file__).resolve().parents[2],
+                         capture_output=True, text=True, timeout=60, check=True).stdout
+    assert json.loads(out) == {"term": True, "int": True, "usr1": True, "pipe_still_ignored": True,
+                               "wakeup_fd": -1}

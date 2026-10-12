@@ -10,6 +10,7 @@ import json
 import math
 import os
 import resource
+import signal
 import socket
 import struct
 import time
@@ -365,6 +366,7 @@ def _run_forked_child(spec: SpawnSpec, sock: socket.socket) -> None:
     """The child's whole life. It never returns into the supervisor's code or its event loop."""
     code = _EXIT_CHILD_CRASHED
     try:
+        reset_signals_after_fork()
         close_fds_except({sock.fileno()})
         try:
             _drop_privileges(spec)
@@ -390,6 +392,18 @@ def _send_fault_quietly(sock: socket.socket, detail: str) -> None:
         send_frame(sock, {"ok": False, "detail": detail})
     except (ChildError, OSError):
         pass
+
+
+def reset_signals_after_fork() -> None:
+    """First thing in any forked child: drop the supervisor's asyncio signal setup.
+
+    Without this, a SIGTERM to the child would be swallowed by the loop's no-op handler, and a signal would be
+    written into the parent's loop pipe (the wakeup fd). Every Python-level handler goes back to SIG_DFL; a
+    signal Python ignores (SIGPIPE, SIGXFSZ) stays ignored."""
+    signal.set_wakeup_fd(-1)
+    for signum in signal.valid_signals():
+        if callable(signal.getsignal(signum)):
+            signal.signal(signum, signal.SIG_DFL)
 
 
 def close_fds_except(keep: set[int]) -> None:

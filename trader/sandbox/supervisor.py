@@ -23,7 +23,7 @@ from trader.authored.static_check import (MAX_SOURCE_BYTES, AuthoredStaticReject
 from trader.sandbox import protocol as proto
 from trader.sandbox.caps import SLOT_DIR_MODE, slot_dir
 from trader.sandbox.child import (SBXCHILD_GID, SLOT_UIDS, ChildError, ChildHandle, SpawnSpec, Spawner,
-                                  _kill_and_reap, close_fds_except)
+                                  _kill_and_reap, close_fds_except, reset_signals_after_fork)
 
 log = logging.getLogger("mmr.sandbox")
 
@@ -407,6 +407,7 @@ def wipe_slot_as_owner(slot: Slot, *, timeout_s: float = _WIPE_TIMEOUT_S) -> boo
     if pid == 0:
         code = 1
         try:
+            reset_signals_after_fork()
             resource.setrlimit(resource.RLIMIT_CPU, (_WIPE_CPU_SECONDS, _WIPE_CPU_SECONDS))
             # As the slot uid it must hold no listening socket and no other session's pipe.
             close_fds_except(set())

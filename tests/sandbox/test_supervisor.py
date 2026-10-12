@@ -252,6 +252,30 @@ def test_the_wipe_helper_undoes_a_hostile_chmod_on_its_slot(tmp_path, monkeypatc
                 path.chmod(0o700)   # let pytest clean up after a failure
 
 
+def test_the_wipe_helper_resets_its_signals_before_anything_else(tmp_path, monkeypatch):
+    # The fork seam: os.fork returns 0, so the helper's path runs in process; os._exit becomes an exception.
+    from trader.sandbox import supervisor as supervisor_module
+    from trader.sandbox.supervisor import Slot, wipe_slot_as_owner
+
+    class Exited(BaseException):
+        pass
+
+    directory = tmp_path / "s20004"
+    directory.mkdir()
+    calls = []
+    monkeypatch.setattr(os, "fork", lambda: 0)
+    monkeypatch.setattr(os, "_exit", lambda code: (_ for _ in ()).throw(Exited(code)))
+    monkeypatch.setattr(supervisor_module, "reset_signals_after_fork", lambda: calls.append("reset"))
+    monkeypatch.setattr(supervisor_module.resource, "setrlimit", lambda *args: calls.append("rlimit"))
+    monkeypatch.setattr(supervisor_module, "close_fds_except", lambda keep: calls.append("close_fds"))
+    for name in ("setgroups", "setresgid", "setresuid"):
+        monkeypatch.setattr(os, name, lambda *args, name=name: calls.append(name), raising=False)
+    with pytest.raises(Exited) as exited:
+        wipe_slot_as_owner(Slot(uid=20004, directory=str(directory)))
+    assert calls == ["reset", "rlimit", "close_fds", "setgroups", "setresgid", "setresuid"]
+    assert exited.value.args == (0,)
+
+
 def test_a_helper_that_cannot_become_the_slot_uid_leaves_a_dirty_slot(tmp_path, monkeypatch):
     from trader.sandbox.supervisor import Slot, wipe_slot_as_owner
 

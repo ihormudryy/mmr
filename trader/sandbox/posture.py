@@ -10,6 +10,7 @@ import errno
 import fcntl
 import os
 import socket
+import stat
 import struct
 
 UNREADABLE = "<unreadable>"   # a list entry no isolation check accepts
@@ -61,10 +62,20 @@ def forbidden_env_names() -> list[str]:
 
 
 def interfaces(net_dir: str = "/sys/class/net") -> list[str]:
+    """Every network device. A regular file there (bonding_masters, when the bonding module is loaded) is a sysfs
+    control file, not a device; any other entry, also one that cannot be inspected, counts as a device."""
     try:
-        return sorted(os.listdir(net_dir))
+        names = os.listdir(net_dir)
     except (OSError, ValueError):
         return [UNREADABLE]
+    return sorted(name for name in names if not _is_regular_file(os.path.join(net_dir, name)))
+
+
+def _is_regular_file(path: str) -> bool:
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False   # unknown: kept as a device, so the network check judges it
 
 
 def has_ipv4_address(name: str) -> bool | None:

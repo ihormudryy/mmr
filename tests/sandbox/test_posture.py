@@ -57,6 +57,20 @@ def test_unreadable_interfaces_and_mounts_never_look_clean(tmp_path):
     assert posture.home_mounts(str(tmp_path / "no-mounts")) == [posture.UNREADABLE]
 
 
+def test_a_sysfs_control_file_is_not_an_interface(tmp_path):
+    # Found on Docker Desktop's kernel (Task 11, phase 2): with the bonding module loaded, /sys/class/net holds
+    # the regular file bonding_masters beside the device links. It is not a device, so network_none must not see it.
+    devices = tmp_path / "devices"
+    (devices / "lo").mkdir(parents=True)
+    (devices / "tunl0").mkdir()
+    net = tmp_path / "net"
+    net.mkdir()
+    (net / "lo").symlink_to(devices / "lo")
+    (net / "tunl0").symlink_to(devices / "tunl0")
+    (net / "bonding_masters").write_text("\n")
+    assert posture.interfaces(str(net)) == ["lo", "tunl0"]
+
+
 def test_interfaces_and_home_mounts_are_read(tmp_path):
     net = tmp_path / "net"
     (net / "lo").mkdir(parents=True)

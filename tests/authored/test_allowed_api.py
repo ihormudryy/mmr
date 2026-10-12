@@ -178,7 +178,7 @@ def test_the_checker_rule_data_lives_with_the_allow_lists():
     assert {"eval", "exec", "getattr", "__import__", "format"} <= BANNED_NAMES
     assert BANNED_ATTRIBUTES == frozenset({"format", "format_map"})
     assert IO_ATTRIBUTE_PREFIXES == ("read_", "to_")
-    assert IO_EXEMPT_NAMES == frozenset({"to_numpy"})
+    assert IO_EXEMPT_NAMES == frozenset({"to_numpy", "to_datetime"})
     assert {"load", "save", "query", "pickle"} <= IO_NAMES
     assert PROTECTED_NAMES == frozenset({"AuthoredStrategy", "Decision"})
 
@@ -187,3 +187,10 @@ def test_no_allowed_name_is_also_banned():
     assert not ALLOWED_BUILTINS & BANNED_NAMES
     for names in ALLOWED_MODULE_ATTRIBUTES.values():
         assert not names & (BANNED_NAMES | DENIED_CHAIN_NAMES | IO_NAMES)
+
+
+def test_every_exempt_io_name_is_to_numpy_or_an_allowed_module_attribute():
+    # An exemption only for what the allow-list already offers; every other to_* stays I/O.
+    allowed_attributes = set().union(*ALLOWED_MODULE_ATTRIBUTES.values())
+    assert IO_EXEMPT_NAMES - {"to_numpy"} <= allowed_attributes
+    assert {name for name in allowed_attributes if name.startswith(IO_ATTRIBUTE_PREFIXES)} <= IO_EXEMPT_NAMES

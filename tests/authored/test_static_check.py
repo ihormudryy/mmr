@@ -62,6 +62,36 @@ def test_a_listed_import_without_an_attribute_list_is_refused(monkeypatch):
     assert "import_not_allowed" in _rules("import typing\n" + CLEAN)
 
 
+def _with_class_name(name):
+    return CLEAN.replace("class Good(", f"class {name}(", 1)
+
+
+def test_a_class_name_the_authored_key_refuses_is_refused():
+    # 65 characters: a valid identifier, but over the key grammar's 64 (keys.authored_key).
+    assert "class_shape" in _rules(_with_class_name("S" * 65))
+
+
+def test_a_class_name_at_the_key_grammar_limit_passes():
+    assert check_source(_with_class_name("S" * 64)) == []
+
+
+def test_a_non_ascii_class_name_is_refused():
+    assert "class_shape" in _rules(_with_class_name("Gr\u00fcn"))
+
+
+def test_pd_to_datetime_from_the_allow_list_passes():
+    body = CLEAN.replace("return None", "stamps = pd.to_datetime(history.index)\n        return None")
+    assert check_source(body) == []
+
+
+@pytest.mark.parametrize("call", [
+    "history.to_pickle('x')", "history.to_csv('x')", "history.to_json()", "history.to_sql('t', None)",
+    "history.to_dict()", "pd.to_pickle(history, 'x')",
+])
+def test_a_real_to_io_call_is_still_refused(call):
+    assert "io_attribute" in _rules(_with_statement(f"y = {call}"))
+
+
 def test_abc_register_on_the_base_class_is_refused():
     body = CLEAN.replace("return None", "AuthoredStrategy.register(Decision)\n        return None")
     assert "banned_name" in _rules(body)

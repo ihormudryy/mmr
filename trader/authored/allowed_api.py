@@ -115,9 +115,10 @@ BANNED_NAMES: frozenset[str] = frozenset({
 BANNED_ATTRIBUTES: frozenset[str] = frozenset({"format", "format_map"})
 
 # An attribute that reads or writes outside the process: read_*/to_* (except the
-# names in IO_EXEMPT_NAMES) and the exact names in IO_NAMES.
+# names in IO_EXEMPT_NAMES) and the exact names in IO_NAMES. An exempt name is
+# to_numpy or a to_* that ALLOWED_MODULE_ATTRIBUTES lists (a test keeps it so).
 IO_ATTRIBUTE_PREFIXES: tuple[str, ...] = ("read_", "to_")
-IO_EXEMPT_NAMES: frozenset[str] = frozenset({"to_numpy"})
+IO_EXEMPT_NAMES: frozenset[str] = frozenset({"to_numpy", "to_datetime"})
 IO_NAMES: frozenset[str] = frozenset({
     "load", "save", "savez", "fromfile", "tofile", "eval", "query", "ctypeslib", "pickle"})
 

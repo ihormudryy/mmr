@@ -6,7 +6,7 @@ import hashlib
 import pytest
 
 from trader.authored.keys import (
-    authored_key, is_authored_key, parse_authored_key, source_digest,
+    authored_key, is_authored_key, is_valid_class_name, parse_authored_key, source_digest,
 )
 
 SOURCE = b"class X(AuthoredStrategy):\n    pass\n"
@@ -84,3 +84,12 @@ def test_parse_refuses_a_non_string_with_value_error(key):
     with pytest.raises(ValueError):
         parse_authored_key(key)
     assert not is_authored_key(key)
+
+
+@pytest.mark.parametrize("name, valid", [
+    ("S" * 64, True), ("S" * 65, False), ("_X1", True), ("1X", False), ("Gr\u00fcn", False), (None, False),
+])
+def test_is_valid_class_name_is_the_key_grammar(name, valid):
+    assert is_valid_class_name(name) is valid
+    if valid:
+        assert parse_authored_key(authored_key(DIGEST, name)) == (DIGEST, name)

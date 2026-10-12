@@ -8,10 +8,12 @@ from __future__ import annotations
 import hashlib
 import re
 
-_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
-_CLASS_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
-_AUTHORED_KEY = re.compile(
-    r"authored:(sha256:[0-9a-f]{64}):([A-Za-z_][A-Za-z0-9_]{0,63})")
+_DIGEST_PATTERN = r"sha256:[0-9a-f]{64}"
+# ASCII only and at most 64 characters: the static checker refuses any class name this refuses.
+_CLASS_NAME_PATTERN = r"[A-Za-z_][A-Za-z0-9_]{0,63}"
+_DIGEST = re.compile(_DIGEST_PATTERN)
+_CLASS_NAME = re.compile(_CLASS_NAME_PATTERN)
+_AUTHORED_KEY = re.compile(f"authored:({_DIGEST_PATTERN}):({_CLASS_NAME_PATTERN})")
 
 
 def source_digest(source: bytes) -> str:
@@ -20,10 +22,14 @@ def source_digest(source: bytes) -> str:
     return f"sha256:{hashlib.sha256(source).hexdigest()}"
 
 
+def is_valid_class_name(class_name: object) -> bool:
+    return isinstance(class_name, str) and _CLASS_NAME.fullmatch(class_name) is not None
+
+
 def authored_key(digest: str, class_name: str) -> str:
     if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
         raise ValueError(f"digest must match sha256:<64 hex>, got {digest!r}")
-    if not isinstance(class_name, str) or not _CLASS_NAME.fullmatch(class_name):
+    if not is_valid_class_name(class_name):
         raise ValueError(f"class name is not a Python identifier: {class_name!r}")
     return f"authored:{digest}:{class_name}"
 

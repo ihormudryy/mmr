@@ -17,6 +17,7 @@ from trader.authored.allowed_api import (
     DENIED_CHAIN_NAMES, DENIED_CHAIN_PREFIXES, IO_ATTRIBUTE_PREFIXES, IO_EXEMPT_NAMES, IO_NAMES,
     PROTECTED_NAMES,
 )
+from trader.authored.keys import is_valid_class_name
 
 MAX_SOURCE_BYTES = 20_480
 BASE_CLASS = "AuthoredStrategy"
@@ -378,6 +379,10 @@ def _check_class_shape(statement: ast.ClassDef, base_imported: bool, checker: _C
     only_the_base = (len(statement.bases) == 1 and not statement.keywords
                      and isinstance(statement.bases[0], ast.Name)
                      and statement.bases[0].id == BASE_CLASS)
+    if not is_valid_class_name(statement.name):
+        checker.add("class_shape", statement,
+                    f"class name {statement.name!r} is not an authored key class name "
+                    "(ASCII letters, digits and _, at most 64 characters)")
     if not only_the_base:
         checker.add("class_shape", statement,
                     f"class {statement.name} must subclass only {BASE_CLASS}, with no keywords")

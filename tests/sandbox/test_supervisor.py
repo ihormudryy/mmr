@@ -1,3 +1,4 @@
+import errno
 import hashlib
 import os
 from datetime import datetime, timedelta, timezone
@@ -478,6 +479,7 @@ def test_a_load_fault_of_the_strategy_is_a_sandbox_error_and_frees_the_slot(tmp_
     ("CHILD_LIMITS_FAILED", "CHILD_LIMITS_FAILED"),
     ("CHILD_SETUP_FAILED", "CHILD_SETUP_FAILED"),
     (OSError(11, "Resource temporarily unavailable"), "OSError"),     # fork or socketpair: EAGAIN
+    (BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable"), "BlockingIOError"),
     (OSError(24, "Too many open files"), "OSError"),
     (RuntimeError("spawner bug"), "RuntimeError"),
 ])
@@ -488,7 +490,9 @@ def test_a_spawn_failure_of_the_sandbox_is_availability_and_frees_the_slot(tmp_p
     exc = ChildSetupError(failure) if isinstance(failure, str) else failure
     sup, _ = _scripted(tmp_path, _raises(exc))
     reply = _open(sup, tmp_path)
-    assert reply["code"] == p.SANDBOX_UNAVAILABLE and marker in reply["detail"]
+    # OSError(11, ...) is a BlockingIOError on Linux (EAGAIN) and a plain OSError on macOS: match its real type.
+    expected = marker if isinstance(failure, str) else type(exc).__name__
+    assert reply["code"] == p.SANDBOX_UNAVAILABLE and expected in reply["detail"]
     assert sup.pong("live")["free"] == 1
 
 

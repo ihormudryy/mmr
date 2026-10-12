@@ -30,7 +30,7 @@ from trader.research.evaluation_case import (
     renewal_forward_complete,
 )
 from trader.research.shadow_window import TRACKED_VERDICTS
-from trader.research.strategy_key import split_strategy_key
+from trader.research.strategy_key import split_evaluation_key
 
 JUDGMENT_DOMAIN = "mmr.backtest-judgment.v1"
 JUDGMENT_BODY_DOMAIN = "mmr.backtest-judgment-body.v1"
@@ -121,7 +121,7 @@ def record_digest(judgment: BacktestJudgment, body_digest: str) -> str:
 
 
 def _binding(case: EvaluationCase, digest: str) -> dict:
-    path, class_name = split_strategy_key(case.strategy_key)
+    path, class_name = split_evaluation_key(case.strategy_key)
     return {"case_digest": digest, "kind": case.kind, "stage": case.stage, "request_id": case.request_id,
             "strategy_key": case.strategy_key, "strategy_path": path, "class_name": class_name,
             "strategy_file_hash": case.strategy_file_hash, "params": case.selected_params,

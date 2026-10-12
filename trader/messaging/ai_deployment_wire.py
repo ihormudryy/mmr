@@ -10,8 +10,13 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from trader.automation.ai_deployments import MAX_CONIDS, _CLASS, _PATH
+from trader.research.strategy_key import AUTHORED_PATH
 
 _STRICT = ConfigDict(extra="forbid", strict=True)
+
+# A catalogue file or an authored file (SP3 Plan 3 ruling 1, decision D4). The trader validates its own reply with
+# this model, so a row this pattern refuses would fail the reply for every deployment.
+ACTIVE_STRATEGY_PATH = rf"^(?:{_PATH.pattern[1:-1]}|{AUTHORED_PATH.pattern[1:-1]})$"
 
 Digest = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
 
@@ -38,7 +43,7 @@ class ActiveAiDeployment(BaseModel):
 
     version_digest: Digest
     base_digest: Digest
-    strategy_path: Annotated[str, Field(pattern=_PATH.pattern)]
+    strategy_path: Annotated[str, Field(pattern=ACTIVE_STRATEGY_PATH)]
     strategy_digest: Digest
     class_name: Annotated[str, Field(pattern=_CLASS.pattern)]
     params: dict[str, Any]

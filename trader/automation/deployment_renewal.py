@@ -23,7 +23,7 @@ from trader.research.forward_evidence_view import (
     ForwardEvidenceView, ForwardSession, LineFacts, PaperTrip, Renewability, VersionBinding, forward_evidence_digest,
 )
 from trader.research.shadow_window import session_close_utc, shadow_window
-from trader.research.strategy_key import split_strategy_key
+from trader.research.strategy_key import split_evaluation_key
 from trader.research.strategy_paths import normalize_strategy_path
 from trader.scoreboard.round_trips import RoundTrip, project_round_trips
 from trader.scoreboard.service import _differences
@@ -269,7 +269,7 @@ def _session(day: dt.date, state: str, reason: Optional[str]) -> ForwardSession:
 def case_differences(case: EvaluationCase, facts: VersionFacts, sessions: list[ForwardSession]) -> list[str]:
     """Ruling 6: the renewal case must name exactly the renewed version's binding and window."""
     base, line = facts.base, facts.line
-    path, class_name = split_strategy_key(case.strategy_key)
+    path, class_name = split_evaluation_key(case.strategy_key)
     problems = []
     if normalize_strategy_path(path) != normalize_strategy_path(base.strategy_path) or class_name != base.class_name:
         problems.append(f"strategy key differs: {case.strategy_key}")

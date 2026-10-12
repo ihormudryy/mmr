@@ -16,7 +16,7 @@ from trader.research.canonical import canonical_json_bytes, sha256_digest
 from trader.research.request_rules import (  # noqa: F401  re-exported for existing callers
     MAX_CONIDS, MAX_PARAMS, TUNABLE_NAME, check_bar_size, check_cohort, check_conids, check_params,
 )
-from trader.research.strategy_key import is_strategy_key
+from trader.research.strategy_key import is_evaluation_key
 
 EVALUATION_REQUEST_DOMAIN = "mmr.research.evaluation-request.v1"
 REQUEST_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -49,8 +49,8 @@ class EvaluationRequestBody(BaseModel):
     @field_validator("strategy_key")
     @classmethod
     def _strategy_key(cls, value: str) -> str:
-        if not is_strategy_key(value):
-            raise ValueError("strategy_key must be strategies/<file>.py:<Class>")
+        if not is_evaluation_key(value):
+            raise ValueError("strategy_key must be strategies/<file>.py:<Class> or authored:sha256:<hex>:<Class>")
         return value
 
     @field_validator("cohort")

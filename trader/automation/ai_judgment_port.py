@@ -11,7 +11,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional, Protocol
 
 from trader.automation.backtest_judge_schema import cooling_until_in_tx
 from trader.automation.evaluation_claims import ny_day
-from trader.research.strategy_key import split_strategy_key
+from trader.research.strategy_key import split_evaluation_key
 
 
 @dataclass(frozen=True)
@@ -62,7 +62,7 @@ class Plan1Judgments:
         if judgment is None:
             return None
         case = self._read_case(judgment.case_digest)   # EvaluationCase; signature checked by Plan 1's verifier
-        strategy_path, class_name = split_strategy_key(case.strategy_key)
+        strategy_path, class_name = split_evaluation_key(case.strategy_key)
         return JudgmentFacts(
             judgment_id=judgment.judgment_id, verdict=judgment.verdict, kind=judgment.kind,
             renews_version=judgment.body["renewal_of_version"], model_id=judgment.body["jev_model"],

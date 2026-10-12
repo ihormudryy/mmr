@@ -41,6 +41,8 @@ REPLY_TIMEOUT_SECONDS = 30
 EMBARGO_SESSIONS = 5
 FULL_SCALE = dict(conids=10, period_sessions=690, holdout_sessions=90, cohort_points=3,
                   tunables=2, bars_per_session=390, folds=6)
+# Owner ruling 2026-10-12 (Plan 1 ruling 1): authored keys use 302 sessions with the holdout scaled to 39.
+OWNER_SELECTED = dict(period_sessions=302, holdout_sessions=39)
 QUIET_LOGGERS = ("data", "backtester", "trader.data.duckdb_store")
 
 
@@ -289,6 +291,13 @@ def ruling_text(estimate):
             f"Since {hours:.2f} h is {'over' if over else 'under'} 4 h: {_ruling_decision(estimate)}.")
 
 
+def selected_configuration_text(per_bar_ms):
+    estimate = extrapolate(per_bar_ms=per_bar_ms, **{**FULL_SCALE, **OWNER_SELECTED})
+    return (f"Owner-selected configuration ({estimate['period_sessions']} sessions, "
+            f"{estimate['holdout_sessions']}-session holdout, otherwise as above): estimated at "
+            f"{estimate['hours']:.2f} h at an upper-bound combined cost of {per_bar_ms:.4f} ms/bar.")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--conids", type=int, default=1)
@@ -316,6 +325,7 @@ def main(argv=None):
     print(f"total bar sends (full scale): {estimate['total_bar_sends']:,}")
     print(f"estimated full evaluation: {estimate['hours']:.2f} h")
     print(ruling_text(estimate))
+    print(selected_configuration_text(combined))
     return 0
 
 

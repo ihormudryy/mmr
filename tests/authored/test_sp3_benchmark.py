@@ -211,3 +211,12 @@ def test_linux_style_pipe_errors_mean_the_child_died(connection):
     from scripts.sp3_benchmark import _exchange
     with pytest.raises(RuntimeError, match=r"child died \(exit code -9\)"):
         _exchange(connection, _FakeProcess(), b"{}", session=0, iso="T", timeout_seconds=1)
+
+
+def test_the_owner_selected_configuration_uses_the_same_arithmetic():
+    from scripts.sp3_benchmark import FULL_SCALE, selected_configuration_text
+    expected = extrapolate(per_bar_ms=0.8872, **{**FULL_SCALE, "period_sessions": 302, "holdout_sessions": 39})
+    text = selected_configuration_text(0.8872)
+    assert "302 sessions" in text and "39-session holdout" in text
+    assert f"{expected['hours']:.2f} h" in text and "4.64 h" in text
+    assert "upper-bound combined cost of 0.8872 ms/bar" in text

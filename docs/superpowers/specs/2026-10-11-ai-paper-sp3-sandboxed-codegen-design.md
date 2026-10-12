@@ -552,4 +552,7 @@ with the plan rulings.
   Plan 1 ruling 1; over 4 h). An authored evaluation uses the most recent 302 sessions
   (`research_service.authored_evaluation_sessions: 302` in `trader.yaml`), with
   SP2c's folds and embargo and the holdout scaled in proportion (39 sessions).
-  Catalogue strategies keep the full SP2c length. The sandbox is not weakened.
+  That configuration is estimated at about 4.6 h (0.8872 ms/bar, an upper bound),
+  above the 4 h planning line; the owner accepted it on 2026-10-12, as it fits
+  the ~15 h overnight window. Catalogue strategies keep the full SP2c length.
+  The sandbox is not weakened.

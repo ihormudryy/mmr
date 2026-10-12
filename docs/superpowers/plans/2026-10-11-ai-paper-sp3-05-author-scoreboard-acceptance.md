@@ -53,6 +53,7 @@
 22. Plan 5 ruling 22: `AiConfig.digest()` gains `authoring`; replays of units recorded before this change report `config_mismatch`, as when SP2c added `research`.
 23. Plan 5 ruling 23: the `ai_author` key is loaded only when authoring is on; with authoring off, `STORED` records are not offered for evaluation until it is on again.
 24. Plan 5 ruling 24: the author's bar-size menu is `research.bar_sizes` (ai.yaml) ∩ the trader's `bar_sizes` (Plan 3 ruling 3), in ai.yaml order; an empty menu skips the night `NO_COMMON_BAR_SIZE`.
+25. Plan 5 ruling 25: `api_reference()` also sends Plan 1's `ALLOWED_FROM_IMPORT_NAMES` (`allowed_from_import_names`), and `AUTHOR_RULES` says `typing`, `dataclasses` and `trader.authored.api` come only by from-import of the listed names (Plan 1 rulings 15 and 24). Without it the author is not told it may write `from typing import Mapping`, and a plain `import typing` costs its one retry. *Cost if wrong: none; the list is Plan 1's data.*
 
 ## Cross-plan additions
 
@@ -1269,7 +1270,8 @@ FILE_TEXT_MAX_CHARS = 40_000           # Plan 1's 20 KB rule decides; this only 
 NOT_A_TUNABLE = frozenset({"LOOKBACK_BARS"})
 AUTHOR_RULES = (
     "One file, at most 20 KB, that parses as Python 3.12.",
-    "Only imports: numpy, pandas, math, statistics, dataclasses, typing, trader.authored.api.",
+    "Only imports: import numpy, pandas, math or statistics; from typing, dataclasses or trader.authored.api "
+    "import only the names in allowed_from_import_names (never import typing or import dataclasses).",
     "Module attributes only from allowed_module_attributes; no name or attribute that starts with _.",
     "No eval, exec, compile, open, getattr, setattr, delattr, globals, locals, vars, input, breakpoint, "
     "memoryview, format; no read_*, to_* (except to_numpy), load, save, query or pickle.",
@@ -1431,9 +1433,9 @@ def retry_messages(first: tuple[ChatMessage, ...], answer_text: str,
 - Test: `tests/ai/author/test_author_facts.py`
 
 **Interfaces:**
-- Consumes: `AiStore.aquery`; tables `ai_research_candidates`, `ai_backtest_judgments`, `ai_model_attempts`; `parse_backtest_ruling`; `fence_untrusted`; Plan 1's `ALLOWED_IMPORTS`, `ALLOWED_MODULE_ATTRIBUTES`, `is_authored_key`, `trader.authored.api`; Task 4 `AuthoredRecord`; Task 5 `AUTHOR_RULES`.
+- Consumes: `AiStore.aquery`; tables `ai_research_candidates`, `ai_backtest_judgments`, `ai_model_attempts`; `parse_backtest_ruling`; `fence_untrusted`; Plan 1's `ALLOWED_IMPORTS`, `ALLOWED_FROM_IMPORT_NAMES`, `ALLOWED_MODULE_ATTRIBUTES`, `is_authored_key`, `trader.authored.api`; Task 4 `AuthoredRecord`; Task 5 `AUTHOR_RULES`.
 - Produces:
-  - `api_reference() -> dict` (`api_source`, `allowed_imports`, `allowed_module_attributes`, `rules`).
+  - `api_reference() -> dict` (`api_source`, `allowed_imports`, `allowed_from_import_names`, `allowed_module_attributes`, `rules`; ruling 25).
   - `async catalogue_evaluations(store) -> list[dict]` (newest case per catalogue key, at most 20).
   - `async authored_history(store, records) -> list[dict]`; `async jev_outcome(store, strategy_key) -> dict | None`.
   - `scoreboard_facts(report) -> dict`.
@@ -1528,6 +1530,9 @@ def test_the_api_reference_is_plan_1s_text_and_lists():
     reference = api_reference()
     assert "class AuthoredStrategy" in reference["api_source"] and "pandas" in reference["allowed_imports"]
     assert reference["allowed_module_attributes"] and reference["rules"]
+    # Ruling 25: the author learns `from typing import Mapping`; typing is never a plain import.
+    assert "Mapping" in reference["allowed_from_import_names"]["typing"]
+    assert "typing" not in reference["allowed_imports"]
 
 
 def test_facts_join_every_part_and_are_canonical_json():
@@ -1567,7 +1572,7 @@ from trader.ai.author_roles import AUTHOR_RULES
 from trader.ai.author_wire import AuthoredRecord
 from trader.ai.research_roles import parse_backtest_ruling
 from trader.ai.untrusted import OutputRefusal, fence_untrusted
-from trader.authored.allowed_api import ALLOWED_IMPORTS, ALLOWED_MODULE_ATTRIBUTES
+from trader.authored.allowed_api import ALLOWED_FROM_IMPORT_NAMES, ALLOWED_IMPORTS, ALLOWED_MODULE_ATTRIBUTES
 from trader.authored.keys import is_authored_key
 
 MAX_CATALOGUE_ROWS = 20
@@ -1579,6 +1584,8 @@ def api_reference() -> dict:
     """The one repo module an authored file may import, as text, and Plan 1's allow-lists."""
     return {"api_source": Path(authored_api.__file__).read_text(encoding="utf-8"),
             "allowed_imports": sorted(ALLOWED_IMPORTS),
+            "allowed_from_import_names": {module: sorted(names)
+                                          for module, names in sorted(ALLOWED_FROM_IMPORT_NAMES.items())},
             "allowed_module_attributes": {module: sorted(names)
                                           for module, names in sorted(ALLOWED_MODULE_ATTRIBUTES.items())},
             "rules": list(AUTHOR_RULES)}

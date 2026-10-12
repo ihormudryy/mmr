@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Base: master after SP3 Plan 1 (`trader/authored/api.py`, `keys.py`, `allowed_api.py`, `static_check.py`). This plan imports `AuthoredStrategy`, `Decision`, `source_digest`, `ALLOWED_IMPORTS`, `require_clean`, `AuthoredStaticRejected` exactly as the index names them.
+- Base: master after SP3 Plan 1 (`trader/authored/api.py`, `keys.py`, `allowed_api.py`, `static_check.py`). This plan imports `AuthoredStrategy`, `Decision`, `source_digest`, `ALLOWED_IMPORTS`, `ALLOWED_FROM_IMPORT_NAMES`, `ALLOWED_BUILTINS`, `require_clean`, `AuthoredStaticRejected` exactly as the index names them.
 - Python 3.12. No new dependency. Load YAML with `yaml.safe_load` only.
 - Spec values (as amended by SP3 decision D1, spec section 14): live pool 3, research pool 4; child uids `20001..20007`, group `sbxchild` gid 20000; per-bar wall 2 s; child memory = the address space mapped at fork + 256 MiB (ruling 3); `pids_limit: 64`, `cpus: 2`, `mem_limit: 4g`; `network_mode: none`, `read_only: true`, `cap_drop: [ALL]`, `cap_add: [CHOWN, SETUID, SETGID, KILL]` where CHOWN is used only at startup to create the slot directories and is dropped before serving (ruling 2; the slot wipe needs no capability, ruling 28), so the serving set is SETUID, SETGID and KILL; `no-new-privileges:true`; tmpfs `/tmp` 64 MB `noexec`; environment `TZ=UTC`, `PYTHONDONTWRITEBYTECODE=1`, `HOME=/tmp`, `TMPDIR=/tmp`, `NUMBA_CACHE_DIR=/tmp/numba`, `MPLCONFIGDIR=/tmp/mpl` (plus the build id, ruling 1).
 - Sockets: `/run/sandbox-live/sandbox.sock`, `/run/sandbox-research/sandbox.sock`, group `trader` (gid 1000), mode 0660. Store at `/store`, read-only.
@@ -55,6 +55,7 @@
 28. **Plan 2 ruling 28 (review r1 #2):** The serving supervisor cannot read a 0700 slot directory its child owns (no CAP_CHOWN or CAP_DAC_*). `wipe_slot_as_owner` forks a short-lived helper, drops it to the slot uid (`setgroups([])`, gid 20000, the slot uid; `RLIMIT_CPU` 5 s), empties the directory and exits 0; any failure quarantines the slot. The session leaves the table under the lock, and the kill, the wipe and the slot release run outside it (ruling 25). The container test `test_a_closed_session_leaves_a_clean_slot_and_frees_it` proves it under the real serving capabilities.
 29. **Plan 2 ruling 29:** `OPENED` carries the supervisor's build id (`SandboxSession.image_digest`), so the strategy service can refuse a session that opened on an unproven build without a separate `PING` race (Plan 4 ruling 19). `PONG` carries `live_open`, the number of open live sessions, on both sockets; `prove-isolation` refuses while it is not 0 (owner ruling 2026-10-11; Plan 3 ruling 15), which also keeps a probe away from a live child's abstract sockets (ruling 21).
 30. **Plan 2 ruling 30 (review r1 #8 and follow-up):** the sandbox full-stack run shares nothing with a live stack on the same host. `scripts/run_sandbox_fullstack.sh` always passes `-p mmr-sbxtest` (an override must start with `mmr-sbxtest`, else exit 2), so containers, network and named volumes are its own; `docker-compose.sbxtest.override.yml` publishes no host port and gives ib-gateway no `.env` (no IB login that could end the live session); `${HOME}` points at a throwaway directory with a copy of `config_defaults` and keys made by `mmr keys init` for the run; `--env-file` is an empty file, so `.env` is never interpolated. Before `up`, `scripts/check_sbxtest_config.py` checks the rendered config and refuses (exit 2) on a non-test project, any published port (named as live when in 4200x/4210x/7496/7497/5901/7424/8081), any bind under the operator's `~/.config/mmr` or `~/.local/share/mmr`, a read of `.env`, or a volume outside `mmr-sbxtest_*`. `down -v` and the throwaway home are removed on exit. `tests/test_sandbox_fullstack_runner.py` covers the checker, the script and, with Docker, the real rendered config.
+31. **Plan 2 ruling 31 (Plan 1 ruling 27):** The child's import guard and reduced built-ins are built from Plan 1's `allowed_api`, never from wider lists of their own. `import X` passes only for a module in `ALLOWED_IMPORTS` with no dot; `from X import a, b` passes only when every name is in `ALLOWED_FROM_IMPORT_NAMES[X]` (so `from typing import operator` and `import typing` fail at run time too). The built-ins are exactly `ALLOWED_BUILTINS` plus `__import__` (the guard) and `__build_class__`: no `iter`, `next`, `map`, `filter`, `issubclass` or exception classes, which the checker already refuses. A probe that skips the static check therefore meets the same lists at run time. *Cost if wrong: none; an authored file the checker passes uses only these names.*
 
 ## Review Focus
 
@@ -489,7 +490,7 @@ The runtime that runs authored code is a pure class so it can be tested in-proce
 - Test: `tests/sandbox/test_child_runtime.py`
 
 **Interfaces:**
-- Consumes: Plan 1 `trader/authored/api.py` (`AuthoredStrategy`, `Decision`), `trader/authored/static_check.py` (`require_clean`, `AuthoredStaticRejected`), `trader/authored/allowed_api.py` (`ALLOWED_IMPORTS`).
+- Consumes: Plan 1 `trader/authored/api.py` (`AuthoredStrategy`, `Decision`), `trader/authored/static_check.py` (`require_clean`, `AuthoredStaticRejected`), `trader/authored/allowed_api.py` (`ALLOWED_IMPORTS`, `ALLOWED_FROM_IMPORT_NAMES`, `ALLOWED_BUILTINS`; ruling 31).
 - Produces: `ChildError(Exception)` (`detail`), `ChildRuntime(source: str, class_name: str, params, lookback: int, conids: tuple[int, ...])` with `load() -> None` and `on_bar(conid, t, ohlcv) -> dict` (a SIGNAL payload: `{"action", "probability"}`); one strategy instance and one trimmed history per conid (ruling 26); `build_guarded_builtins() -> dict`; `guarded_import(...)`; `load_authored_class(source, class_name) -> type`; `SpawnSpec` (adds `conids`); `ForkSpawner` and the `Spawner` protocol (`spawn(spec) -> ChildHandle`); `ChildHandle` (`send_bar(conid, t, ohlcv) -> dict`, `close() -> None`, `pid`).
 
 - [ ] **Step 1: Write the failing tests.** Write `tests/sandbox/test_child_runtime.py`:
@@ -499,6 +500,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from trader.authored.allowed_api import ALLOWED_BUILTINS
 from trader.sandbox.child import (ChildError, ChildRuntime, build_guarded_builtins, guarded_import,
                                   load_authored_class)
 
@@ -640,12 +642,32 @@ class Over(AuthoredStrategy):
         runtime.on_bar(C1, T0, BAR)
 
 
-def test_the_guarded_builtins_hide_dangerous_names():
+def test_the_guarded_builtins_are_exactly_plan_1s_allow_list():
+    # Ruling 31: built from ALLOWED_BUILTINS, never a wider list of the child's own.
     guarded = build_guarded_builtins()
-    for name in ("eval", "exec", "open", "compile", "input", "breakpoint", "getattr"):
+    assert set(guarded) == set(ALLOWED_BUILTINS) | {"__import__", "__build_class__"}
+    for name in ("eval", "exec", "open", "compile", "input", "breakpoint", "getattr",
+                 "iter", "next", "map", "filter", "issubclass", "type", "ValueError", "Exception"):
         assert name not in guarded
     assert guarded["__import__"] is guarded_import
-    assert "len" in guarded and "range" in guarded and "min" in guarded and "__build_class__" in guarded
+
+
+@pytest.mark.parametrize("name, fromlist", [
+    ("typing", ()), ("dataclasses", ()), ("typing", ("operator",)), ("typing", ("Mapping", "sys")),
+    ("numpy", ("mean",)), ("trader.authored.api", ("pd",)), ("trader.authored.api", ()), ("os", ()),
+    ("typing", ("*",)),
+])
+def test_the_import_guard_follows_plan_1s_import_lists(name, fromlist):
+    with pytest.raises(ChildError, match="not allowed"):
+        guarded_import(name, None, None, fromlist, 0)
+
+
+@pytest.mark.parametrize("name, fromlist", [
+    ("numpy", ()), ("pandas", None), ("math", ()), ("statistics", ()), ("typing", ("Mapping",)),
+    ("dataclasses", ("dataclass", "field")), ("trader.authored.api", ("AuthoredStrategy", "Decision")),
+])
+def test_the_import_guard_admits_what_the_checker_admits(name, fromlist):
+    assert guarded_import(name, None, None, fromlist, 0) is not None
 
 
 def test_a_disallowed_import_at_module_load_is_blocked():
@@ -686,7 +708,7 @@ class Late(AuthoredStrategy):
 
 def test_the_benign_api_class_loads_and_answers_one_bar():
     # Review r1 #1: a class statement needs __build_class__, and `from trader.authored.api import ...` must pass
-    # the guard by its exact module name although ALLOWED_IMPORTS has no root `trader`.
+    # the guard by its exact module name and ALLOWED_FROM_IMPORT_NAMES, although no root `trader` is importable.
     source = '''
 import numpy as np
 from trader.authored.api import AuthoredStrategy, Decision
@@ -748,22 +770,9 @@ from typing import Any, Mapping, Protocol
 import numpy as np
 import pandas as pd
 
-from trader.authored.allowed_api import ALLOWED_IMPORTS
+from trader.authored.allowed_api import ALLOWED_BUILTINS, ALLOWED_FROM_IMPORT_NAMES, ALLOWED_IMPORTS
 from trader.authored.api import AuthoredStrategy, Decision
 from trader.authored.static_check import AuthoredStaticRejected, require_clean
-
-# Built-ins an authored module may see. Everything the static checker denies, and
-# everything that reaches the import system or the file system, is left out.
-_SAFE_BUILTIN_NAMES = frozenset({
-    "abs", "all", "any", "bool", "dict", "divmod", "enumerate", "filter", "float",
-    "frozenset", "int", "isinstance", "issubclass", "iter", "len", "list", "map",
-    "max", "min", "next", "pow", "range", "reversed", "round", "set", "slice",
-    "sorted", "str", "sum", "tuple", "zip", "True", "False", "None",
-    "ValueError", "TypeError", "ZeroDivisionError", "KeyError", "IndexError",
-    "ArithmeticError", "Exception", "FloatingPointError", "OverflowError",
-})
-
-_ALLOWED_IMPORT_NAMES = frozenset(ALLOWED_IMPORTS)
 
 
 class ChildError(Exception):
@@ -774,21 +783,24 @@ class ChildError(Exception):
         self.detail = detail
 
 
-_API_MODULE = "trader.authored.api"
+def _import_is_allowed(name: str, fromlist) -> bool:
+    """Plan 1's lists, exactly (ruling 31). A dotted plain import would bind the root package."""
+    if not fromlist:
+        return name in ALLOWED_IMPORTS and "." not in name
+    names = ALLOWED_FROM_IMPORT_NAMES.get(name, frozenset())
+    return all(item in names for item in fromlist)
 
 
 def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
     """Exact module names only (review r1 #1). ``trader.authored.api`` passes only as ``from ... import``, so the
     authored module gets the API module itself, never the ``trader`` package."""
-    allowed = name in _ALLOWED_IMPORT_NAMES and (name != _API_MODULE or bool(fromlist))
-    if level != 0 or not allowed:
+    if level != 0 or not _import_is_allowed(name, fromlist):
         raise ChildError(f"import of {name!r} is not allowed")
     return _builtins.__import__(name, globals, locals, fromlist, level)
 
 
 def build_guarded_builtins() -> dict:
-    guarded = {name: getattr(_builtins, name) for name in _SAFE_BUILTIN_NAMES
-               if hasattr(_builtins, name)}
+    guarded = {name: getattr(_builtins, name) for name in ALLOWED_BUILTINS}
     guarded["__import__"] = guarded_import
     # A class statement calls __build_class__ (review r1 #1). Authored source can never name it: the static
     # checker refuses every name that starts with "_".

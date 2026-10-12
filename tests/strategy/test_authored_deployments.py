@@ -1,8 +1,10 @@
 # tests/strategy/test_authored_deployments.py
 """SP3 spec 7.6, 7.9 and 8 (strategy side): loading an authored deployment, its gates, its retirement.
 Plan 4 rulings 18-20."""
+import asyncio
 import datetime as dt
 import logging
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -537,3 +539,141 @@ def test_a_signal_with_no_open_session_is_refused(world):
     world.rt._signal_hold.dispatch((CONID, instance.name), instance, signal, CONID, frame)
     assert world.rt.signal_record.read(0, 10).signals == ()
     assert [event.metadata["reason"] for event in gaps] == [AUTHORED_UNPROVEN]
+
+
+# Final review I2: an authored bar runs on its instance's own thread, so the service loop never waits on the sandbox.
+
+OTHER = 76792991
+
+
+@pytest.fixture
+def service_loop(world):
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, name="test-service-loop", daemon=True)
+    thread.start()
+    world.rt._maybe_check_exits = lambda *args: None
+    yield loop
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join(timeout=5)
+    loop.close()
+
+
+def on_loop(loop, fn, *args):
+    """Runs ``fn`` on the service loop; the returned future answers once it has run there."""
+    async def run():
+        return fn(*args)
+    return asyncio.run_coroutine_threadsafe(run(), loop)
+
+
+def held_open(sandbox):
+    """OPEN waits until released: the first bar of a session stands for a long warm-up or a slow proof read."""
+    release, real_open = threading.Event(), sandbox.open_session
+
+    def slow_open(*args, **kwargs):
+        release.wait(timeout=10)
+        return real_open(*args, **kwargs)
+    sandbox.open_session = slow_open
+    return release
+
+
+def dispatched(world, count):
+    """The signals that reached the signal hold, in order, and an Event set once ``count`` of them did."""
+    seen, done, dispatch = [], threading.Event(), world.rt._signal_hold.dispatch
+
+    def record(key, strategy, signal, conid, frame):
+        seen.append((conid, signal.probability))
+        dispatch(key, strategy, signal, conid, frame)
+        if len(seen) >= count:
+            done.set()
+    world.rt._signal_hold.dispatch = record
+    return seen, done
+
+
+def test_a_slow_authored_bar_does_not_hold_the_service_loop(world, service_loop):
+    reconcile(world, [catalogue_active(world), authored_active(world.sandbox)])
+    authored, catalogue = instance_of(world), instance_of(world, CATALOGUE_VERSION)
+    world.rt._strategy_frame = lambda conid, bar_size: bars(3)
+    catalogue_bars, on_prices = [], catalogue.on_prices
+    catalogue.on_prices = lambda frame: catalogue_bars.append(len(frame)) or on_prices(frame)
+    seen, signalled = dispatched(world, 1)
+    release = held_open(world.sandbox)
+    try:
+        on_loop(service_loop, world.rt._on_tick_for_strategy, authored, CONID).result(timeout=2)
+        on_loop(service_loop, world.rt._on_tick_for_strategy, catalogue, CONID).result(timeout=2)
+        assert catalogue_bars == [3]                                       # the catalogue bar ran meanwhile
+        assert on_loop(service_loop, world.rt.disable_strategy, catalogue.name).result(timeout=2) == \
+            StrategyState.DISABLED                                         # and so did a control call
+        assert seen == []
+    finally:
+        release.set()
+    assert signalled.wait(timeout=5) and seen == [(CONID, 3 / 10000)]     # the authored signal follows
+    entries = world.rt.signal_record.read(0, 10).signals
+    assert [(e.entry.action, e.entry.conid) for e in entries] == [("BUY", CONID)]
+
+
+def test_the_bars_of_an_authored_instance_keep_their_order_and_none_runs_twice(world, service_loop):
+    reconcile(world, [authored_active(world.sandbox, conids=(CONID, OTHER))])
+    authored = instance_of(world)
+    ticks = [(CONID, 3), (OTHER, 4), (CONID, 5), (OTHER, 6), (CONID, 7)]
+    frames = iter(bars(count) for _, count in ticks)
+    world.rt._strategy_frame = lambda conid, bar_size: next(frames)
+    seen, signalled = dispatched(world, len(ticks))
+    release = held_open(world.sandbox)
+    try:
+        for conid, _ in ticks:                                             # all queued behind the held OPEN
+            on_loop(service_loop, world.rt._on_tick_for_strategy, authored, conid).result(timeout=2)
+        assert seen == []
+    finally:
+        release.set()
+    assert signalled.wait(timeout=5)
+    assert seen == [(conid, count / 10000) for conid, count in ticks]
+    session = world.sandbox.sessions[0]
+    assert len(world.sandbox.sessions) == 1
+    assert len(session.stamps_of(CONID)) == 7 and len(session.stamps_of(OTHER)) == 6   # each bar sent once
+
+
+def test_unloading_drops_the_queued_bars_and_ends_the_worker(world, service_loop):
+    reconcile(world, [authored_active(world.sandbox)])
+    authored = instance_of(world)
+    frames = iter(bars(count) for count in (3, 4, 5))
+    world.rt._strategy_frame = lambda conid, bar_size: next(frames)
+    release = held_open(world.sandbox)
+    unloaded = threading.Thread(target=world.rt.unload_strategy, args=(authored.name,))
+    try:
+        for _ in range(3):
+            on_loop(service_loop, world.rt._on_tick_for_strategy, authored, CONID).result(timeout=2)
+        worker, stopped, stop = authored._worker._thread, threading.Event(), authored._worker.stop
+        authored._worker.stop = lambda: (stop(), stopped.set())
+        unloaded.start()                                                   # then waits for the bar holding the lock
+        assert stopped.wait(timeout=2)
+    finally:
+        release.set()
+    unloaded.join(timeout=5)
+    worker.join(timeout=5)
+    assert not unloaded.is_alive() and not worker.is_alive()
+    assert len(world.sandbox.sessions) == 1 and len(world.sandbox.sessions[0].stamps) == 3   # only the first bar
+    assert world.sandbox.open_sessions == []
+    assert not authored.run_off_loop(lambda: None)                         # nothing runs after close
+
+
+def test_a_crash_on_the_worker_stops_the_bars_queued_behind_it(world, service_loop):
+    reconcile(world, [authored_active(world.sandbox)])
+    authored = instance_of(world)
+    frames = iter(bars(count) for count in (3, 4))
+    world.rt._strategy_frame = lambda conid, bar_size: next(frames)
+    release, opens, idle = threading.Event(), [], threading.Event()
+
+    def broken_open(*args, **kwargs):
+        release.wait(timeout=10)
+        opens.append(args)
+        raise RuntimeError("unexpected")
+    world.sandbox.open_session = broken_open
+    try:
+        for _ in range(2):
+            on_loop(service_loop, world.rt._on_tick_for_strategy, authored, CONID).result(timeout=2)
+        assert authored.run_off_loop(idle.set)
+    finally:
+        release.set()
+    assert idle.wait(timeout=5)
+    assert len(opens) == 1 and authored.state == StrategyState.ERROR    # the second bar did not reopen
+    assert world.rt.signal_record.read(0, 10).signals == ()

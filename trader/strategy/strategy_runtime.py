@@ -752,7 +752,7 @@ class StrategyRuntime():
             )
 
     def _new_proof_query_client(self) -> TypedRpcClient:
-        """The isolation proof is read on the tick thread before every authored bar, so it gets its own socket:
+        """The isolation proof is read before every authored bar (on its worker), so it gets its own socket:
         a call holds its client's lock until it ends, and on the shared client a bar would wait behind a
         reconcile read. The client timeout also bounds the send to a trader that is down (SNDTIMEO)."""
         return TypedRpcClient(
@@ -1843,23 +1843,35 @@ class StrategyRuntime():
             self._last_dispatched_bar[dkey] = last_bar
             if self._below_warmup(strategy, conId, len(frame)):
                 signal = None   # exits below still run: a held position must not wait for warm-up
+            elif self._decide_off_loop(strategy, dkey, conId, frame):
+                return          # its worker hands the decision back to the loop (_finish_tick)
             else:
-                # Stamp which instrument this dispatch is for BEFORE calling
-                # on_prices — multi-instrument strategies (pairs) read
-                # ``self.dispatch_conid`` instead of guessing identity from
-                # the shape of the data.
-                strategy._dispatch_conid = conId
-                signal = strategy.on_prices(frame)
-        except Exception:
-            logging.exception(
-                'strategy %s raised on_prices for conId %s; disabling it and '
-                'continuing the tick feed', getattr(strategy, 'name', '?'), conId)
-            try:
-                strategy.state = StrategyState.ERROR
-            except Exception:
-                pass
+                signal = self._call_on_prices(strategy, conId, frame)
+        except Exception as ex:
+            self._note_on_prices_error(strategy, conId, ex)
             return
+        self._finish_tick(strategy, dkey, conId, frame, signal)
 
+    @staticmethod
+    def _call_on_prices(strategy: Strategy, conId: int, frame: pd.DataFrame):
+        # Stamp which instrument this dispatch is for BEFORE calling
+        # on_prices — multi-instrument strategies (pairs) read
+        # ``self.dispatch_conid`` instead of guessing identity from
+        # the shape of the data.
+        strategy._dispatch_conid = conId
+        return strategy.on_prices(frame)
+
+    @staticmethod
+    def _note_on_prices_error(strategy: Strategy, conId: int, ex: Exception) -> None:
+        logging.error(
+            'strategy %s raised on_prices for conId %s; disabling it and '
+            'continuing the tick feed', getattr(strategy, 'name', '?'), conId, exc_info=ex)
+        try:
+            strategy.state = StrategyState.ERROR
+        except Exception:
+            pass
+
+    def _finish_tick(self, strategy: Strategy, dkey: tuple, conId: int, frame: pd.DataFrame, signal) -> None:
         # Time-based exits (max_hold_bars / close_by_time) are checked on
         # every new completed bar, signal or not — a VwapReclaim-style
         # position must flatten at 15:45 even if no fresh signal fires.
@@ -1868,6 +1880,32 @@ class StrategyRuntime():
         if not signal:
             return
         self._signal_hold.dispatch(dkey, strategy, signal, conId, frame)
+
+    def _decide_off_loop(self, strategy: Strategy, dkey: tuple, conId: int, frame: pd.DataFrame) -> bool:
+        """Final review I2: an authored bar can wait seconds on the sandbox (a session's warm-up, the per-bar
+        proof read), so it runs on the instance's own thread, in bar order, and its decision comes back to the
+        loop for the same exits and signal path as any bar. False when the caller decides inline: not an
+        authored instance, no running loop (a direct call), or its sessions are closed."""
+        if not isinstance(strategy, AuthoredLiveStrategy):
+            return False
+        loop = _running_loop()
+        if loop is None:
+            return False
+
+        def decide() -> None:
+            if not _is_dispatchable(strategy):
+                return          # disabled, faulted or crashed after this bar was queued
+            try:
+                signal = self._call_on_prices(strategy, conId, frame)
+            except Exception as ex:
+                self._note_on_prices_error(strategy, conId, ex)     # here, so the next queued bar sees it
+                return
+            try:
+                loop.call_soon_threadsafe(self._finish_tick, strategy, dkey, conId, frame, signal)
+            except RuntimeError:
+                logging.warning('authored strategy %s: the service loop closed before the bar of conId %s was '
+                                'finished; its decision is dropped', strategy.name, conId)
+        return strategy.run_off_loop(decide)
 
     def _new_signal_hold(self) -> SignalHold:
         return SignalHold(dispatch=self._dispatch_held, block_reason=self._held_signal_block_reason,

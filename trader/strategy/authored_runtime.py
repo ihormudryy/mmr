@@ -12,6 +12,7 @@ import datetime as dt
 import hmac
 import logging
 import threading
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
@@ -77,6 +78,50 @@ def _unsent(prices: pd.DataFrame, last_sent: Optional[dt.datetime]) -> pd.DataFr
     return prices[index > pd.Timestamp(last_sent)]
 
 
+class _BarWorker:
+    """One thread per authored instance that runs its bars in order, off the service loop (final review I2): a
+    bar can wait seconds on the sandbox (a session's warm-up, the per-bar proof read). Started at the first bar."""
+
+    def __init__(self) -> None:
+        self._jobs: deque[Callable[[], None]] = deque()
+        self._wake = threading.Condition()
+        self._stopped = False
+        self._thread: Optional[threading.Thread] = None
+
+    def submit(self, job: Callable[[], None], thread_name: str) -> bool:
+        """False once stopped: the job never runs."""
+        with self._wake:
+            if self._stopped:
+                return False
+            self._jobs.append(job)
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._run, name=thread_name, daemon=True)
+                self._thread.start()
+            self._wake.notify()
+        return True
+
+    def stop(self) -> None:
+        """Drops the queued jobs and ends the thread after the running one. Does not wait for it: the caller
+        may be that job (a fault callback that closes the sessions)."""
+        with self._wake:
+            self._stopped = True
+            self._jobs.clear()
+            self._wake.notify()
+
+    def _run(self) -> None:
+        while True:
+            with self._wake:
+                while not self._jobs and not self._stopped:
+                    self._wake.wait()
+                if self._stopped:
+                    return
+                job = self._jobs.popleft()
+            try:
+                job()
+            except BaseException:                 # the next bar still runs
+                logger.exception("an authored bar failed on its worker thread %s", threading.current_thread().name)
+
+
 def crash_backoff(consecutive_crashes: int) -> dt.timedelta:
     doublings = max(0, min(consecutive_crashes - 1, 16))
     return min(CRASH_BACKOFF_BASE * 2 ** doublings, CRASH_BACKOFF_CAP)
@@ -106,8 +151,9 @@ class AuthoredLiveStrategy(Strategy):
         self._on_fault = on_fault
         self._now = now
         self._current: Optional[_DaySession] = None
-        # The tick thread sends; the reconcile thread may close. One bar at a time on the session (Plan 2 ruling 25).
+        # The worker sends; the reconcile thread may close. One bar at a time on the session (Plan 2 ruling 25).
         self._lock = threading.Lock()
+        self._worker = _BarWorker()
         self._faulted = False
         self._closed = False             # close_sessions() is final: no PING, OPEN or BAR after it
         self._future_warned: set[tuple[int, dt.date]] = set()
@@ -186,8 +232,15 @@ class AuthoredLiveStrategy(Strategy):
         """False while the wait after an unexpected error runs (ruling 3): the runtime does not re-enable it yet."""
         return self._recover_after is None or self._now() >= self._recover_after
 
+    def run_off_loop(self, job: Callable[[], None]) -> bool:
+        """Runs ``job`` on this instance's worker thread after the jobs before it; False once the sessions are
+        closed (the job never runs)."""
+        return self._worker.submit(job, f"authored-bars-{self.name}")
+
     def close_sessions(self) -> None:
-        """Final: the reconcile thread unloads the instance, and a tick thread that still holds it opens nothing."""
+        """Final: the reconcile thread unloads the instance; no queued bar starts after this, and a bar already
+        running (it holds the lock) opens nothing more."""
+        self._worker.stop()
         with self._lock:
             self._closed = True
             self._end_session()
@@ -316,11 +369,12 @@ class AuthoredLiveStrategy(Strategy):
         self._on_fault(self.digest, str(fault.code))
 
 
-# The proof read runs on the tick thread before every bar: a short deadline bounds one bar's wait (ruling 1).
+# The proof read runs on an instance's worker before every bar, and on the service loop at each signal's dispatch:
+# a short deadline bounds one wait (ruling 1).
 PROOF_TIMEOUT_SECONDS = 2.0
 RETIRE_TIMEOUT_SECONDS = 15.0
 # After a proof read that failed for want of an answer (the trader down, slow or erroring), the gate stays shut
-# this long without asking: the read runs on the service loop, and a 2 s wait per bar per conid would stall it.
+# this long without asking: a 2 s wait per bar per conid would stall the instance's bars and each dispatch.
 PROOF_OUTAGE_HOLD = dt.timedelta(seconds=20)
 # Ruling 2: a retryable refusal (AUTHORED_WITHDRAWAL_FAILED, WITHDRAWAL_ENTRY_IN_FLIGHT) or a remote error is sent
 # again at most this often per digest.
@@ -409,7 +463,7 @@ class AuthoredDeployments:
         return instance
 
     def request_retirement(self, digest: str, code: str) -> None:
-        """Called on the tick thread: record only, never raise; the reconcile thread sends (Plan 4 ruling 18)."""
+        """Called on an instance's worker thread: record only, never raise; the reconcile thread sends (Plan 4 ruling 18)."""
         with self._lock:
             if digest not in self._retired:
                 self._retiring.setdefault(digest, code)

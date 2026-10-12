@@ -113,8 +113,11 @@ class ResearchStore:
     def finished(self) -> list[dict]:
         return self._select("state IN ('DONE','FAILED')")
 
-    def hold_report(self, request_id: str, final: str, *, now: dt.datetime, case_digest: str, summary: dict) -> None:
-        """Ruling 24: the case is signed, but the row stays RUNNING until the trader confirms ``final``."""
+    def hold_report(self, request_id: str, final: str, *, now: dt.datetime, case_digest: Optional[str],
+                    summary: Optional[dict]) -> None:
+        """Ruling 24: the case is signed, but the row stays RUNNING until the trader confirms ``final``.
+
+        An authored end (Plan 4 ruling 11) holds neither a case nor a summary."""
         if final not in ("DONE", "FAILED"):
             raise ValueError(f"a report owes DONE or FAILED, not {final!r}")
         self._db.execute("UPDATE research_requests SET pending_report = ?, case_digest = ?, summary_json = ?, "

@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Optional
 from zoneinfo import ZoneInfo
 
+from trader.authored.keys import parse_authored_key
+from trader.research.authored_outcome import AUTHORED_END_CODE, AuthoredEnd, AuthoredEvaluationEnded
 from trader.research.case_builder import build_failed_case, build_initial_case, evaluation_summary
 from trader.research.cohort import RequestRefused, request_body
 from trader.messaging.typed_rpc import TypedRpcRemoteError
@@ -27,6 +29,9 @@ READERS = frozenset({"ai_research", "cli"})
 FINISHED_CLAIM_STATES = ("DONE", "FAILED")
 RETRYABLE_STATES = ("CLAIMING", "REFUSED")
 PARK_DETAIL_MAX = 200
+# Review r1 #7: an authored end the trader refused for good is parked, resent hourly (and at a restart), and the
+# claim stays open; refusal is never delivery.
+PARKED_RESEND_SECONDS = 3600
 CASE_ERROR_MESSAGE_MAX = 120
 _UNSAFE_ERROR_TEXT = re.compile(
     r"[/\\]"                                                                  # a file path
@@ -76,6 +81,7 @@ class EvaluationService:
         self._queue: "queue.Queue[str]" = queue.Queue()
         self._submit_lock = threading.Lock()
         self._worker_lock = threading.Lock()                    # plan ruling 20: one evaluation at a time
+        self._refused_at: dict[str, dt.datetime] = {}         # request id -> when the trader last refused its end
 
     def _today(self) -> dt.date:
         return self._now().astimezone(NEW_YORK).date()
@@ -248,11 +254,22 @@ class EvaluationService:
         row = self._store.get(request_id)
         if row["state"] not in OPEN_STATES or row["pending_report"] is not None:
             return
+        if AuthoredEnd.from_row(row) is not None:             # decided before a crash: never run again
+            self._end_without_case(request_id)
+            return
         self._store.set_state(request_id, "RUNNING", now=self._now())
         signed = self._store.case(request_id=request_id)
         if signed is None:
             self._report_running(request_id)
-            digest, case = self._evaluate_and_sign(row)
+            try:
+                digest, case = self._evaluate_and_sign(row)
+            except AuthoredEvaluationEnded as ended:
+                logger.warning("authored evaluation %s ended %s (%s); no case is signed", request_id,
+                               ended.end.event, ended.end.detail)
+                self._store.set_state(request_id, "RUNNING", now=self._now(), code=AUTHORED_END_CODE,
+                                      detail=ended.end.marker())
+                self._end_without_case(request_id)
+                return
         else:                                                   # signed before a crash: never run twice
             digest = signed["case_digest"]
             case = load_verified_case(self._cases_dir, digest, {self._signer.public_key_id: self._signer.public_key})
@@ -260,6 +277,11 @@ class EvaluationService:
         self._store.hold_report(request_id, final, now=self._now(), case_digest=digest,
                                 summary=evaluation_summary(case, order_notional=self._order_notional))
         self._report_end(request_id, final)
+
+    def _end_without_case(self, request_id: str) -> None:
+        """Plan 4 ruling 11: get_evaluation reads FAILED with no case, so no model ever judges it."""
+        self._store.hold_report(request_id, "FAILED", now=self._now(), case_digest=None, summary=None)
+        self._report_end(request_id, "FAILED")
 
     def _evaluate_and_sign(self, row: dict) -> tuple[str, Any]:
         created_at = self._now()
@@ -276,6 +298,8 @@ class EvaluationService:
                 raise RequestRefused("STRATEGY_SOURCE_CHANGED", "the strategy file changed after the claim")
             case = build_initial_case(spec, claim_day, self._evaluate(spec), created_at=created_at,
                                       warmup_sessions=self._warmup_sessions)
+        except (AuthoredEvaluationEnded, ServiceStateError, TraderUnavailable):
+            raise                       # not a case: an authored end, a parked request or an unreachable trader
         except RequestRefused as refusal:
             logger.warning("evaluation %s refused after its claim: %s", row["request_id"], refusal.code)
             case = failed(case_error(refusal.code, refusal.detail))
@@ -295,6 +319,8 @@ class EvaluationService:
 
     def _report_end(self, request_id: str, final: str) -> bool:
         """Ruling 24: confirmed by UPDATED or UNCHANGED, or after a lost reply by reading the claim back."""
+        if not self._authored_outcome_delivered(request_id):
+            return False
         try:
             reply = self._trader.update_claim(request_id, final)
             confirmed = reply["status"] in ("UPDATED", "UNCHANGED")
@@ -308,6 +334,47 @@ class EvaluationService:
         else:
             logger.warning("claim %s: %s not confirmed by the trader yet; sent again next tick", request_id, final)
         return confirmed
+
+    def _authored_outcome_delivered(self, request_id: str) -> bool:
+        """Plan 4 ruling 10: an authored end reaches the trader before its claim closes, so the record never
+        stays EVALUATING behind a closed claim. Resent every tick until the trader answers; a final refusal parks
+        the end (ruling 10, review r1 #7): never treated as delivered."""
+        row = self._store.get(request_id)
+        end = AuthoredEnd.from_row(row)
+        if end is None:
+            return True
+        refused_at = self._refused_at.get(request_id)
+        if refused_at is not None and self._now() < refused_at + dt.timedelta(seconds=PARKED_RESEND_SECONDS):
+            return False
+        digest, _ = parse_authored_key(row["strategy_key"])
+        try:
+            reply = self._trader.report_authored_evaluation(end.report_body(request_id, digest))
+        except TraderUnavailable:
+            logger.warning("authored evaluation %s: %s not reported yet; sent again next tick", request_id, end.event)
+            return False
+        except TypedRpcRemoteError as remote:                  # a wire error: as final as a refusal
+            reply = {"status": "REFUSED", "code": remote.code, "detail": remote.message, "retryable": False}
+        if reply.get("status") in ("UPDATED", "UNCHANGED"):
+            self._refused_at.pop(request_id, None)
+            return True
+        if reply.get("retryable"):
+            logger.warning("authored evaluation %s: the trader asks to resend (%s); sent again next tick",
+                           request_id, reply.get("code"))
+            return False
+        self._park_end(request_id, end, digest, reply)
+        return False
+
+    def _park_end(self, request_id: str, end: AuthoredEnd, digest: str, reply: Mapping[str, Any]) -> None:
+        first_refusal = request_id not in self._refused_at
+        self._refused_at[request_id] = self._now()
+        if not first_refusal:
+            logger.warning("authored evaluation %s: the trader still refuses %s (%s); sent again in %s s",
+                           request_id, end.event, reply.get("code"), PARKED_RESEND_SECONDS)
+            return
+        logger.error("AUTHORED_REPORT_REFUSED: authored evaluation %s: the trader refused %s (%s: %s); the claim "
+                     "stays open and the end is sent again in %s s (after a restart: at once); check "
+                     "`mmr ai-author list` for digest %s", request_id, end.event, reply.get("code"),
+                     reply.get("detail"), PARKED_RESEND_SECONDS, digest)
 
     def _claim_reads(self, request_id: str, state: str) -> bool:
         try:

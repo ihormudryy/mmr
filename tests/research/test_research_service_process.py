@@ -215,6 +215,9 @@ class OwedReportStore:
     def pending_reports(self):
         return [{"request_id": "sha256:" + "1" * 64, "pending_report": "DONE"}] if self.owed else []
 
+    def get(self, request_id):
+        return {"request_id": request_id, "pending_report": "DONE", "code": None}
+
 
 class RefusingTrader:
     def __init__(self, code):

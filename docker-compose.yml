@@ -248,6 +248,7 @@ services:
       # trading_runtime.py's typed_bind_address (G0 Task 5 fix). Feed
       # (42103) binds 0.0.0.0 too but is never host-published (see ports).
       TYPED_BIND_ADDRESS: tcp://0.0.0.0
+      MMR_AUTHORED_STORE_DIR: /store
       # The trader's own strategy-control/hot-arm clients reach the strategy
       # container here. (The `cli` key is never mounted in this container, so
       # `mmr` CLI commands run in the one-shot `cli` service instead.)
@@ -296,6 +297,9 @@ services:
       # directory in its place; a missing directory is just empty (Telegram stays off).
       - ${HOME}/.config/mmr/secrets:/home/trader/.config/mmr/secrets:ro
       - mmr_db_data:/home/trader/.local/share/mmr/data
+      # SP3 store of authored files (Plan 3 ruling 20, Plan 2 ruling 22): the trader writes it; only the
+      # sandbox also mounts it, read-only, at the same path.
+      - mmr_authored_strategies:/store
       - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
       # Paper-automation Activate (dashboard hot-arm) reads the bundles that
       # `mmr research attest bundle` exports HERE (sha256_<digest>/), plus the

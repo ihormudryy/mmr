@@ -1352,6 +1352,9 @@ def build_command_stack(
     from trader.automation.backtest_judge_schema import apply_backtest_judge_migrations
 
     apply_backtest_judge_migrations(migrator)         # 110, 111 (SP2c Plan 1), 125 (SP2c Plan 5)
+    from trader.automation.authored_schema import apply_authored_migrations
+
+    apply_authored_migrations(migrator)               # 130, 131 (SP3 Plan 3)
     from trader.automation.ai_deployment_versions import apply_ai_deployment_version_migrations
 
     apply_ai_deployment_version_migrations(migrator)  # 115, 116 (SP2c Plan 2)

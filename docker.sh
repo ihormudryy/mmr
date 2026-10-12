@@ -1087,6 +1087,7 @@ key_check() {
     $RUNTIME volume rm "${KEYCHECK_PROJECT}_mmr_db_data" >/dev/null 2>&1 || true
     $RUNTIME volume rm "${KEYCHECK_PROJECT}_mmr_ai_data" >/dev/null 2>&1 || true
     $RUNTIME volume rm "${KEYCHECK_PROJECT}_mmr_research_data" >/dev/null 2>&1 || true
+    $RUNTIME volume rm "${KEYCHECK_PROJECT}_mmr_authored_strategies" >/dev/null 2>&1 || true
     if [[ -n "$failed" ]]; then
         echo "Key check FAILED for:$failed. Do not cut over."
         exit 1

@@ -175,3 +175,29 @@ def test_a_garbage_body_is_a_frame_error_not_a_crash(body):
         writer.close()
 
     asyncio.run(run())
+
+
+def _bar_with_time(t):
+    return {"v": 1, "type": "BAR", "session": "s1", "conid": 101, "t": t,
+            "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 1.0}
+
+
+def test_a_bar_time_without_an_offset_is_refused():
+    with pytest.raises(p.FrameError) as exc:
+        p.parse_request(_bar_with_time("2024-01-02T14:30:00"))
+    assert exc.value.code == p.SANDBOX_BAD_REQUEST
+
+
+@pytest.mark.parametrize("text", ["2024-01-02T14:30:00+00:00", "2024-01-02T14:30:00Z"])
+def test_a_utc_bar_time_is_accepted(text):
+    from datetime import datetime, timezone
+
+    assert p.parse_request(_bar_with_time(text)).t == datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc)
+
+
+def test_a_non_utc_bar_time_is_converted_to_utc():
+    from datetime import datetime, timezone
+
+    got = p.parse_request(_bar_with_time("2024-01-02T16:30:00+02:00")).t
+    assert got == datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc)
+    assert got.utcoffset().total_seconds() == 0

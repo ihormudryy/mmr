@@ -172,7 +172,7 @@ def parse_request(obj: Mapping[str, Any]) -> Request:
         except ValueError as exc:
             raise FrameError(f"t is not ISO-8601: {exc}") from exc
         if when.tzinfo is None:
-            when = when.replace(tzinfo=timezone.utc)
+            raise FrameError("t must carry a UTC offset (ISO-8601 with Z or +HH:MM)")
         ohlcv = {col: _number(obj, col) for col in ("open", "high", "low", "close", "volume")}
         return Request(type="BAR", session=session, conid=conid, t=when.astimezone(timezone.utc), ohlcv=ohlcv)
     if kind == "CLOSE":

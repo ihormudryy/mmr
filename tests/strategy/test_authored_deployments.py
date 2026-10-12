@@ -656,6 +656,17 @@ def test_unloading_drops_the_queued_bars_and_ends_the_worker(world, service_loop
     assert not authored.run_off_loop(lambda: None)                         # nothing runs after close
 
 
+def test_a_bar_after_the_worker_stopped_is_dropped_never_run_on_the_loop(world, service_loop):  # final re-review
+    reconcile(world, [authored_active(world.sandbox)])
+    authored = instance_of(world)
+    world.rt._strategy_frame = lambda conid, bar_size: bars(3)
+    authored._worker.stop()                                     # an unload is under way on the reconcile thread
+    called = []
+    authored.on_prices = lambda prices: called.append(prices)
+    on_loop(service_loop, world.rt._on_tick_for_strategy, authored, CONID).result(timeout=2)
+    assert called == [] and world.sandbox.sessions == []        # nothing ran inline, nothing opened
+
+
 def test_a_crash_on_the_worker_stops_the_bars_queued_behind_it(world, service_loop):
     reconcile(world, [authored_active(world.sandbox)])
     authored = instance_of(world)

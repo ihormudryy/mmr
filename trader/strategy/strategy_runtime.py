@@ -1885,7 +1885,7 @@ class StrategyRuntime():
         """Final review I2: an authored bar can wait seconds on the sandbox (a session's warm-up, the per-bar
         proof read), so it runs on the instance's own thread, in bar order, and its decision comes back to the
         loop for the same exits and signal path as any bar. False when the caller decides inline: not an
-        authored instance, no running loop (a direct call), or its sessions are closed."""
+        authored instance, or no running loop (a direct call). A bar for closed sessions is dropped."""
         if not isinstance(strategy, AuthoredLiveStrategy):
             return False
         loop = _running_loop()
@@ -1905,7 +1905,11 @@ class StrategyRuntime():
             except RuntimeError:
                 logging.warning('authored strategy %s: the service loop closed before the bar of conId %s was '
                                 'finished; its decision is dropped', strategy.name, conId)
-        return strategy.run_off_loop(decide)
+        if not strategy.run_off_loop(decide):
+            # Its sessions are closing (an unload on the reconcile thread): drop the bar rather than run it on
+            # the loop, where it would wait for the bar the worker still holds.
+            logging.info('authored strategy %s is closing; the bar of conId %s is dropped', strategy.name, conId)
+        return True
 
     def _new_signal_hold(self) -> SignalHold:
         return SignalHold(dispatch=self._dispatch_held, block_reason=self._held_signal_block_reason,

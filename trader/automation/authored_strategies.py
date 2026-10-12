@@ -37,7 +37,9 @@ from trader.automation.authored_wire import (
     ReportAuthoredEvaluationRequest, RetireAuthoredStrategyRequest, SubmitAuthoredStrategyRequest,
 )
 from trader.automation.backtest_judgments import JudgmentRefused, nth_session_after
-from trader.automation.evaluation_claims import STRATEGY_NOT_ALLOWED, ClaimRefused, ny_day, utc
+from trader.automation.evaluation_claims import (
+    STRATEGY_NOT_ALLOWED, ClaimRefused, claim_row_in_tx, ny_day, utc,
+)
 from trader.automation.strategy_binding import bar_size_key
 from trader.research.canonical import canonical_json_bytes
 from trader.research.evaluation_request import EvaluationRequestBody
@@ -76,6 +78,7 @@ UNAVAILABLE_ATTEMPTS = 3
 # Reasons a record carries (spec 7.3; rulings 9 and 11).
 SANDBOX_ERROR = "SANDBOX_ERROR"
 SANDBOX_UNAVAILABLE = "SANDBOX_UNAVAILABLE"
+CLAIM_FAILED = "CLAIM_FAILED"                       # research closed the claim FAILED and no judgment came
 JEV_REJECT = "JEV_REJECT"
 JEV_SHADOW = "JEV_SHADOW"
 JEV_NO_VERDICT = "JEV_NO_VERDICT"
@@ -291,10 +294,31 @@ def _apply_report(conn: Any, record: AuthoredRecord, request: ReportAuthoredEval
     if request.event == "SANDBOX_ERROR":
         return move_in_tx(conn, record, REJECTED, event="SANDBOX_ERROR", reason=SANDBOX_ERROR, now=now,
                           request_id=request.request_id, detail=detail, evaluation_request_id=None)
+    return _retry_or_fail(conn, record, cause=SANDBOX_UNAVAILABLE, now=now, request_id=request.request_id,
+                          detail=detail)
+
+
+def _retry_or_fail(conn: Any, record: AuthoredRecord, *, cause: str, now: dt.datetime, request_id: str,
+                   detail: Optional[str]) -> AuthoredRecord:
+    """Spec 8: an evaluation that could not run sends the record back to STORED for another night, or to FAILED
+    with ``cause`` as its reason once it has failed UNAVAILABLE_ATTEMPTS times."""
     attempts = record.attempts + 1
-    target, reason = (FAILED, SANDBOX_UNAVAILABLE) if attempts >= UNAVAILABLE_ATTEMPTS else (STORED, None)
-    return move_in_tx(conn, record, target, event="SANDBOX_UNAVAILABLE", reason=reason, now=now,
-                      request_id=request.request_id, detail=detail, attempts=attempts, evaluation_request_id=None)
+    target, reason = (FAILED, cause) if attempts >= UNAVAILABLE_ATTEMPTS else (STORED, None)
+    return move_in_tx(conn, record, target, event=cause, reason=reason, now=now, request_id=request_id,
+                      detail=detail, attempts=attempts, evaluation_request_id=None)
+
+
+def _claim_failed_unjudged_in_tx(conn: Any, record: AuthoredRecord) -> bool:
+    """An EVALUATING record whose claim research closed FAILED and that no judgment moved. A FAILED claim that
+    is judged later is the judgment's to move; once this returns the record, that judgment is refused."""
+    if record.state != EVALUATING or record.evaluation_request_id is None:
+        return False
+    claim = claim_row_in_tx(conn, record.evaluation_request_id)
+    if claim is None or claim.state != "FAILED":
+        return False
+    judged = conn.execute("SELECT 1 FROM backtest_judgments WHERE request_id = ?",
+                          [record.evaluation_request_id]).fetchone()
+    return judged is None
 
 
 def _existing_in_tx(conn: Any, digest: str) -> AuthoredRecord:
@@ -713,12 +737,14 @@ class AuthoredStrategyStore:
     def refresh(self) -> None:
         """Ruling 11: a SHADOW or DEPLOYED record leaves the count when its window ends. Other stores are read
         first, outside the transaction; each record moves only if it did not move meanwhile. A line the strategy
-        retired is withdrawn again while it still has a live version (its first withdrawal may have been lost)."""
+        retired is withdrawn again while it still has a live version (its first withdrawal may have been lost).
+        An EVALUATING record whose claim failed without a judgment goes back to STORED, or to FAILED."""
         now = utc(self._now())
         records = self._db.transaction(records_in_tx)
         for record in records:
             if record.state == RETIRED and record.reason == SANDBOX_ERROR:
                 self._withdraw_again(record)
+        self._return_failed_claims(records, now)
         endings = [(record, ending) for record in records if (ending := self._ending(record, now)) is not None]
         if not endings:
             return
@@ -730,6 +756,28 @@ class AuthoredStrategyStore:
                         and current.state_changed_at == record.state_changed_at:
                     move_in_tx(conn, current, target, event="WINDOW_ENDED", reason=reason, now=now)
         self._write(write)
+
+    def _return_failed_claims(self, records: tuple[AuthoredRecord, ...], now: dt.datetime) -> None:
+        """Best effort, like ``_withdraw_again``: a failure is logged and never breaks a read or a submit; the
+        next refresh tries again. The claim and judgment are read again inside the write transaction."""
+        try:
+            stranded = self._db.transaction(
+                lambda conn: [record for record in records if _claim_failed_unjudged_in_tx(conn, record)])
+            if stranded:
+                self._write(lambda conn: self._return_failed_claims_in_tx(conn, stranded, now))
+        except Exception:
+            logger.exception("returning authored records whose evaluation claim failed did not complete; "
+                             "the next refresh tries again")
+
+    @staticmethod
+    def _return_failed_claims_in_tx(conn: Any, stranded: list[AuthoredRecord], now: dt.datetime) -> None:
+        for record in stranded:
+            current = record_in_tx(conn, record.digest)
+            if current is None or current.state_changed_at != record.state_changed_at \
+                    or not _claim_failed_unjudged_in_tx(conn, current):
+                continue
+            _retry_or_fail(conn, current, cause=CLAIM_FAILED, now=now, request_id=current.evaluation_request_id,
+                           detail="the evaluation claim closed FAILED without a judgment")
 
     def _withdraw_again(self, record: AuthoredRecord) -> None:
         """Best effort: the record stays RETIRED whatever happens, and a failure never breaks a read or a submit.

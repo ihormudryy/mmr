@@ -511,7 +511,7 @@ def test_a_reply_with_the_wrong_version_is_unavailable(fake):
 
 def test_an_unknown_session_reply_ends_the_session_but_a_clock_error_does_not(fake):
     def refuse(conn, request):
-        detail = "unknown session" if request["open"] == 9.0 else "bar time must strictly increase per conid"
+        detail = p.UNKNOWN_SESSION_DETAIL if request["open"] == 9.0 else "bar time must strictly increase per conid"
         _reply(conn, {"type": "ERROR", "v": 1, "code": p.SANDBOX_BAD_REQUEST, "detail": detail})
 
     session = _open_fake_session(fake, refuse)
@@ -520,6 +520,14 @@ def test_an_unknown_session_reply_ends_the_session_but_a_clock_error_does_not(fa
             session.bar(C1, T0, *BAR)
     with pytest.raises(SandboxProtocolError, match="unknown session"):
         session.bar(C1, T0 + timedelta(minutes=1), 9.0, 10.0, 8.0, 9.5, 1.0)
+    _assert_session_ended(session)
+
+
+def test_the_servers_unknown_session_reply_ends_the_client_session(stack):
+    session = SandboxClient(stack.live).open_session(stack.store(GOOD), "Counter", {}, "1 min", [C1])
+    session._id = "s" + "0" * 16   # a session the server never opened
+    with pytest.raises(SandboxProtocolError, match=p.UNKNOWN_SESSION_DETAIL):
+        session.bar(C1, T0, *BAR)
     _assert_session_ended(session)
 
 

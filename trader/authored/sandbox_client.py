@@ -25,8 +25,6 @@ from trader.authored.api import Decision
 from trader.sandbox import protocol as proto
 
 _HEADER = struct.Struct(">I")
-# The detail the sandbox gives when a session is gone (supervisor._bar): the one BAD_REQUEST that ends it.
-_UNKNOWN_SESSION_DETAIL = "unknown session"
 _OHLCV_NAMES = ("open", "high", "low", "close", "volume")
 
 # A timed-out BAR is answered only after the sandbox killed the child and wiped its slot (about 7 s).
@@ -237,7 +235,7 @@ def _is_instant(text: Any, when: datetime) -> bool:
 
 def _leaves_session_usable(reply: Mapping[str, Any]) -> bool:
     """Only a bar the sandbox refused as a caller mistake keeps the session, and not when the session is gone."""
-    return reply.get("code") == proto.SANDBOX_BAD_REQUEST and reply.get("detail") != _UNKNOWN_SESSION_DETAIL
+    return reply.get("code") == proto.SANDBOX_BAD_REQUEST and reply.get("detail") != proto.UNKNOWN_SESSION_DETAIL
 
 
 def _sandbox_info(reply: Mapping[str, Any]) -> SandboxInfo:

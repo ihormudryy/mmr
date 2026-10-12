@@ -500,7 +500,8 @@ def test_bind_socket_refuses_to_replace_a_file_that_is_not_a_socket(socket_dir):
         stream.write("keep me")
     with pytest.raises(RuntimeError, match="not a socket"):
         bind_socket(path, gid=os.getgid())
-    assert open(path).read() == "keep me"
+    with open(path) as stream:
+        assert stream.read() == "keep me"
 
 
 def test_bind_socket_fails_loudly_when_it_cannot_set_the_group(socket_dir, monkeypatch):

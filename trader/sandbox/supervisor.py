@@ -240,7 +240,7 @@ class Supervisor:
         with self._lock:
             session = self._sessions.get(request.session)
             if session is None or session.conn_id != conn_id or session.handle is None:
-                return _error(proto.SANDBOX_BAD_REQUEST, "unknown session")
+                return _error(proto.SANDBOX_BAD_REQUEST, proto.UNKNOWN_SESSION_DETAIL)
             if session.busy:
                 return _error(proto.SANDBOX_BAD_REQUEST, "a bar is already in flight")
             # Caller errors are checked here, before the child sees the bar, and never end the session (ruling 8).
@@ -275,7 +275,7 @@ class Supervisor:
         with self._lock:
             session = self._sessions.get(request.session)
             if session is None or session.conn_id != conn_id or session.handle is None:
-                return _error(proto.SANDBOX_BAD_REQUEST, "unknown session")
+                return _error(proto.SANDBOX_BAD_REQUEST, proto.UNKNOWN_SESSION_DETAIL)
             del self._sessions[session.session_id]
         self._finish(session)
         return {"type": "CLOSED", "v": proto.PROTOCOL_VERSION}

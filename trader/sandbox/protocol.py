@@ -23,6 +23,10 @@ SANDBOX_BUSY = "SANDBOX_BUSY"
 SANDBOX_DIGEST_MISMATCH = "SANDBOX_DIGEST_MISMATCH"
 SANDBOX_BAD_REQUEST = "SANDBOX_BAD_REQUEST"
 
+# The BAD_REQUEST detail for a session the connection does not hold; the one caller mistake that ends
+# the client's session (it is gone on the server).
+UNKNOWN_SESSION_DETAIL = "unknown session"
+
 MAX_FRAME_BYTES = 262144  # 256 KiB: a lookback of bars plus a 20 KB source, with headroom
 
 # A live session serves one authored deployment: all of its conids in one child (ruling 26).

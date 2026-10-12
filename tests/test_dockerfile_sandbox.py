@@ -56,6 +56,15 @@ def test_the_build_id_arg_is_declared_in_the_runtime_stage_before_use():
     assert DOCKERFILE.index("FROM python") < arg_at < DOCKERFILE.index("/etc/mmr-build-id")
 
 
+def test_the_build_id_arg_comes_after_the_last_apt_and_pip_layer():
+    # An ARG is part of every later RUN's cache key: declared early, a new build id rebuilds apt, venv and pip.
+    arg_at = DOCKERFILE.index("ARG MMR_BUILD_ID")
+    runtime_stage = DOCKERFILE[:DOCKERFILE.index("AS test")]
+    heavy_runs = [match.start() for match in re.finditer(r"^RUN\b[^\n]*(?:\\\n[^\n]*)*", runtime_stage, re.MULTILINE)
+                  if re.search(r"\b(apt-get|pip3?|venv)\b", match.group(0))]
+    assert heavy_runs and arg_at > max(heavy_runs)
+
+
 def test_compose_passes_the_build_id_to_every_build():
     anchor = COMPOSE[COMPOSE.index("x-mmr-build:"):]
     assert "MMR_BUILD_ID: ${MMR_BUILD_ID:-unset}" in anchor.split("\nx-", 1)[0].split("\nservices:", 1)[0]

@@ -6,10 +6,6 @@ ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Build identity baked at image build time (SP3 Plan 2 ruling 1). docker.sh passes
-# MMR_BUILD_ID; a plain `docker build` leaves it "unset" and the sandbox refuses to start.
-ARG MMR_BUILD_ID=unset
-
 # Pin a fixed UID/GID (rather than whatever `useradd` picks next) so the
 # G0 Compose split's `user: trader` + `read_only: true` hardening has a
 # stable, documented identity: host-bind-mounted directories
@@ -115,7 +111,10 @@ RUN mkdir -p /home/trader/.config/mmr \
 
 RUN chmod +x /home/trader/mmr/scripts/docker-entrypoint.sh
 
-# Bake the build id so the running sandbox cannot misreport its own image (ruling 1).
+# Build identity baked at image build time (SP3 Plan 2 ruling 1). docker.sh passes
+# MMR_BUILD_ID; a plain `docker build` leaves it "unset" and the sandbox refuses to start.
+# Declared here, after the apt, venv and pip layers, so a new build id does not rebuild them.
+ARG MMR_BUILD_ID=unset
 RUN printf '%s\n' "${MMR_BUILD_ID}" > /etc/mmr-build-id && chmod 0444 /etc/mmr-build-id
 LABEL mmr.build_id="${MMR_BUILD_ID}"
 

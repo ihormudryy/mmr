@@ -2,8 +2,10 @@
 
 One journal row per digest. ``COUNTED_STATES`` count toward ``ai_paper.authored_strategies.max_active``;
 every other state is terminal. A row moves only along ``TRANSITIONS`` and each move appends to its
-history. Functions ending ``_in_tx`` run inside the caller's ``DuckDBConnection.transaction`` and never
-call the store's own ``execute`` or ``transaction``.
+history. A move or note is compare-and-set: it changes the row only while the row still holds the state
+and history of the record the caller read, so a stale record can never overwrite a newer one. Functions
+ending ``_in_tx`` run inside the caller's ``DuckDBConnection.transaction`` and never call the store's own
+``execute`` or ``transaction``.
 """
 from __future__ import annotations
 
@@ -15,7 +17,7 @@ from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
 from trader.authored.keys import authored_key
-from trader.automation.authored_refusals import AUTHORED_STATE_CONFLICT, AuthoredRefused
+from trader.automation.authored_refusals import AuthoredStateConflict
 from trader.automation.evaluation_claims import utc
 from trader.research.canonical import canonical_json_bytes
 
@@ -168,23 +170,28 @@ def insert_in_tx(conn: Any, record: AuthoredRecord) -> None:
     conn.execute(f"INSERT INTO authored_strategies ({', '.join(_COLUMNS)}) VALUES ({marks})", _values(record))
 
 
-def _update_in_tx(conn: Any, record: AuthoredRecord) -> None:
+def _replace_in_tx(conn: Any, expected: AuthoredRecord, updated: AuthoredRecord) -> None:
     assignments = ", ".join(f"{name} = ?" for name in _COLUMNS[1:])
-    conn.execute(f"UPDATE authored_strategies SET {assignments} WHERE digest = ?",
-                 _values(record)[1:] + [record.digest])
+    changed = conn.execute(
+        f"UPDATE authored_strategies SET {assignments} WHERE digest = ? AND state = ? AND history_json = ? "
+        "RETURNING digest",
+        _values(updated)[1:] + [expected.digest, expected.state.value, _text(list(expected.history))]).fetchall()
+    if not changed:
+        raise AuthoredStateConflict(f"{expected.digest} is no longer {expected.state.value} as read "
+                                    f"(history of {len(expected.history)} entries)")
 
 
 def move_in_tx(conn: Any, record: AuthoredRecord, target: AuthoredState, *, event: str, reason: Optional[str],
                now: dt.datetime, request_id: Optional[str] = None, detail: Optional[str] = None,
                **changes: Any) -> AuthoredRecord:
     if target not in TRANSITIONS.get(record.state, frozenset()):
-        raise AuthoredRefused(AUTHORED_STATE_CONFLICT, f"{record.state.value} cannot move to {target.value}")
+        raise AuthoredStateConflict(f"{record.state.value} cannot move to {target.value}")
     now = utc(now)
     entry = _entry(now, event=event, source=record.state, target=target, reason=reason, request_id=request_id,
                    detail=detail)
     moved = replace(record, state=target, reason=reason, state_changed_at=now, history=record.history + (entry,),
                     **changes)
-    _update_in_tx(conn, moved)
+    _replace_in_tx(conn, record, moved)
     return moved
 
 
@@ -195,5 +202,5 @@ def note_in_tx(conn: Any, record: AuthoredRecord, *, event: str, now: dt.datetim
     entry = _entry(utc(now), event=event, source=record.state, target=record.state, reason=record.reason,
                    request_id=request_id, detail=detail, image=image)
     noted = replace(record, history=record.history + (entry,), **changes)
-    _update_in_tx(conn, noted)
+    _replace_in_tx(conn, record, noted)
     return noted

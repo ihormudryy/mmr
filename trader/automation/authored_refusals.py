@@ -25,3 +25,10 @@ class AuthoredRefused(Exception):
     def reply(self, **extra) -> dict:
         return {"status": "REFUSED", "code": self.code, "detail": self.detail, "retryable": self.retryable,
                 "record": None, **extra}
+
+
+class AuthoredStateConflict(AuthoredRefused):
+    """The record is not in the state the caller read, or the move is not in the state table."""
+
+    def __init__(self, detail: str):
+        super().__init__(AUTHORED_STATE_CONFLICT, detail)

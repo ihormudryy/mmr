@@ -210,7 +210,9 @@ def test_a_slot_that_cannot_be_wiped_is_never_reused(tmp_path):
     sup._wiper = lambda slot: False
     session = _open(sup, tmp_path)["session"]
     sup.handle("live", 1, p.parse_request({"v": 1, "type": "CLOSE", "session": session}))
-    assert sup.pong("live")["free"] == 0 and _open(sup, tmp_path, conn=2)["code"] == p.SANDBOX_BUSY
+    reply = _open(sup, tmp_path, conn=2)
+    assert sup.pong("live")["free"] == 0 and reply["code"] == p.SANDBOX_BUSY      # availability (ruling 34)
+    assert "1 quarantined" in reply["detail"]
 
 
 def test_the_wipe_helper_empties_the_directory_as_the_slot_uid(tmp_path, monkeypatch):
@@ -392,7 +394,9 @@ def test_any_exception_from_the_child_ends_the_session(tmp_path):
     sup, spawner = _scripted(tmp_path, lambda spec: _ScriptedChild(crash))
     session = _open(sup, tmp_path)["session"]
     reply = _bar(sup, session, T0)
-    assert reply["code"] == p.SANDBOX_ERROR and "RuntimeError" in reply["detail"]
+    # A bug on the sandbox side, not a fault of the strategy (ruling 34).
+    assert reply["code"] == p.SANDBOX_UNAVAILABLE and "internal sandbox error" in reply["detail"]
+    assert "RuntimeError" in reply["detail"]
     assert spawner.children[0].closes == 1 and sup.pong("live")["free"] == 1
     assert _bar(sup, session, T0 + timedelta(minutes=1))["code"] == p.SANDBOX_BAD_REQUEST
 
@@ -415,20 +419,38 @@ def test_dropping_a_connection_closes_its_child(tmp_path):
     assert spawner.closed == 1 and sup.pong("live")["free"] == 2
 
 
-def test_a_spawn_failure_of_any_kind_frees_the_slot(tmp_path):
+def _raises(exc):
+    def make(spec):
+        raise exc
+    return make
+
+
+def test_a_load_fault_of_the_strategy_is_a_sandbox_error_and_frees_the_slot(tmp_path):
     from trader.sandbox.child import ChildError
 
-    def fail_child(spec):
-        raise ChildError("load failed: boom")
+    sup, _ = _scripted(tmp_path, _raises(ChildError("load failed: boom")))
+    reply = _open(sup, tmp_path)
+    assert reply["code"] == p.SANDBOX_ERROR and "boom" in reply["detail"]
+    assert sup.pong("live")["free"] == 1
 
-    def fail_os(spec):
-        raise OSError(24, "Too many open files")
 
-    for make, marker in ((fail_child, "boom"), (fail_os, "OSError")):
-        sup, _ = _scripted(tmp_path, make)
-        reply = _open(sup, tmp_path)
-        assert reply["code"] == p.SANDBOX_ERROR and marker in reply["detail"]
-        assert sup.pong("live")["free"] == 1
+@pytest.mark.parametrize("failure, marker", [
+    ("PRIVILEGE_DROP_FAILED", "PRIVILEGE_DROP_FAILED"),
+    ("CHILD_LIMITS_FAILED", "CHILD_LIMITS_FAILED"),
+    ("CHILD_SETUP_FAILED", "CHILD_SETUP_FAILED"),
+    (OSError(11, "Resource temporarily unavailable"), "OSError"),     # fork or socketpair: EAGAIN
+    (OSError(24, "Too many open files"), "OSError"),
+    (RuntimeError("spawner bug"), "RuntimeError"),
+])
+def test_a_spawn_failure_of_the_sandbox_is_availability_and_frees_the_slot(tmp_path, failure, marker):
+    # Ruling 34: the strategy did not cause it, so it must not be a SANDBOX_ERROR that retires the strategy.
+    from trader.sandbox.child import ChildSetupError
+
+    exc = ChildSetupError(failure) if isinstance(failure, str) else failure
+    sup, _ = _scripted(tmp_path, _raises(exc))
+    reply = _open(sup, tmp_path)
+    assert reply["code"] == p.SANDBOX_UNAVAILABLE and marker in reply["detail"]
+    assert sup.pong("live")["free"] == 1
 
 
 def test_a_connection_dropped_during_open_frees_the_slot(tmp_path):     # ruling 7: no leaked slot
@@ -440,7 +462,7 @@ def test_a_connection_dropped_during_open_frees_the_slot(tmp_path):     # ruling
     sup, spawner = _scripted(tmp_path, make)
     holder["sup"] = sup
     reply = _open(sup, tmp_path, conn=1)
-    assert reply["type"] == "ERROR" and reply["code"] == p.SANDBOX_ERROR
+    assert reply["type"] == "ERROR" and reply["code"] == p.SANDBOX_UNAVAILABLE   # the caller left: no fault
     assert spawner.children[0].closes == 1 and sup.pong("live")["free"] == 1
     assert sup.pong("live")["live_open"] == 0
 

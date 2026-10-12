@@ -135,7 +135,7 @@ class Server:
             pass
         except Exception:  # noqa: BLE001 — a supervisor bug: answer, log it, end this connection only
             log.exception("connection %s on the %s socket failed", conn.conn_id, conn.pool)
-            _send(writer, _error(proto.SANDBOX_ERROR, "internal sandbox error"))
+            _send(writer, _error(proto.SANDBOX_UNAVAILABLE, "internal sandbox error"))   # ruling 34
         finally:
             self._handlers.discard(task)
             writer.close()
@@ -208,8 +208,8 @@ async def serve(supervisor: Supervisor, sockets: Mapping[str, str], *, bar_timeo
 def _send(writer: asyncio.StreamWriter, reply: dict) -> None:
     try:
         proto.write_frame(writer, reply)
-    except proto.FrameError as exc:   # a reply that cannot be encoded is itself a sandbox fault
-        proto.write_frame(writer, _error(exc.code, exc.detail))
+    except proto.FrameError as exc:   # a reply the sandbox cannot encode is its own bug (ruling 34)
+        proto.write_frame(writer, _error(proto.SANDBOX_UNAVAILABLE, exc.detail))
 
 
 def _error(code: str, detail: str) -> dict:

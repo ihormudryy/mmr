@@ -2,8 +2,8 @@
 every conid of one deployment, a research session one conid (ruling 26).
 
 Error mapping (spec 7.6):
-- SandboxUnavailable: SANDBOX_BUSY, and a socket that is unreachable, slow, dropped or out of contract.
-  The strategy is not to blame.
+- SandboxUnavailable: SANDBOX_BUSY, SANDBOX_UNAVAILABLE (the sandbox itself failed, ruling 34), and a socket
+  that is unreachable, slow, dropped or out of contract. The strategy is not to blame.
 - SandboxFault: SANDBOX_ERROR and SANDBOX_DIGEST_MISMATCH. The strategy failed; the session is over.
 - SandboxProtocolError: SANDBOX_BAD_REQUEST, and anything the client refuses to send (ruling 8).
   A refused bar never reaches the sandbox and never ends the session.
@@ -272,6 +272,8 @@ def _raise_for(reply: Mapping[str, Any]) -> None:
     code, detail = reply.get("code"), str(reply.get("detail", ""))
     if code == proto.SANDBOX_BUSY:
         raise SandboxUnavailable(f"sandbox busy: {detail}")
+    if code == proto.SANDBOX_UNAVAILABLE:
+        raise SandboxUnavailable(f"sandbox unavailable: {detail}")
     if code == proto.SANDBOX_BAD_REQUEST:
         raise SandboxProtocolError(detail)
     if code not in (proto.SANDBOX_ERROR, proto.SANDBOX_DIGEST_MISMATCH):

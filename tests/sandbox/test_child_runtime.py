@@ -889,6 +889,59 @@ def test_a_child_that_cannot_reset_its_signals_runs_nothing(monkeypatch):
     assert calls == [] and exited.value.code == child_module._EXIT_CHILD_CRASHED
 
 
+@pytest.mark.parametrize("broken", ["reset_signals_after_fork", "close_fds_except"])
+def test_a_child_whose_setup_fails_says_so_before_it_exits(monkeypatch, broken):
+    # Ruling 34: a setup failure is the sandbox's, so the parent must be able to tell it from a strategy fault.
+    def refuse(*args):
+        raise RuntimeError("cannot")
+
+    monkeypatch.setattr(child_module, "reset_signals_after_fork", lambda: None)
+    monkeypatch.setattr(child_module, "close_fds_except", lambda keep: None)
+    monkeypatch.setattr(child_module, broken, refuse)
+    monkeypatch.setattr(child_module, "_drop_privileges", lambda spec: pytest.fail("must not drop"))
+    monkeypatch.setattr(child_module.os, "_exit", lambda code: (_ for _ in ()).throw(_Exited(code)))
+    parent, child = socket.socketpair()
+    with parent, child:
+        with pytest.raises(_Exited) as exited:
+            child_module._run_forked_child(_spec(), child)
+        assert child_module.recv_frame(parent, timeout_s=5) == {"ok": False, "detail": "CHILD_SETUP_FAILED"}
+    assert exited.value.code == child_module._EXIT_CHILD_CRASHED
+
+
+@pytest.mark.parametrize("call", ["fork", "socketpair"])
+def test_a_fork_or_socketpair_failure_is_a_setup_error_and_leaks_no_descriptor(monkeypatch, call):
+    made = []
+    real_socketpair = socket.socketpair
+
+    def tracked_socketpair():
+        pair = real_socketpair()
+        made.extend(pair)
+        return pair
+
+    def eagain(*args):
+        raise BlockingIOError(11, "Resource temporarily unavailable")
+
+    monkeypatch.setattr(child_module.socket, "socketpair", tracked_socketpair)
+    target = child_module.os if call == "fork" else child_module.socket
+    monkeypatch.setattr(target, call, eagain)
+    with pytest.raises(child_module.ChildSetupError, match=f"{call} failed"):
+        child_module.ForkSpawner().spawn(_spec())
+    assert all(sock.fileno() == -1 for sock in made)
+
+
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_a_child_that_cannot_drop_privileges_is_a_setup_error_at_spawn():
+    # A real fork, no privileges: uid 0 is refused before any syscall, so no authored code runs.
+    with pytest.raises(child_module.ChildSetupError) as exc:
+        child_module.ForkSpawner().spawn(_spec(slot_uid=0))
+    assert exc.value.detail == "PRIVILEGE_DROP_FAILED"
+
+
+def test_a_load_fault_of_the_strategy_is_not_a_setup_error():
+    assert not issubclass(ChildError, child_module.ChildSetupError)
+    assert issubclass(child_module.ChildSetupError, ChildError)
+
+
 _RESET_PROBE = '''
 import asyncio, json, os, signal
 from trader.sandbox.child import reset_signals_after_fork

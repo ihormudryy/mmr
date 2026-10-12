@@ -18,8 +18,13 @@ LIVE_SOCKET = "/run/sandbox-live/sandbox.sock"
 RESEARCH_SOCKET = "/run/sandbox-research/sandbox.sock"
 STORE_DIR = "/store"
 
+# Who is to blame (spec 7.6, 8; ruling 34). Faults of the strategy: SANDBOX_ERROR (its load, on_bar, output or
+# time ran wrong, or the static check refused it) and SANDBOX_DIGEST_MISMATCH. Availability, never the strategy:
+# SANDBOX_BUSY (no free slot now) and SANDBOX_UNAVAILABLE (the sandbox itself failed: fork or socketpair, the
+# child's privilege drop, rlimits or setup, an internal error). SANDBOX_BAD_REQUEST: the caller (ruling 8).
 SANDBOX_ERROR = "SANDBOX_ERROR"
 SANDBOX_BUSY = "SANDBOX_BUSY"
+SANDBOX_UNAVAILABLE = "SANDBOX_UNAVAILABLE"
 SANDBOX_DIGEST_MISMATCH = "SANDBOX_DIGEST_MISMATCH"
 SANDBOX_BAD_REQUEST = "SANDBOX_BAD_REQUEST"
 

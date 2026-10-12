@@ -433,6 +433,23 @@ def test_a_supervisor_side_error_naming_the_marker_is_not_containment():
     assert not any(check_of(result, name).passed for name in ic.HOSTILE_ESCAPES)
 
 
+def test_a_sandbox_unavailable_at_bar_is_not_containment():
+    # Ruling 34: a sandbox-side failure is availability, so it never proves an escape was stopped.
+    class Unavailable(_FakeClient):
+        def open_probe(self, kind, name):
+            if kind == "probe":
+                return super().open_probe(kind, name)
+            session = _FakeSession()
+
+            def bar(*a, **k):
+                raise SandboxUnavailable("sandbox unavailable: internal sandbox error: RuntimeError")
+            session.bar = bar
+            return session
+
+    result = ic.run_isolation_checks(Unavailable())
+    assert all(check_of(result, name).detail.startswith("no fault at BAR") for name in ic.HOSTILE_ESCAPES)
+
+
 def test_an_unknown_escape_name_is_a_failed_check():
     check = ic.hostile_check(_FakeClient(), "escape_not_in_the_list")
     assert check.passed is False

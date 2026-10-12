@@ -41,6 +41,14 @@ class ChildError(Exception):
         self.detail = detail
 
 
+class ChildSetupError(ChildError):
+    """The sandbox could not start a child (fork, socketpair, privilege drop, rlimits): not the strategy's fault."""
+
+
+# The fixed codes a child sends when its own setup fails, before any authored code loads (ruling 34).
+CHILD_SETUP_FAULTS = frozenset({"CHILD_SETUP_FAILED", "PRIVILEGE_DROP_FAILED", "CHILD_LIMITS_FAILED"})
+
+
 # ── the import guard and the reduced built-ins (ruling 31) ──────────────
 
 def _import_is_allowed(name: str, fromlist: tuple[str, ...]) -> bool:
@@ -348,8 +356,8 @@ class ForkSpawner:
         self._bar_timeout = bar_timeout_s     # backstop; the server's 2 s wall timeout also kills the child
 
     def spawn(self, spec: SpawnSpec) -> ChildHandle:
-        parent_sock, child_sock = socket.socketpair()
-        pid = os.fork()
+        parent_sock, child_sock = _socketpair()
+        pid = _fork(parent_sock, child_sock)
         if pid == 0:
             _run_forked_child(spec, child_sock)   # never returns
         child_sock.close()
@@ -358,16 +366,40 @@ class ForkSpawner:
         except (ChildError, OSError) as exc:
             _kill_and_reap(pid)
             parent_sock.close()
-            raise ChildError(getattr(exc, "detail", f"child load failed: {exc}")) from exc
+            detail = getattr(exc, "detail", f"child load failed: {exc}")
+            if detail in CHILD_SETUP_FAULTS:
+                raise ChildSetupError(detail) from exc
+            raise ChildError(detail) from exc
         return _ForkedChild(pid=pid, pipe=_ChildPipe(sock=parent_sock, reply_timeout_s=self._bar_timeout))
+
+
+def _socketpair() -> tuple[socket.socket, socket.socket]:
+    try:
+        return socket.socketpair()
+    except OSError as exc:
+        raise ChildSetupError(f"socketpair failed: {exc}") from exc
+
+
+def _fork(*sockets: socket.socket) -> int:
+    """Fork; on failure (EAGAIN under the pids limit) close ``sockets`` and raise ChildSetupError."""
+    try:
+        return os.fork()
+    except OSError as exc:
+        for sock in sockets:
+            sock.close()
+        raise ChildSetupError(f"fork failed: {exc}") from exc
 
 
 def _run_forked_child(spec: SpawnSpec, sock: socket.socket) -> None:
     """The child's whole life. It never returns into the supervisor's code or its event loop."""
     code = _EXIT_CHILD_CRASHED
     try:
-        reset_signals_after_fork()
-        close_fds_except({sock.fileno()})
+        try:
+            reset_signals_after_fork()
+            close_fds_except({sock.fileno()})
+        except Exception:  # noqa: BLE001 — the sandbox's own setup failed, before any authored code
+            _send_fault_quietly(sock, "CHILD_SETUP_FAILED")
+            return
         try:
             _drop_privileges(spec)
         except Exception:  # noqa: BLE001 — any failure here leaves the child privileged

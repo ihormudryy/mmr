@@ -55,8 +55,9 @@ def socket_dir():
 class _Stack:
     """Run the asyncio server in a background thread so a synchronous client can call it."""
 
-    def __init__(self, store_dir, socket_dir, live=2, research=1):
+    def __init__(self, store_dir, socket_dir, live=2, research=1, live_spawner=None):
         self.store_dir = store_dir
+        self._live_spawner = live_spawner or InProcessSpawner()
         self.live = os.path.join(socket_dir, "live.sock")
         self.research = os.path.join(socket_dir, "research.sock")
         self._loop = asyncio.new_event_loop()
@@ -69,7 +70,7 @@ class _Stack:
 
     def _run(self):
         asyncio.set_event_loop(self._loop)
-        sup = Supervisor(spawners={"live": InProcessSpawner(), "research": InProcessSpawner()},
+        sup = Supervisor(spawners={"live": self._live_spawner, "research": InProcessSpawner()},
                          pool_sizes=self._sizes, store_dir=str(self.store_dir),
                          image_digest="build-x", posture={"caps": "00000000000000e0"})
         self._server = self._loop.run_until_complete(
@@ -280,6 +281,84 @@ def test_a_strategy_fault_ends_the_session_and_frees_the_slot(stack):
     with pytest.raises(SandboxProtocolError):    # a dead session is an error, never "no signal"
         session.bar(C1, T0 + timedelta(minutes=1), *BAR)
     assert client.ping().free == 2
+
+
+class _FailingSpawner:
+    """Fails at spawn with ``failure``, or spawns a child whose bars raise ``bar_failure``."""
+
+    def __init__(self, failure=None, bar_failure=None):
+        self._failure = failure
+        self._bar_failure = bar_failure
+
+    def spawn(self, spec):
+        if self._failure is not None:
+            raise self._failure
+        bar_failure = self._bar_failure
+
+        class _Child:
+            pid = -1
+
+            def send_bar(self, conid, t, ohlcv):
+                raise bar_failure
+
+            def close(self):
+                return None
+        return _Child()
+
+
+def _setup_error(detail):
+    from trader.sandbox.child import ChildSetupError
+    return ChildSetupError(detail)
+
+
+@pytest.mark.parametrize("failure", [
+    BlockingIOError(11, "Resource temporarily unavailable"),        # fork EAGAIN under the pids limit
+    "PRIVILEGE_DROP_FAILED", "CHILD_LIMITS_FAILED", "CHILD_SETUP_FAILED",
+])
+def test_a_sandbox_side_open_failure_is_unavailable_not_a_fault(tmp_path, socket_dir, failure):   # ruling 34
+    exc = _setup_error(failure) if isinstance(failure, str) else failure
+    stack = _Stack(tmp_path, socket_dir, live_spawner=_FailingSpawner(failure=exc))
+    try:
+        with pytest.raises(SandboxUnavailable):
+            SandboxClient(stack.live).open_session(stack.store(GOOD), "Counter", {}, "1 min", [C1])
+        assert SandboxClient(stack.live).ping().free == 2
+    finally:
+        stack.stop()
+
+
+def test_a_sandbox_bug_at_a_bar_is_unavailable_and_ends_the_session(tmp_path, socket_dir):        # ruling 34
+    stack = _Stack(tmp_path, socket_dir, live_spawner=_FailingSpawner(bar_failure=RuntimeError("bug")))
+    try:
+        session = SandboxClient(stack.live).open_session(stack.store(GOOD), "Counter", {}, "1 min", [C1])
+        with pytest.raises(SandboxUnavailable, match="internal sandbox error"):
+            session.bar(C1, T0, *BAR)
+        with pytest.raises(SandboxProtocolError):
+            session.bar(C1, T0 + timedelta(minutes=1), *BAR)
+    finally:
+        stack.stop()
+
+
+def test_a_strategy_fault_at_a_bar_stays_a_fault(tmp_path, socket_dir):
+    from trader.sandbox.child import ChildError
+
+    stack = _Stack(tmp_path, socket_dir,
+                   live_spawner=_FailingSpawner(bar_failure=ChildError("on_bar raised ZeroDivisionError: x")))
+    try:
+        session = SandboxClient(stack.live).open_session(stack.store(GOOD), "Counter", {}, "1 min", [C1])
+        with pytest.raises(SandboxFault) as exc:
+            session.bar(C1, T0, *BAR)
+        assert exc.value.code == p.SANDBOX_ERROR
+    finally:
+        stack.stop()
+
+
+def test_an_unavailable_reply_maps_to_sandbox_unavailable(fake):
+    session = _open_fake_session(fake, lambda conn, request: _reply(
+        conn, {"type": "ERROR", "v": 1, "code": p.SANDBOX_UNAVAILABLE, "detail": "fork failed"}))
+    with pytest.raises(SandboxUnavailable, match="fork failed"):
+        session.bar(C1, T0, *BAR)
+    with pytest.raises(SandboxProtocolError):    # the sandbox ended the session
+        session.bar(C1, T0 + timedelta(minutes=1), *BAR)
 
 
 def test_a_probe_opens_on_the_research_socket_with_its_one_conid(stack):

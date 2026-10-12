@@ -22,8 +22,8 @@ from trader.authored.static_check import (MAX_SOURCE_BYTES, AuthoredStaticReject
                                           require_clean)
 from trader.sandbox import protocol as proto
 from trader.sandbox.caps import SLOT_DIR_MODE, slot_dir
-from trader.sandbox.child import (SBXCHILD_GID, SLOT_UIDS, ChildError, ChildHandle, SpawnSpec, Spawner,
-                                  _kill_and_reap, close_fds_except, reset_signals_after_fork)
+from trader.sandbox.child import (SBXCHILD_GID, SLOT_UIDS, ChildError, ChildHandle, ChildSetupError, SpawnSpec,
+                                  Spawner, _kill_and_reap, close_fds_except, reset_signals_after_fork)
 
 log = logging.getLogger("mmr.sandbox")
 
@@ -202,17 +202,14 @@ class Supervisor:
         except Exception as exc:  # noqa: BLE001 — any spawn failure must give the slot back
             self._forget(reserved)
             self._release(pool_name, reserved.slot)
-            detail = exc.detail if isinstance(exc, ChildError) else f"spawn failed: {type(exc).__name__}"
-            if not isinstance(exc, ChildError):
-                log.error("spawning a %s child failed", pool_name, exc_info=True)
-            return _error(proto.SANDBOX_ERROR, detail)
+            return _spawn_failure(pool_name, exc)
         with self._lock:
             still_open = self._sessions.get(reserved.session_id) is reserved
             if still_open:
                 reserved.handle = handle
-        if not still_open:   # the connection dropped while the child loaded (ruling 7)
+        if not still_open:   # the connection dropped while the child loaded (ruling 7): the caller left, no fault
             self._finish_with(handle, reserved)
-            return _error(proto.SANDBOX_ERROR, "connection dropped during open")
+            return _error(proto.SANDBOX_UNAVAILABLE, "connection dropped during open")
         # The build id travels with OPENED, so a caller knows which image this very session runs on (ruling 29).
         return {"type": "OPENED", "v": proto.PROTOCOL_VERSION, "session": reserved.session_id,
                 "image_digest": self._image_digest}
@@ -229,7 +226,8 @@ class Supervisor:
                 return _error(proto.SANDBOX_BUSY, "live sessions open")
             pool = self._pools[pool_name]
             if not pool.free_slots:
-                return _error(proto.SANDBOX_BUSY, "no free slot")
+                quarantined = f" ({len(pool.quarantined)} quarantined)" if pool.quarantined else ""
+                return _error(proto.SANDBOX_BUSY, f"no free slot{quarantined}")
             session = _Session(session_id="s" + secrets.token_hex(8), pool=pool_name, conn_id=conn_id,
                                slot=pool.free_slots.pop(), conids=tuple(conids))
             self._sessions[session.session_id] = session
@@ -263,10 +261,11 @@ class Supervisor:
             proto.validate_signal(payload)
         except Exception as exc:  # noqa: BLE001 — a fault, a dead pipe or a bug: the child is done
             self._end(session)
+            # The child answered wrongly, raised, timed out or died mid-bar: the strategy's fault (spec 8).
             if isinstance(exc, (ChildError, proto.FrameError)):
                 return _error(proto.SANDBOX_ERROR, exc.detail)
             log.error("bar on session %s failed", session.session_id, exc_info=True)
-            return _error(proto.SANDBOX_ERROR, f"child failed: {type(exc).__name__}")
+            return _error(proto.SANDBOX_UNAVAILABLE, f"internal sandbox error: {type(exc).__name__}")
         with self._lock:
             if self._sessions.get(request.session) is not session:   # dropped or killed during the call
                 return _error(proto.SANDBOX_ERROR, "session ended during the bar")
@@ -336,6 +335,18 @@ def _build_pool(name: str, size: int, spawners: Mapping[str, Spawner]) -> Pool:
 
 def _error(code: str, detail: str) -> dict:
     return {"type": "ERROR", "v": proto.PROTOCOL_VERSION, "code": code, "detail": detail}
+
+
+def _spawn_failure(pool_name: str, exc: Exception) -> dict:
+    """Ruling 34: only a load fault of the authored class is SANDBOX_ERROR. A child the sandbox could not set up
+    (fork, socketpair, privilege drop, rlimits) or a spawner bug is availability: the strategy is not to blame."""
+    if isinstance(exc, ChildSetupError):
+        log.error("a %s child could not be set up: %s", pool_name, exc.detail)
+        return _error(proto.SANDBOX_UNAVAILABLE, exc.detail)
+    if isinstance(exc, ChildError):
+        return _error(proto.SANDBOX_ERROR, exc.detail)
+    log.error("spawning a %s child failed", pool_name, exc_info=True)
+    return _error(proto.SANDBOX_UNAVAILABLE, f"internal sandbox error: spawn failed: {type(exc).__name__}")
 
 
 def _static_rejected(rules: str) -> dict:

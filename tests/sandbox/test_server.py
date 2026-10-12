@@ -439,10 +439,21 @@ async def test_an_unexpected_supervisor_error_answers_and_closes(running, monkey
     monkeypatch.setattr(sup, "handle", broken)
     reader, writer = await _client(live)
     reply = await _call(reader, writer, {"v": 1, "type": "CLOSE", "session": "s1"})
-    assert reply["code"] == p.SANDBOX_ERROR
+    # A sandbox bug, not a fault of the strategy (ruling 34).
+    assert reply["code"] == p.SANDBOX_UNAVAILABLE and reply["detail"] == "internal sandbox error"
     with pytest.raises(p.FrameError):
         await p.read_frame(reader)
     assert "boom" in caplog.text
+    writer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_reply_the_sandbox_cannot_encode_is_availability(running, monkeypatch):
+    sup, live, _, _, _ = running
+    monkeypatch.setattr(sup, "handle", lambda *args: {"type": "CLOSED", "v": 1, "odd": float("nan")})
+    reader, writer = await _client(live)
+    reply = await _call(reader, writer, {"v": 1, "type": "CLOSE", "session": "s1"})
+    assert reply["type"] == "ERROR" and reply["code"] == p.SANDBOX_UNAVAILABLE
     writer.close()
 
 

@@ -1881,6 +1881,19 @@ class StrategyRuntime():
             return
         self._signal_hold.dispatch(dkey, strategy, signal, conId, frame)
 
+    def _finish_authored_tick(self, strategy: Strategy, dkey: tuple, conId: int, frame: pd.DataFrame, signal,
+                              disables_when_queued: int) -> None:
+        """A decision from the worker, on the loop. If the instance was disabled or unloaded since its bar was
+        queued (PR #161 review), its exits are not checked and its signal reaches the hold only to be written as
+        a STRATEGY_DISABLED or STRATEGY_UNLOADED gap: never recorded or published."""
+        crossed = (self.get_strategy(strategy.name) is not strategy
+                   or self._signal_hold.disables_of(strategy.name) != disables_when_queued)
+        if not crossed:
+            self._maybe_check_exits(strategy, conId, frame)
+        if signal:
+            self._signal_hold.dispatch(dkey, strategy, signal, conId, frame,
+                                       disables_when_decided=disables_when_queued)
+
     def _decide_off_loop(self, strategy: Strategy, dkey: tuple, conId: int, frame: pd.DataFrame) -> bool:
         """Final review I2: an authored bar can wait seconds on the sandbox (a session's warm-up, the per-bar
         proof read), so it runs on the instance's own thread, in bar order, and its decision comes back to the
@@ -1891,6 +1904,7 @@ class StrategyRuntime():
         loop = _running_loop()
         if loop is None:
             return False
+        disables_when_queued = self._signal_hold.disables_of(strategy.name)
 
         def decide() -> None:
             if not _is_dispatchable(strategy):
@@ -1901,7 +1915,8 @@ class StrategyRuntime():
                 self._note_on_prices_error(strategy, conId, ex)     # here, so the next queued bar sees it
                 return
             try:
-                loop.call_soon_threadsafe(self._finish_tick, strategy, dkey, conId, frame, signal)
+                loop.call_soon_threadsafe(self._finish_authored_tick, strategy, dkey, conId, frame, signal,
+                                          disables_when_queued)
             except RuntimeError:
                 logging.warning('authored strategy %s: the service loop closed before the bar of conId %s was '
                                 'finished; its decision is dropped', strategy.name, conId)

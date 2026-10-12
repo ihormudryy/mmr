@@ -294,9 +294,21 @@ run at the same moment as a pass wins. A proof whose `ran_at` is more than 5 min
 refused with the RPC error `PROOF_FROM_THE_FUTURE` and not stored. Until every build research reported `STARTED` on the record's evaluation, and the
 build it reported last, has a passing newest proof, the trader refuses an authored registration with
 `AUTHORED_ISOLATION_UNPROVEN`. A record past its `SHADOW` window is refused `AUTHORED_STATE_CONFLICT` even before a
-`list` expires it. A rebuilt image needs a new run. The strategy service's own check at load (the build id its `PING`
-sees must have a passing proof) arrives with SP3 Plan 4; until then an authored path does not load in the strategy
-service at all.
+`list` expires it. A rebuilt image needs a new run.
+
+The strategy service loads an active authored deployment without reading its file: the code runs only in the live
+sandbox. It loads only when the deployment's `strategy_digest` is the stored file's digest and the build its `PING`
+reports has a passing newest proof. It reads the proof from the trader again before every new session, on every bar
+(for the build the session's `OPENED` reported) and when a signal is dispatched; a passing proof is never cached. Alarm
+codes in the strategy service log:
+- `AUTHORED_ISOLATION_UNPROVEN`: no passing proof for the running build, or the proof cannot be read. No signal; the
+  deployment stays loaded and gives signals again once a proof passes. A decided signal is then written as a
+  `SIGNAL_GAP` with reason `AUTHORED_BUILD_UNPROVEN`.
+- `AUTHORED_SANDBOX_UNAVAILABLE`: the live sandbox does not answer, is full, or moved to another build during `OPEN`.
+  No signal; it reconnects on the next bar.
+- `AUTHORED_SANDBOX_FAULT` and `AUTHORED_DIGEST_MISMATCH`: the strategy failed in the sandbox on the proven build, or
+  the stored file is not the bound digest. The instance stops and the trader retires the file
+  (`retire_authored_strategy`); open positions keep their stops.
 `--compose "podman compose"` uses another compose command.
 
 ## Command Service Requirements

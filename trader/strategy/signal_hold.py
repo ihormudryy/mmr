@@ -151,13 +151,24 @@ class SignalHold:
         with self._dispatch_lock:
             self._disables[strategy_name] = self._disables.get(strategy_name, 0) + 1
 
+    def disables_of(self, strategy_name: str) -> int:
+        """How many times the strategy was disabled so far: a signal compares it with the count it was decided under."""
+        with self._dispatch_lock:
+            return self._disables.get(strategy_name, 0)
+
     def held_count(self, key: tuple) -> int:
         hold = self._holds.get(key)
         return len(hold.signals) if hold else 0
 
-    def dispatch(self, key: tuple, strategy: Any, signal: Any, conid: int, frame: pd.DataFrame) -> None:
-        """Dispatch a new signal now, or queue it behind the held (or evicted, not yet written) ones."""
-        held = HeldSignal(strategy, signal, conid, frame, self._disables.get(strategy.name, 0))
+    def dispatch(self, key: tuple, strategy: Any, signal: Any, conid: int, frame: pd.DataFrame,
+                 disables_when_decided: Optional[int] = None) -> None:
+        """Dispatch a new signal now, or queue it behind the held (or evicted, not yet written) ones.
+
+        ``disables_when_decided`` is the ``disables_of`` count when the bar was handed to another thread to
+        decide; a disable since then makes the signal a STRATEGY_DISABLED gap. None: decided just now."""
+        if disables_when_decided is None:
+            disables_when_decided = self._disables.get(strategy.name, 0)
+        held = HeldSignal(strategy, signal, conid, frame, disables_when_decided)
         hold = self._holds.get(key)
         if hold is not None:
             self._enqueue(key, hold, held)

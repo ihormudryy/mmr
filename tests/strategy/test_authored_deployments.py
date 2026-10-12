@@ -580,9 +580,9 @@ def dispatched(world, count):
     """The signals that reached the signal hold, in order, and an Event set once ``count`` of them did."""
     seen, done, dispatch = [], threading.Event(), world.rt._signal_hold.dispatch
 
-    def record(key, strategy, signal, conid, frame):
+    def record(key, strategy, signal, conid, frame, **kwargs):
         seen.append((conid, signal.probability))
-        dispatch(key, strategy, signal, conid, frame)
+        dispatch(key, strategy, signal, conid, frame, **kwargs)
         if len(seen) >= count:
             done.set()
     world.rt._signal_hold.dispatch = record
@@ -706,3 +706,29 @@ def test_a_fault_callback_on_the_worker_may_close_the_sessions_without_a_deadloc
     assert reported.wait(timeout=5) and faults == [(True, "SANDBOX_ERROR")]
     authored._worker._thread.join(timeout=5)
     assert not authored._worker._thread.is_alive() and world.sandbox.open_sessions == []
+
+
+def test_an_authored_decision_that_crossed_a_disable_is_a_gap_never_recorded(world, service_loop):  # PR #161
+    gaps, published = [], []
+    world.rt.event_store = SimpleNamespace(append=lambda event: gaps.append(event.metadata))
+    world.rt.zmq_messagebus_client = SimpleNamespace(write=lambda *args: published.append(args))
+    reconcile(world, [authored_active(world.sandbox)])
+    authored = instance_of(world)
+    world.rt._strategy_frame = lambda conid, bar_size: bars(3)
+    release, loop_held, loop_free, worker_idle = (threading.Event() for _ in range(4))
+    open_held = held_open(world.sandbox)
+    try:
+        on_loop(service_loop, world.rt._on_tick_for_strategy, authored, CONID).result(timeout=2)
+        service_loop.call_soon_threadsafe(lambda: (loop_held.set(), release.wait(timeout=10)))
+        assert loop_held.wait(timeout=2)                         # the loop is busy: the decision waits behind it
+        open_held.set()
+        assert authored.run_off_loop(worker_idle.set) and worker_idle.wait(timeout=5)   # BUY decided and queued
+        assert world.rt.disable_strategy(authored.name) == StrategyState.DISABLED
+        assert world.rt.enable_strategy(authored.name) == StrategyState.RUNNING
+    finally:
+        open_held.set()
+        release.set()
+    service_loop.call_soon_threadsafe(loop_free.set)
+    assert loop_free.wait(timeout=5)                             # the queued decision has run on the loop
+    assert world.rt.signal_record.read(0, 10).signals == () and published == []
+    assert [gap["reason"] for gap in gaps] == ["STRATEGY_DISABLED"]

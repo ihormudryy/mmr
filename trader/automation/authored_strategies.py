@@ -24,6 +24,7 @@ from trader.automation.ai_deployment_activity import EXPIRED as VERSION_EXPIRED
 from trader.automation.ai_deployment_activity import (
     ACTIVE, JUDGMENT_ENDED, NOT_STARTED, OVER_CAP, SUPERSEDED, WITHDRAWN,
 )
+from trader.automation.ai_deployment_registration import CALENDAR_UNAVAILABLE
 from trader.automation.ai_deployment_versions import WITHDRAWAL_ENTRY_IN_FLIGHT
 from trader.automation.ai_deployments import AiDeployment, DeploymentRefused
 from trader.automation.authored_config import AuthoredStrategiesConfig
@@ -429,6 +430,16 @@ def _running_images_in_tx(conn: Any) -> tuple[str, ...]:
     return tuple(row[0] for row in rows)
 
 
+def _evaluated_builds(record: AuthoredRecord) -> tuple[Optional[str], ...]:
+    """Every build research reported STARTED on the record's latest claim (review r1 of PR #160): a second STARTED
+    on the same request replaces the record's column (ruling 12) but the first build ran part of the evaluation.
+    ``(None,)`` when the claim has no STARTED, so nothing unreported passes as proven."""
+    claims = [entry.get("request_id") for entry in record.history if entry.get("event") == "CLAIMED"]
+    builds = tuple(entry.get("image") for entry in record.history
+                   if claims and entry.get("event") == "STARTED" and entry.get("request_id") == claims[-1])
+    return builds or (None,)
+
+
 def _authored_digest_of_version_in_tx(conn: Any, version_digest: str) -> Optional[str]:
     """The authored file digest behind a deployment version, via its base deployment's strategy_path, or None for
     a catalogue or unknown version (review r2 #3). Works for an initial or a renewed version (both share the base)."""
@@ -498,13 +509,13 @@ class AuthoredStrategyStore:
         return images[0] if images else None
 
     def require_proven_in_tx(self, conn: Any, deployment: AiDeployment) -> None:
-        """Ruling 12 (review r1 #5): the build that evaluated this record (its own STARTED) and the build research
-        reported last must both have a passing newest proof. Run before the seal and again inside it, so a
-        failed run recorded after the preflight stops the seal. The binding check of the build that will run the
-        code live is the strategy service's, at every new live session (Plan 4 ruling 19)."""
+        """Ruling 12 (review r1 #5): every build that evaluated this record (each STARTED on its latest claim) and
+        the build research reported last must have a passing newest proof. Run before the seal and again inside
+        it, so a failed run recorded after the preflight stops the seal. The binding check of the build that will
+        run the code live is the strategy service's, at every new live session (Plan 4 ruling 19)."""
         record = record_in_tx(conn, authored_digest_of_path(deployment.strategy_path))
-        evaluated = None if record is None else record.sandbox_image_digest
-        builds = (evaluated, *(_running_images_in_tx(conn) or (None,)))
+        evaluated = (None,) if record is None else _evaluated_builds(record)
+        builds = (*evaluated, *(_running_images_in_tx(conn) or (None,)))
         unproven = [build or "(none reported)" for build in dict.fromkeys(builds)
                     if self._proofs is None or not self._proofs.passing_for_in_tx(conn, build)]
         if unproven:
@@ -551,12 +562,14 @@ class AuthoredStrategyStore:
             raise DeploymentRefused(AUTHORED_STATE_CONFLICT,
                                     f"the record is {record.state.value}, verdict {record.verdict} of "
                                     f"{record.judgment_id}; this is a {kind} registration of {judgment_id}")
+        self._require_shadow_window_open(record)
         self._db.transaction(lambda conn: self.require_proven_in_tx(conn, deployment))
 
     def require_registrable_in_tx(self, conn: Any, deployment: AiDeployment, judgment_id: str, *,
                                   kind: str) -> None:
         """Inside the seal transaction, the preflight again: the record still awaits this registration (a
-        retirement since the preflight refuses a renewal too) and both builds are still proven."""
+        retirement since the preflight refuses a renewal too), its SHADOW window is still open and every build is
+        still proven."""
         if not self._config.enabled:
             raise DeploymentRefused(AUTHORED_STRATEGIES_DISABLED, "ai_paper.authored_strategies.enabled is false")
         record = record_in_tx(conn, authored_digest_of_path(deployment.strategy_path))
@@ -565,7 +578,26 @@ class AuthoredStrategyStore:
             raise DeploymentRefused(AUTHORED_STATE_CONFLICT,
                                     f"the authored record is {found} since the preflight; this is a {kind} "
                                     f"registration of {judgment_id}")
+        self._require_shadow_window_open(record)
         self.require_proven_in_tx(conn, deployment)
+
+    def _require_shadow_window_open(self, record: AuthoredRecord) -> None:
+        """Ruling 11 at registration (review r1 of PR #160): a SHADOW record past its window never registers, whether
+        or not a refresh has expired it yet. Unlike refresh this fails closed: a calendar that cannot serve refuses.
+        It never moves the record, because inside the seal the move would roll back with the refusal; refresh
+        expires it later. A renewal's record is DEPLOYED and its line ends through ``lines``."""
+        if record.state != SHADOW:
+            return
+        if self._calendar is None:
+            raise DeploymentRefused(CALENDAR_UNAVAILABLE, "the authored store has no session calendar")
+        try:
+            expired = self._shadow_expired(record, utc(self._now()))
+        except JudgmentRefused as refused:
+            raise DeploymentRefused(CALENDAR_UNAVAILABLE, refused.detail) from None
+        if expired:
+            raise DeploymentRefused(AUTHORED_STATE_CONFLICT,
+                                    f"the record's SHADOW window of {self._shadow_sessions} sessions has ended "
+                                    f"({SHADOW_EXPIRED}); it no longer registers")
 
     def mark_deployed_in_tx(self, conn: Any, deployment: AiDeployment, judgment_id: str, version_digest: str,
                             now: dt.datetime) -> None:
@@ -811,11 +843,17 @@ class AuthoredStrategyStore:
         if self._calendar is None:
             return None
         try:
-            last = nth_session_after(self._calendar, ny_day(record.state_changed_at), self._shadow_sessions)
+            expired = self._shadow_expired(record, now)
         except JudgmentRefused as refused:          # the calendar cannot serve: stay counted, the safe side
             logger.error("authored strategy %s stays SHADOW: %s", record.digest, refused.detail)
             return None
-        return (EXPIRED, SHADOW_EXPIRED) if ny_day(now) > last else None
+        return (EXPIRED, SHADOW_EXPIRED) if expired else None
+
+    def _shadow_expired(self, record: AuthoredRecord, now: dt.datetime) -> bool:
+        """Ruling 11: ``now`` is past the last of the ``shadow_sessions`` XNYS sessions after the record entered
+        SHADOW. Shared by refresh and registration; raises JudgmentRefused when the calendar cannot serve."""
+        last = nth_session_after(self._calendar, ny_day(record.state_changed_at), self._shadow_sessions)
+        return ny_day(now) > last
 
     def _require_enabled(self) -> None:
         if not self._config.enabled:

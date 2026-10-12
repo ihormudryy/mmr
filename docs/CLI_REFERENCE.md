@@ -289,9 +289,13 @@ sandbox checks: the supervisor's posture from `PONG` (capabilities SETUID/SETGID
 network none, read-only root, pids limit 64, no provider variables), a benign session and every hostile escape. It
 prints one JSON proof with the build id the sandbox reports. The step refuses with `LIVE_SESSIONS_OPEN` (exit 3, nothing
 printed) while the sandbox reports an open live session, before or after the run. The host checks the JSON and records it
-with typed `record_isolation_proof` as `cli`. Until the newest proof of the build id that research last reported passed, the
-trader refuses an authored registration with `AUTHORED_ISOLATION_UNPROVEN`; the strategy service also refuses to load
-an authored deployment unless the build id its own `PING` sees has a passing proof. A rebuilt image needs a new run.
+with typed `record_isolation_proof` as `cli`. The newest proof of a build is the run that ran last (`ran_at`); a failing
+run at the same moment as a pass wins. Until every build research reported `STARTED` on the record's evaluation, and the
+build it reported last, has a passing newest proof, the trader refuses an authored registration with
+`AUTHORED_ISOLATION_UNPROVEN`. A record past its `SHADOW` window is refused `AUTHORED_STATE_CONFLICT` even before a
+`list` expires it. A rebuilt image needs a new run. The strategy service's own check at load (the build id its `PING`
+sees must have a passing proof) arrives with SP3 Plan 4; until then an authored path does not load in the strategy
+service at all.
 `--compose "podman compose"` uses another compose command.
 
 ## Command Service Requirements

@@ -70,12 +70,24 @@ def test_each_image_needs_its_own_run(tmp_path):                                
 
 @pytest.mark.parametrize("seconds", range(4))
 @pytest.mark.parametrize("order", [(True, False), (False, True)])
-def test_a_failing_run_recorded_at_the_same_moment_as_a_pass_wins(tmp_path, order, seconds):   # fix round 1
-    proofs = IsolationProofs(authored_journal(tmp_path), now=Clock(NOW))   # fixed: one recorded_at for both
+def test_a_failing_run_that_ran_at_the_same_moment_as_a_pass_wins(tmp_path, order, seconds):  # fix rounds 1, 2
+    clock = Clock(NOW)
+    proofs = IsolationProofs(authored_journal(tmp_path), now=clock)
     ran_at = NOW - dt.timedelta(seconds=seconds)       # other proof ids, so no id order can decide the tie
-    for passed in order:
+    for passed in order:                               # the later recording time must not decide it either
         proofs.record(proof_request(passed=passed, ran_at=ran_at), principal="cli")
+        clock.now = clock.now + dt.timedelta(minutes=1)
     assert not proofs.passing_for(IMAGE)
+
+
+def test_a_delayed_pass_of_an_earlier_run_never_outranks_a_later_failing_run(tmp_path):      # review r1 (#160)
+    clock = Clock(NOW + dt.timedelta(minutes=2))
+    proofs = IsolationProofs(authored_journal(tmp_path), now=clock)
+    proofs.record(proof_request(passed=False, ran_at=NOW + dt.timedelta(minutes=2)), principal="cli")
+    clock.now = NOW + dt.timedelta(minutes=3)            # the earlier run's pass is recorded later
+    proofs.record(proof_request(passed=True, ran_at=NOW + dt.timedelta(minutes=1)), principal="cli")
+    assert not proofs.passing_for(IMAGE)
+    assert proofs.latest(IMAGE).ran_at == NOW + dt.timedelta(minutes=2)
 
 
 @pytest.mark.parametrize("change", [
@@ -113,12 +125,13 @@ class Stack:
         self.judgments, self.cooldowns, self.bundles = SeededJudgments(), Cooldowns(), FakeBundles()
         self.rebuild(enabled=True)
 
-    def rebuild(self, *, enabled: bool) -> None:
-        """A trader restart with the switch set to ``enabled``."""
+    def rebuild(self, *, enabled: bool, calendar=None) -> None:
+        """A trader restart with the switch set to ``enabled`` (and another session calendar, if given)."""
         clock = lambda: self.now                                                   # noqa: E731
         self.store = AuthoredStrategyStore(self.db, config=AuthoredStrategiesConfig(enabled=enabled),
                                            files=AuthoredFileStore(self.tmp_path / "store"), now=clock,
-                                           proofs=self.proofs, journal=self.journal)
+                                           proofs=self.proofs, calendar=calendar or XNYSCalendarPolicy(), shadow_sessions=20,
+                                           journal=self.journal)
         self.activity = DeploymentActivity(versions=self.versions, deployments=self.deployments,
                                            judgments=self.judgments, cooldowns=self.cooldowns, max_active=3,
                                            now=clock, authored=self.store)
@@ -127,16 +140,19 @@ class Stack:
             judgments=self.judgments, cooldowns=self.cooldowns, bundles=self.bundles,
             calendar=XNYSCalendarPolicy(), expiry_sessions=20, now=clock, authored=self.store)
 
-    def awaiting(self, *, range_bars: int = 15, judgment_id: str = "jdg-00000001", image: str = IMAGE):
-        """Stored, claimed, STARTED on ``image`` and judged DEPLOY: SHADOW AWAITING_REGISTRATION."""
+    def awaiting(self, *, range_bars: int = 15, judgment_id: str = "jdg-00000001", image: str = IMAGE,
+                 images: tuple[str, ...] = ()):
+        """Stored, claimed, STARTED on ``image`` (or on each of ``images`` in turn) and judged DEPLOY: SHADOW
+        AWAITING_REGISTRATION."""
         digest = self.store.submit(submit_request(source(range_bars)))["record"]["digest"]
         claim = request_id(range_bars)
         self.db.transaction(lambda conn: move_in_tx(
             conn, record_in_tx(conn, digest), EVALUATING, event="CLAIMED", reason=None, now=self.now,
             request_id=claim, evaluation_request_id=claim))
-        self.store.report(ReportAuthoredEvaluationRequest.model_validate({
-            "digest": digest, "request_id": claim, "event": "STARTED", "sandbox_image_digest": image,
-            "detail": ""}))
+        for started in images or (image,):
+            self.store.report(ReportAuthoredEvaluationRequest.model_validate({
+                "digest": digest, "request_id": claim, "event": "STARTED", "sandbox_image_digest": started,
+                "detail": ""}))
         self.db.transaction(lambda conn: move_in_tx(
             conn, record_in_tx(conn, digest), SHADOW, event="JUDGED", reason="AWAITING_REGISTRATION", now=self.now,
             verdict="DEPLOY", judgment_id=judgment_id, evaluation_request_id=None))
@@ -374,3 +390,78 @@ def test_a_retirement_between_the_preflight_and_the_seal_stops_a_renewal(tmp_pat
     s.store.registration_refusal = preflight_then_retire
     assert s.refused("jdg-00000002", record) == "AUTHORED_STATE_CONFLICT"
     assert [sealed.digest for sealed in s.versions.sealed()] == [version]
+
+
+# -- fix round 2 (PR #160 review r1) -------------------------------------------------------------------------
+
+@pytest.mark.parametrize("listed_first", [False, True])
+def test_registration_after_the_shadow_deadline_is_refused_with_or_without_a_list_first(tmp_path, listed_first):
+    s = Stack(tmp_path)
+    s.proofs.record(proof_request(IMAGE), principal="cli")
+    digest, record = s.awaiting()
+    s.now = NOW + dt.timedelta(days=50)                  # past the 20 XNYS sessions of SHADOW (ruling 11)
+    if listed_first:
+        s.store.overview()                               # refresh() expires the record lazily
+    assert s.refused("jdg-00000001", record) == "AUTHORED_STATE_CONFLICT"
+    assert s.versions.sealed() == ()
+    assert s.store.get(digest).state == ("EXPIRED" if listed_first else SHADOW)
+
+
+def test_registration_on_the_last_shadow_session_still_registers(tmp_path):
+    s = Stack(tmp_path)
+    s.proofs.record(proof_request(IMAGE), principal="cli")
+    digest, record = s.awaiting()                        # SHADOW from Friday 2026-10-09
+    s.now = dt.datetime(2026, 11, 6, 20, 0, tzinfo=UTC)  # the 20th session after it
+    assert s.register("jdg-00000001", record)["created"] is True
+    assert s.store.get(digest).state == DEPLOYED
+
+
+def test_a_shadow_deadline_passed_since_the_preflight_stops_the_seal(tmp_path):
+    s = Stack(tmp_path)
+    s.proofs.record(proof_request(IMAGE), principal="cli")
+    digest, record = s.awaiting()
+    preflight = s.store.registration_refusal
+
+    def preflight_then_the_deadline_passes(*args, **kwargs):
+        preflight(*args, **kwargs)
+        s.now = NOW + dt.timedelta(days=50)
+    s.store.registration_refusal = preflight_then_the_deadline_passes
+    assert s.refused("jdg-00000001", record) == "AUTHORED_STATE_CONFLICT"
+    assert s.versions.sealed() == () and s.store.get(digest).state == SHADOW
+
+
+def test_a_calendar_that_cannot_serve_refuses_registration(tmp_path):
+    s = Stack(tmp_path)
+    s.proofs.record(proof_request(IMAGE), principal="cli")
+    _digest, record = s.awaiting()
+
+    class CalendarWithoutSessions:                       # nth_session_after refuses: too few sessions
+        def sessions_in_range(self, start, end):
+            return []
+    s.rebuild(enabled=True, calendar=CalendarWithoutSessions())
+    assert s.refused("jdg-00000001", record) == "DEPLOYMENT_CALENDAR_UNAVAILABLE"
+    assert s.versions.sealed() == ()
+
+
+def test_a_delayed_earlier_pass_never_lets_a_build_register_after_a_later_failing_run(tmp_path):  # review r1
+    s = Stack(tmp_path)
+    _digest, record = s.awaiting()
+    s.now = NOW + dt.timedelta(minutes=2)
+    s.proofs.record(proof_request(IMAGE, passed=False, ran_at=NOW + dt.timedelta(minutes=2)), principal="cli")
+    s.now = NOW + dt.timedelta(minutes=3)                # the earlier run's pass arrives late
+    s.proofs.record(proof_request(IMAGE, passed=True, ran_at=NOW + dt.timedelta(minutes=1)), principal="cli")
+    assert not s.proofs.passing_for(IMAGE)
+    assert s.refused("jdg-00000001", record) == "AUTHORED_ISOLATION_UNPROVEN"
+    assert s.versions.sealed() == ()
+
+
+def test_every_build_started_on_the_evaluated_request_must_be_proven(tmp_path):             # review r1
+    s = Stack(tmp_path)
+    digest, record = s.awaiting(images=(IMAGE, OTHER_IMAGE))     # one request, STARTED on A then on B
+    assert s.store.get(digest).sandbox_image_digest == OTHER_IMAGE    # ruling 12: the latest STARTED is kept
+    s.proofs.record(proof_request(OTHER_IMAGE), principal="cli")
+    assert s.refused("jdg-00000001", record) == "AUTHORED_ISOLATION_UNPROVEN"
+    assert s.versions.sealed() == ()
+    s.proofs.record(proof_request(IMAGE), principal="cli")
+    assert s.register("jdg-00000001", record)["created"] is True
+    assert s.store.get(digest).state == DEPLOYED

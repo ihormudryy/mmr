@@ -17,8 +17,10 @@ from trader.research.canonical import canonical_json_bytes, sha256_digest
 
 PROOF_DOMAIN = "mmr.authored.isolation-proof.v1"
 _COLUMNS = "proof_id, image_digest, passed, checks_json, ran_at, recorded_at, principal"
-# Among runs recorded at the same moment a failing one counts as the newest: a tie never proves an image.
-_NEWEST_FIRST = "recorded_at DESC, passed ASC, proof_id DESC"
+# The newest run is the one that ran last, whenever its result was recorded: a delayed pass of an earlier run
+# never outranks a later failing run. Among runs at the same moment a failing one wins, so a tie never proves an
+# image. Recording time and proof id only make the order total.
+_NEWEST_FIRST = "ran_at DESC, passed ASC, recorded_at DESC, proof_id DESC"
 
 
 @dataclass(frozen=True)
@@ -72,7 +74,7 @@ class IsolationProofs:
         return self._journal.mutate_batch_work(self._journal.connect(), lambda conn, _append: write(conn))
 
     def latest_in_tx(self, conn: Any, image_digest: Optional[str]) -> Optional[IsolationProof]:
-        """The newest proof of ``image_digest`` (by recording time), or the newest of all when None."""
+        """The newest run of ``image_digest`` (by the time it ran), or the newest of all when None."""
         if image_digest is None:
             row = conn.execute(f"SELECT {_COLUMNS} FROM authored_isolation_proofs "
                                f"ORDER BY {_NEWEST_FIRST} LIMIT 1").fetchone()

@@ -19,7 +19,7 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Callable, Iterator, Mapping, Optional
 
-from trader.authored.keys import authored_key, source_digest
+from trader.authored.keys import authored_key, parse_authored_key, source_digest
 from trader.automation.ai_deployment_activity import EXPIRED as VERSION_EXPIRED
 from trader.automation.ai_deployment_activity import (
     ACTIVE, JUDGMENT_ENDED, NOT_STARTED, OVER_CAP, SUPERSEDED, WITHDRAWN,
@@ -29,16 +29,18 @@ from trader.automation.ai_deployments import DeploymentRefused
 from trader.automation.authored_config import AuthoredStrategiesConfig
 from trader.automation.authored_files import AuthoredFileStore
 from trader.automation.authored_refusals import (
-    AUTHORED_CAP_FULL, AUTHORED_STRATEGIES_DISABLED, AUTHORED_STRATEGY_UNKNOWN, AuthoredRefused,
-    AuthoredStateConflict,
+    AUTHORED_CAP_FULL, AUTHORED_STATE_CONFLICT, AUTHORED_STRATEGIES_DISABLED, AUTHORED_STRATEGY_UNKNOWN,
+    AuthoredRefused, AuthoredStateConflict,
 )
 from trader.automation.authored_submission import check_submission
 from trader.automation.authored_wire import (
     ReportAuthoredEvaluationRequest, RetireAuthoredStrategyRequest, SubmitAuthoredStrategyRequest,
 )
 from trader.automation.backtest_judgments import JudgmentRefused, nth_session_after
-from trader.automation.evaluation_claims import ny_day, utc
+from trader.automation.evaluation_claims import STRATEGY_NOT_ALLOWED, ClaimRefused, ny_day, utc
+from trader.automation.strategy_binding import bar_size_key
 from trader.research.canonical import canonical_json_bytes
+from trader.research.evaluation_request import EvaluationRequestBody
 
 logger = logging.getLogger(__name__)
 
@@ -351,6 +353,44 @@ class _DigestLocks:
                     self._held[digest] = (lock, users - 1)
 
 
+# Ruling 9: an INITIAL judgment's verdict and the state it gives the record.
+VERDICT_STATES: Mapping[str, tuple[AuthoredState, str]] = MappingProxyType({
+    "DEPLOY": (SHADOW, AWAITING_REGISTRATION),
+    "SHADOW": (SHADOW, JEV_SHADOW),
+    "REJECT": (REJECTED, JEV_REJECT),
+    "NO_VERDICT": (FAILED, JEV_NO_VERDICT),
+})
+
+
+def _claim_problem(record: Optional[AuthoredRecord], class_name: str, body: EvaluationRequestBody) -> Optional[str]:
+    """Ruling 7: why ``body`` may not evaluate ``record``, or None."""
+    if record is None:
+        return "no authored strategy has this digest"
+    if record.state != STORED:
+        return f"the authored strategy is {record.state.value}; only a STORED one may be claimed"
+    if record.class_name != class_name:
+        return f"the authored file's class is {record.class_name}, not {class_name}"
+    if bar_size_key(body.bar_size) != bar_size_key(record.bar_size):
+        return f"the authored file runs on {record.bar_size}, not {body.bar_size}"
+    for point in body.cohort:
+        for name, value in point.items():
+            problem = _point_problem(record.tunables, name, value)
+            if problem is not None:
+                return problem
+    return None
+
+
+def _point_problem(tunables: Mapping[str, Mapping[str, float]], name: str, value: Any) -> Optional[str]:
+    bounds = tunables.get(name)
+    if bounds is None:
+        return f"{name} is not a tunable of the authored file"
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return f"{name}={value!r} is not a number"
+    if not bounds["low"] <= value <= bounds["high"]:
+        return f"{name}={value!r} is outside [{bounds['low']}, {bounds['high']}]"
+    return None
+
+
 class AuthoredStrategyStore:
     """The trader's authority over authored strategies (SP3 spec 7.3). One instance per trader."""
 
@@ -416,6 +456,34 @@ class AuthoredStrategyStore:
         return {"enabled": self._config.enabled, "max_active": self._config.max_active, "counted": counted,
                 "room": max(0, self._config.max_active - counted), "judged_count": judged,
                 "bar_sizes": list(self._config.bar_sizes), "records": [record.to_json() for record in records]}
+
+    def claim_in_tx(self, conn: Any, request_id: str, body: EvaluationRequestBody, now: dt.datetime) -> None:
+        """Ruling 7, inside the SP2c claim transaction: STORED -> EVALUATING, or ClaimRefused."""
+        if not self._config.enabled:
+            raise ClaimRefused(AUTHORED_STRATEGIES_DISABLED, "ai_paper.authored_strategies.enabled is false")
+        digest, class_name = parse_authored_key(body.strategy_key)
+        record = record_in_tx(conn, digest)
+        problem = _claim_problem(record, class_name, body)
+        if problem is not None:
+            raise ClaimRefused(STRATEGY_NOT_ALLOWED, problem)
+        move_in_tx(conn, record, EVALUATING, event="CLAIMED", reason=None, now=now, request_id=request_id,
+                   evaluation_request_id=request_id)
+
+    def after_judgment_in_tx(self, conn: Any, judgment: Any, now: dt.datetime) -> None:
+        """Ruling 9, inside the judgment's transaction. A renewal ends a line; ``refresh`` reads that from the
+        deployment versions, so only an INITIAL judgment moves the record here."""
+        if judgment.kind != "INITIAL":
+            return
+        digest, class_name = parse_authored_key(judgment.strategy_key)
+        record = record_in_tx(conn, digest)
+        if record is None or record.state != EVALUATING or record.class_name != class_name \
+                or record.evaluation_request_id != judgment.request_id:
+            found = "missing" if record is None else f"{record.state.value} on {record.evaluation_request_id}"
+            raise JudgmentRefused(AUTHORED_STATE_CONFLICT,
+                                  f"the authored record is {found}; the judgment names {judgment.request_id}")
+        target, reason = VERDICT_STATES[judgment.verdict]
+        move_in_tx(conn, record, target, event="JUDGED", reason=reason, now=now, request_id=judgment.request_id,
+                   verdict=judgment.verdict, judgment_id=judgment.judgment_id, evaluation_request_id=None)
 
     def report(self, request: ReportAuthoredEvaluationRequest) -> dict:
         """Research's facts about one evaluation (spec 7.6, 8; ruling 17). The switch is not checked: an

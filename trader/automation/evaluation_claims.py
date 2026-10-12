@@ -17,6 +17,7 @@ import json
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Optional
 
+from trader.authored.keys import is_authored_key
 from trader.automation.backtest_judge_config import BacktestJudgeConfig
 from trader.automation.backtest_judge_schema import cooling_until_in_tx
 from trader.automation.calendar_policy import ET
@@ -94,10 +95,13 @@ def claim_row_in_tx(conn: Any, request_id: str) -> Optional[EvaluationClaim]:
 
 
 class EvaluationClaims:
-    def __init__(self, db: Any, *, config: BacktestJudgeConfig, now: Callable[[], dt.datetime]):
+    def __init__(self, db: Any, *, config: BacktestJudgeConfig, now: Callable[[], dt.datetime],
+                 authored: Any = None):
+        """``authored`` is the trader's AuthoredStrategyStore (SP3); without it an authored key is never claimable."""
         self._db = db
         self._config = config
         self._now = now
+        self._authored = authored
 
     def claim(self, request_id: str, body: EvaluationRequestBody, *, principal: str) -> ClaimResult:
         canonical = canonical_request_json(body)
@@ -122,6 +126,9 @@ class EvaluationClaims:
             if used >= self._config.evaluations_per_day:
                 raise ClaimRefused(EVALUATION_LIMIT_REACHED, f"{used} of {self._config.evaluations_per_day} "
                                                              f"evaluations already claimed on {day.isoformat()}")
+            if is_authored_key(body.strategy_key):
+                # SP3 Plan 3 ruling 7: the last check, because it moves the record; any refusal rolls it back.
+                self._authored.claim_in_tx(conn, request_id, body, now)
             conn.execute(f"INSERT INTO evaluation_claims ({_COLUMNS}) VALUES (?, ?, ?, ?, 'QUEUED', ?, ?, ?)",
                          [request_id, canonical, body.strategy_key, day, principal, now, now])
             return ClaimResult("ACCEPTED", EvaluationClaim(request_id, canonical, body.strategy_key, day, "QUEUED",
@@ -129,7 +136,10 @@ class EvaluationClaims:
         return self._db.transaction(write)
 
     def _check_config(self, body: EvaluationRequestBody) -> None:
-        if not self._config.allows(body.strategy_key):
+        if is_authored_key(body.strategy_key):
+            if self._authored is None:
+                raise ClaimRefused(STRATEGY_NOT_ALLOWED, "this trader has no authored-strategy store")
+        elif not self._config.allows(body.strategy_key):
             raise ClaimRefused(STRATEGY_NOT_ALLOWED,
                                f"{body.strategy_key} is not on ai_paper.backtest_judge.strategy_allowlist")
         if len(body.cohort) > self._config.max_cohort_points:

@@ -21,6 +21,7 @@ from typing import Any, Callable, Optional, Protocol
 
 from exchange_calendars.errors import DateOutOfBounds
 
+from trader.authored.keys import is_authored_key
 from trader.automation.backtest_judge_config import BacktestJudgeConfig
 from trader.automation.backtest_judge_wire import RecordBacktestJudgmentRequest
 from trader.automation.evaluation_claims import claim_row_in_tx, ny_day, utc
@@ -154,7 +155,8 @@ def _receipt(status: str, judgment_id: str, verdict: str, cooldown: Optional[dt.
 
 class BacktestJudgments:
     def __init__(self, db: Any, *, config: BacktestJudgeConfig, calendar: Any, cases_dir: Path, verify_dir: Path,
-                 now: Callable[[], dt.datetime], renewals: Optional[RenewalChecks] = None):
+                 now: Callable[[], dt.datetime], renewals: Optional[RenewalChecks] = None, authored: Any = None):
+        """``authored`` is the AuthoredStrategyStore (SP3 Plan 3 ruling 9); without it an authored case is refused."""
         self._db = db
         self._config = config
         self._calendar = calendar
@@ -162,6 +164,7 @@ class BacktestJudgments:
         self._verify_dir = Path(verify_dir)
         self._now = now
         self._renewals = renewals if renewals is not None else NoRenewalVersions()
+        self._authored = authored
 
     def record(self, request: RecordBacktestJudgmentRequest) -> dict:
         body = request.digest_body()
@@ -288,7 +291,15 @@ class BacktestJudgments:
                       judgment.verdict, judgment.strategy_key, _text(judgment.body), body_digest,
                       _text(judgment.binding), judgment.cooldown_until_session, judgment.recorded_at,
                       record_digest(judgment, body_digest)])
+        if is_authored_key(case.strategy_key):
+            self._authored_judged_in_tx(conn, judgment, recorded_at)
         return _receipt("RECORDED", judgment.judgment_id, judgment.verdict, judgment.cooldown_until_session)
+
+    def _authored_judged_in_tx(self, conn: Any, judgment: BacktestJudgment, recorded_at: dt.datetime) -> None:
+        """Same transaction as the judgment row: a refusal here records nothing (SP3 Plan 3 ruling 9)."""
+        if self._authored is None:
+            raise JudgmentRefused("AUTHORED_STRATEGIES_DISABLED", "this trader has no authored-strategy store")
+        self._authored.after_judgment_in_tx(conn, judgment, recorded_at)
 
     @staticmethod
     def _claim_renewal_in_tx(conn: Any, prior: str, judgment_id: str, recorded_at: dt.datetime) -> None:

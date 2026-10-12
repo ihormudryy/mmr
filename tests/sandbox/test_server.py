@@ -13,6 +13,7 @@ import pytest
 import pytest_asyncio
 
 from trader.sandbox import protocol as p
+from trader.sandbox import server as server_module
 from trader.sandbox.server import bind_socket, serve
 from trader.sandbox.supervisor import Supervisor
 from tests.sandbox.fakes import InProcessSpawner
@@ -406,6 +407,29 @@ async def test_an_oversize_frame_header_closes_the_connection(running):
 
 
 @pytest.mark.asyncio
+async def test_a_peer_that_hung_up_is_sent_nothing(running, monkeypatch):
+    sup, live, _, tmp_path, server = running
+    sent = []
+    send = server_module._send
+    monkeypatch.setattr(server_module, "_send", lambda writer, reply: (sent.append(reply), send(writer, reply)))
+    reader, writer = await _client(live)
+    await _call(reader, writer, _open(_store(tmp_path, GOOD)))
+    assert [reply["type"] for reply in sent] == ["OPENED"]
+    writer.close()
+    await writer.wait_closed()
+    assert await _until(lambda: not server._handlers and len(sup._pools["live"].free_slots) == 2)
+    assert [reply["type"] for reply in sent] == ["OPENED"]
+
+
+@pytest.mark.asyncio
+async def test_serving_locks_each_socket_directory_to_the_group(running):    # ruling 15
+    _, live, research, _, _ = running
+    for path in (live, research):
+        info = os.stat(os.path.dirname(path))
+        assert stat.S_IMODE(info.st_mode) == 0o750 and info.st_gid == os.getgid()
+
+
+@pytest.mark.asyncio
 async def test_an_unexpected_supervisor_error_answers_and_closes(running, monkeypatch, caplog):
     sup, live, _, _, _ = running
 
@@ -431,6 +455,36 @@ def test_bind_socket_sets_the_mode_and_group(socket_dir):
         assert stat.S_IMODE(info.st_mode) == 0o660 and info.st_gid == os.getgid()
     finally:
         sock.close()
+
+
+def test_bind_socket_locks_its_directory_to_the_group(socket_dir):    # ruling 15
+    os.chmod(socket_dir, 0o777)
+    bind_socket(os.path.join(socket_dir, "a.sock"), gid=os.getgid()).close()
+    info = os.stat(socket_dir)
+    assert stat.S_IMODE(info.st_mode) == 0o750 and info.st_gid == os.getgid()
+
+
+def test_bind_socket_refuses_a_directory_it_does_not_own(socket_dir, monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: os.stat(socket_dir).st_uid + 1)
+    path = os.path.join(socket_dir, "a.sock")
+    with pytest.raises(RuntimeError, match="not owned"):
+        bind_socket(path, gid=os.getgid())
+    assert not os.path.lexists(path)
+
+
+def test_bind_socket_fails_loudly_when_it_cannot_set_the_directory_group(socket_dir, monkeypatch):
+    chown = os.chown
+
+    def refuse_the_directory(path, uid, gid):
+        if path == socket_dir:
+            raise PermissionError("not in group")
+        chown(path, uid, gid)
+
+    monkeypatch.setattr(os, "chown", refuse_the_directory)
+    path = os.path.join(socket_dir, "a.sock")
+    with pytest.raises(PermissionError):
+        bind_socket(path, gid=os.getgid())
+    assert not os.path.lexists(path)
 
 
 def test_bind_socket_replaces_a_stale_socket(socket_dir):

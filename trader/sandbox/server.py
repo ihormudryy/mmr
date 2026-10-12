@@ -24,6 +24,7 @@ log = logging.getLogger("mmr.sandbox")
 
 TRADER_GID = 1000          # group trader: the only callers (ruling 15)
 SOCKET_MODE = 0o660
+SOCKET_DIR_MODE = 0o750
 # One worker per possible session (3 live + 4 research), one per drop, plus slack: a slow bar in one
 # session never queues another session's request (ruling 25).
 _WORKERS = 16
@@ -32,8 +33,9 @@ _connection_ids = itertools.count(1)   # unique across servers: the supervisor k
 
 
 def bind_socket(path: str, gid: int = TRADER_GID, mode: int = SOCKET_MODE) -> socket.socket:
-    """Listen on ``path`` as group ``gid`` with ``mode``. A socket the callers cannot reach is a
-    broken service, so a failed chgrp raises instead of serving."""
+    """Listen on ``path`` as group ``gid`` with ``mode``, in a directory locked to that group. A socket the
+    callers cannot reach, or one others can, is a broken service: any failure raises instead of serving."""
+    _lock_socket_directory(os.path.dirname(os.path.abspath(path)), gid)
     _remove_stale_socket(path)
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
@@ -46,6 +48,16 @@ def bind_socket(path: str, gid: int = TRADER_GID, mode: int = SOCKET_MODE) -> so
         sock.close()
         raise
     return sock
+
+
+def _lock_socket_directory(directory: str, gid: int) -> None:
+    """root:trader 0750 (ruling 15). Before the socket exists, so it is never reachable through a wider dir.
+
+    A chgrp only: the supervisor is root and in group trader, which works with or without CAP_CHOWN."""
+    if os.stat(directory).st_uid != os.geteuid():
+        raise RuntimeError(f"{directory} is not owned by the sandbox (uid {os.geteuid()}): refusing to serve in it")
+    os.chown(directory, -1, gid)
+    os.chmod(directory, SOCKET_DIR_MODE)
 
 
 def _remove_stale_socket(path: str) -> None:
@@ -117,7 +129,8 @@ class Server:
                 _send(writer, reply)
                 await writer.drain()
         except _StreamOutOfStep as out_of_step:
-            _send(writer, out_of_step.reply)   # best effort: close() flushes it if the peer still reads
+            if not reader.at_eof():   # a peer that hung up gets nothing; one still reading gets the reason
+                _send(writer, out_of_step.reply)
         except ConnectionError:
             pass
         except Exception:  # noqa: BLE001 — a supervisor bug: answer, log it, end this connection only

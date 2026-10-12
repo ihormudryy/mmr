@@ -78,17 +78,39 @@ def test_the_entry_reads_no_knob_that_could_swap_the_spawner():    # ruling 12
     assert "argparse" not in source and "InProcess" not in source
 
 
+_DYNAMIC_IMPORTERS = ("import_module", "__import__")
+
+
+def _imported_names(node: ast.AST) -> list[str]:
+    """Module names a node imports: import statements and import_module / __import__ calls on a literal."""
+    if isinstance(node, ast.Import):
+        return [alias.name for alias in node.names]
+    if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+        return [node.module]
+    if isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.Constant):
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        if name in _DYNAMIC_IMPORTERS and isinstance(node.args[0].value, str):
+            return [node.args[0].value]
+    return []
+
+
+def _is_tests(name: str) -> bool:
+    return name == "tests" or name.startswith("tests.")
+
+
+def test_the_import_scan_sees_dynamic_imports():
+    tree = ast.parse("import importlib\nimportlib.import_module('tests.sandbox.fakes')\n__import__('tests')\n"
+                     "from importlib import import_module\nimport_module('tests.x')\n")
+    assert [name for node in ast.walk(tree) for name in _imported_names(node) if _is_tests(name)] == [
+        "tests.sandbox.fakes", "tests", "tests.x"]
+
+
 def test_no_module_under_trader_imports_tests():    # ruling 12
     offenders = []
     for path in sorted((REPO / "trader").rglob("*.py")):
         for node in ast.walk(ast.parse(path.read_text(), str(path))):
-            names = []
-            if isinstance(node, ast.Import):
-                names = [alias.name for alias in node.names]
-            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                names = [node.module]
-            offenders += [f"{path.relative_to(REPO)}: {name}" for name in names
-                          if name == "tests" or name.startswith("tests.")]
+            offenders += [f"{path.relative_to(REPO)}: {name}" for name in _imported_names(node) if _is_tests(name)]
     assert offenders == []
 
 

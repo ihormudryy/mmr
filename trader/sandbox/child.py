@@ -13,7 +13,7 @@ import resource
 import socket
 import struct
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, Mapping, Protocol
@@ -528,6 +528,7 @@ class _ForkedChild:
     or a dead pipe all end the session, and only ``close()`` kills the process and frees the slot."""
     pid: int
     pipe: _ChildPipe
+    reaped: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         _require_child_pid(self.pid)
@@ -536,6 +537,12 @@ class _ForkedChild:
         return self.pipe.send_bar(conid, t, ohlcv)
 
     def close(self) -> None:
-        # Kill first: a child looping or ignoring CLOSE must die so its slot and pid free (CAP_KILL).
-        _kill_and_reap(self.pid)
-        self.pipe.close()
+        """Idempotent. Once reaped, the pid is never signalled again: the kernel may have given it to another
+        process, and the supervisor runs as root."""
+        try:
+            if not self.reaped:
+                # Kill first: a child looping or ignoring CLOSE must die so its slot and pid free (CAP_KILL).
+                _kill_and_reap(self.pid)
+                self.reaped = True
+        finally:
+            self.pipe.close()

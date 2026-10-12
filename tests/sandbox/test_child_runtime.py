@@ -596,6 +596,44 @@ def test_a_handle_refuses_a_pid_that_is_not_one_child(pid, monkeypatch):
             child_module._ForkedChild(pid=pid, pipe=child_module._ChildPipe(sock=right, reply_timeout_s=1.0))
 
 
+def _handle_with_fake_process(monkeypatch, kill=None):
+    calls = []
+
+    def fake_kill(pid, sig):
+        calls.append(("kill", pid, sig))
+        if kill is not None:
+            raise kill
+
+    def fake_waitpid(pid, options):
+        calls.append(("waitpid", pid, options))
+        return pid, 0
+
+    monkeypatch.setattr(child_module.os, "kill", fake_kill)
+    monkeypatch.setattr(child_module.os, "waitpid", fake_waitpid)
+    left, right = socket.socketpair()
+    handle = child_module._ForkedChild(pid=4242, pipe=child_module._ChildPipe(sock=right, reply_timeout_s=1.0))
+    return handle, calls, left, right
+
+
+def test_a_second_close_never_signals_a_pid_the_kernel_may_have_reused(monkeypatch):
+    handle, calls, left, right = _handle_with_fake_process(monkeypatch)
+    with left, right:
+        handle.close()
+        assert calls == [("kill", 4242, 9), ("waitpid", 4242, 0)]
+        handle.close()
+        assert calls == [("kill", 4242, 9), ("waitpid", 4242, 0)]
+        assert right.fileno() == -1
+
+
+def test_close_closes_the_pipe_even_when_the_kill_fails(monkeypatch):
+    handle, calls, left, right = _handle_with_fake_process(monkeypatch, kill=PermissionError("no CAP_KILL"))
+    with left, right:
+        with pytest.raises(PermissionError):
+            handle.close()
+        assert right.fileno() == -1 and handle.pipe.dead
+        assert calls == [("kill", 4242, 9)]
+
+
 @pytest.mark.parametrize("pid", [0, -1, True])
 def test_kill_and_reap_refuses_a_pid_that_is_not_one_child(pid, monkeypatch):
     monkeypatch.setattr(child_module.os, "kill", lambda *args: pytest.fail("os.kill was called"))

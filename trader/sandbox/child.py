@@ -6,14 +6,11 @@
 from __future__ import annotations
 
 import builtins as _builtins
-import json
 import math
 import os
 import resource
 import signal
 import socket
-import struct
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from types import MappingProxyType, SimpleNamespace
@@ -25,7 +22,8 @@ from trader.authored.allowed_api import ALLOWED_BUILTINS, ALLOWED_FROM_IMPORT_NA
 from trader.authored.api import ACTIONS, MAX_LOOKBACK_BARS, MIN_LOOKBACK_BARS, AuthoredStrategy, Decision
 from trader.authored.static_check import AuthoredStaticRejected, require_clean
 from trader.sandbox.caps import SBXCHILD_GID, SLOT_UIDS
-from trader.sandbox.protocol import MAX_FRAME_BYTES, FrameError, encode_frame, validate_signal
+from trader.sandbox.protocol import FrameError, encode_frame, validate_signal
+from trader.sandbox.protocol import recv_frame as protocol_recv_frame
 
 OHLCV_COLUMNS = ("open", "high", "low", "close", "volume")
 _EXIT_DROP_FAILED = 71                    # EX_OSERR: the privilege drop did not take
@@ -244,9 +242,6 @@ def _signal_payload(decision: Any) -> dict:
 
 # ── the frames between the supervisor and its child ─────────────────────
 
-_FRAME_HEADER = struct.Struct(">I")
-
-
 def send_frame(sock: socket.socket, obj: Mapping[str, Any]) -> None:
     try:
         sock.sendall(encode_frame(obj))
@@ -255,45 +250,11 @@ def send_frame(sock: socket.socket, obj: Mapping[str, Any]) -> None:
 
 
 def recv_frame(sock: socket.socket, timeout_s: float | None = None) -> dict:
-    """One frame from the other end, which may be hostile: capped, and always a JSON object.
-
-    ``timeout_s`` bounds the whole frame with one deadline (ruling 6): a peer that trickles one byte
-    at a time cannot stretch it, as it could a per-recv socket timeout."""
-    deadline = None if timeout_s is None else time.monotonic() + timeout_s
+    """``protocol.recv_frame``, with its failures as ChildError: a pipe that fails ends the session."""
     try:
-        (length,) = _FRAME_HEADER.unpack(_recv_exact(sock, _FRAME_HEADER.size, deadline))
-        if length > MAX_FRAME_BYTES:
-            raise ChildError(f"child frame of {length} bytes over the {MAX_FRAME_BYTES} cap")
-        body = _recv_exact(sock, length, deadline)
-    finally:
-        if deadline is not None:
-            sock.settimeout(None)
-    try:
-        obj = json.loads(body)
-    except (ValueError, RecursionError) as exc:
-        raise ChildError(f"child frame is not JSON: {type(exc).__name__}") from exc
-    if not isinstance(obj, dict):
-        raise ChildError("child frame is not a JSON object")
-    return obj
-
-
-def _recv_exact(sock: socket.socket, count: int, deadline: float | None) -> bytes:
-    chunks = []
-    while count:
-        if deadline is not None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise ChildError("child reply timed out")
-            sock.settimeout(remaining)
-        try:
-            chunk = sock.recv(count)
-        except TimeoutError as exc:          # socket.timeout is TimeoutError since 3.10
-            raise ChildError("child reply timed out") from exc
-        if not chunk:
-            raise ChildError("child pipe closed")
-        chunks.append(chunk)
-        count -= len(chunk)
-    return b"".join(chunks)
+        return protocol_recv_frame(sock, timeout_s)
+    except FrameError as exc:
+        raise ChildError(exc.detail) from exc
 
 
 def _raise_for_child_fault(reply: Mapping[str, Any], fallback: str) -> None:

@@ -5,7 +5,9 @@ import asyncio
 import json
 import math
 import re
+import socket
 import struct
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -113,6 +115,52 @@ def decode_frame_body(body: bytes) -> dict:
     if not isinstance(obj, dict):
         raise FrameError("frame is not a JSON object")
     return obj
+
+
+_FRAME_HEADER = struct.Struct(">I")
+
+
+def recv_frame(sock: socket.socket, timeout_s: float | None = None) -> dict:
+    """One frame from a blocking socket whose peer may be hostile (the child): capped, always a JSON object.
+
+    ``timeout_s`` bounds the whole frame with one deadline (ruling 6): a peer that trickles one byte at a time
+    cannot stretch it, as it could a per-recv timeout. Every failure is a FrameError. The details name the child,
+    the hostile peer: the isolation checks match on "child reply timed out"."""
+    deadline = None if timeout_s is None else time.monotonic() + timeout_s
+    try:
+        (length,) = _FRAME_HEADER.unpack(_recv_exact(sock, _FRAME_HEADER.size, deadline))
+        if length > MAX_FRAME_BYTES:
+            raise FrameError(f"child frame of {length} bytes over the {MAX_FRAME_BYTES} cap", code=SANDBOX_ERROR)
+        body = _recv_exact(sock, length, deadline)
+    finally:
+        if deadline is not None:
+            sock.settimeout(None)
+    try:
+        obj = json.loads(body)
+    except (ValueError, RecursionError) as exc:
+        raise FrameError(f"child frame is not JSON: {type(exc).__name__}", code=SANDBOX_ERROR) from exc
+    if not isinstance(obj, dict):
+        raise FrameError("child frame is not a JSON object", code=SANDBOX_ERROR)
+    return obj
+
+
+def _recv_exact(sock: socket.socket, count: int, deadline: float | None) -> bytes:
+    chunks = []
+    while count:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise FrameError("child reply timed out", code=SANDBOX_ERROR)
+            sock.settimeout(remaining)
+        try:
+            chunk = sock.recv(count)
+        except TimeoutError as exc:          # socket.timeout is TimeoutError since 3.10
+            raise FrameError("child reply timed out", code=SANDBOX_ERROR) from exc
+        if not chunk:
+            raise FrameError("child pipe closed", code=SANDBOX_ERROR)
+        chunks.append(chunk)
+        count -= len(chunk)
+    return b"".join(chunks)
 
 
 def require_version(obj: Mapping[str, Any]) -> None:

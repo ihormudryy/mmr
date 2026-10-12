@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from trader.sandbox import server as server_module
 from trader.sandbox.child import ForkSpawner
 from trader.sandbox.supervisor import LIVE_POOL_SIZE, RESEARCH_POOL_SIZE
 
@@ -48,6 +49,7 @@ def test_the_math_libraries_are_single_threaded_before_numpy_loads():    # rulin
 
         sys.meta_path.insert(0, Spy())
         import trader.sandbox_service
+        import trader.sandbox.supervisor   # what the serving path imports after the entry module set the vars
         print(json.dumps(seen))
     ''')
     env = {**os.environ, "OPENBLAS_NUM_THREADS": "8", "OMP_NUM_THREADS": "8", "MKL_NUM_THREADS": "8"}
@@ -193,6 +195,38 @@ def test_main_health_exits_by_the_answer(service, monkeypatch):
     assert down.value.code == 1
 
 
+_HEALTH_RUN = textwrap.dedent('''
+    import json, runpy, sys
+    sys.argv = ["sandbox_service", "--health", *sys.argv[1:]]
+    try:
+        runpy.run_module("trader.sandbox_service", run_name="__main__")   # as compose runs it: python -m ...
+    except SystemExit as exc:
+        code = exc.code
+    print(json.dumps({"code": code, "loaded": sorted(m for m in ("pandas", "numpy", "pyarrow") if m in sys.modules)}))
+''')
+
+
+def test_the_health_check_loads_no_pandas():
+    # M5: compose runs it every 30 s; the protocol alone answers it (no socket here, so it reports down).
+    out = subprocess.run([sys.executable, "-c", _HEALTH_RUN], cwd=REPO, capture_output=True, text=True,
+                         timeout=60, check=True).stdout
+    assert json.loads(out) == {"code": 1, "loaded": []}
+
+
+def test_the_protocol_reads_a_frame_and_fails_with_a_frame_error():
+    from trader.sandbox import protocol
+
+    a, b = socket.socketpair()
+    with a, b:
+        a.sendall(protocol.encode_frame({"type": "PONG"}))
+        assert protocol.recv_frame(b, timeout_s=1) == {"type": "PONG"}
+        with pytest.raises(protocol.FrameError, match="timed out"):
+            protocol.recv_frame(b, timeout_s=0.05)
+        a.close()
+        with pytest.raises(protocol.FrameError, match="closed"):
+            protocol.recv_frame(b, timeout_s=1)
+
+
 class _FakeServer:
     def __init__(self, calls):
         self.calls = calls
@@ -221,7 +255,7 @@ def startup(service, monkeypatch):
         os.kill(os.getpid(), signal.SIGTERM)   # as docker stop sends it, once the sockets listen
         return _FakeServer(calls)
 
-    monkeypatch.setattr(service, "serve", fake_serve)
+    monkeypatch.setattr(server_module, "serve", fake_serve)
     return calls
 
 
@@ -249,7 +283,7 @@ def test_sigint_also_closes_the_server(service, startup, monkeypatch):
         os.kill(os.getpid(), signal.SIGINT)
         return _FakeServer(startup)
 
-    monkeypatch.setattr(service, "serve", serve_then_interrupt)
+    monkeypatch.setattr(server_module, "serve", serve_then_interrupt)
     _run_with_timeout(service)
     assert startup[-2:] == ["serve", "close"]
 

@@ -21,10 +21,10 @@ import socket  # noqa: E402
 
 from trader.sandbox import caps  # noqa: E402
 from trader.sandbox import protocol as proto  # noqa: E402
-from trader.sandbox.child import ChildError, ForkSpawner, recv_frame  # noqa: E402
 from trader.sandbox.posture import read_posture  # noqa: E402  (Task 6)
-from trader.sandbox.server import TRADER_GID, serve  # noqa: E402
-from trader.sandbox.supervisor import LIVE_POOL_SIZE, RESEARCH_POOL_SIZE, Supervisor  # noqa: E402
+
+# The serving modules (server, supervisor, child) load pandas. Only the serving path imports them, so a --health
+# run, which compose starts every 30 s, needs only the protocol.
 
 log = logging.getLogger("mmr.sandbox")
 
@@ -47,7 +47,10 @@ def read_build_id(path: str = BUILD_ID_FILE) -> str:
     return value
 
 
-def build_supervisor() -> Supervisor:
+def build_supervisor():
+    from trader.sandbox.child import ForkSpawner
+    from trader.sandbox.supervisor import LIVE_POOL_SIZE, RESEARCH_POOL_SIZE, Supervisor
+
     return Supervisor(
         spawners={"live": ForkSpawner(), "research": ForkSpawner()},
         pool_sizes={"live": LIVE_POOL_SIZE, "research": RESEARCH_POOL_SIZE},
@@ -64,14 +67,16 @@ def is_healthy(path: str = proto.LIVE_SOCKET, timeout_s: float = HEALTH_TIMEOUT_
             sock.settimeout(timeout_s)
             sock.connect(path)
             sock.sendall(proto.encode_frame({"v": proto.PROTOCOL_VERSION, "type": "PING"}))
-            reply = recv_frame(sock, timeout_s)
-    except (OSError, ChildError):
+            reply = proto.recv_frame(sock, timeout_s)
+    except (OSError, proto.FrameError):
         return False
     return reply.get("type") == "PONG"
 
 
 def _join_trader_group() -> None:
     """Group trader lets the supervisor chgrp its sockets (ruling 15). Without it no caller can connect."""
+    from trader.sandbox.server import TRADER_GID
+
     try:
         os.setgroups([TRADER_GID])
     except OSError as exc:
@@ -103,6 +108,8 @@ def _stop_on_signals():
 
 
 async def _amain() -> None:
+    from trader.sandbox.server import serve
+
     _join_trader_group()
     _require_serving_posture()        # CAP_CHOWN was dropped when the module started (ruling 2)
     supervisor = build_supervisor()   # reads the posture once, so only after the drop: PONG shows the serving caps

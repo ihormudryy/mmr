@@ -10,14 +10,21 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# One list with the running sandbox: a name its posture reports as forbidden is never injected by this run.
+# posture.py imports only the standard library, so the host's python3 can load it.
+from trader.sandbox.posture import FORBIDDEN_ENV_NAMES, FORBIDDEN_ENV_PREFIXES  # noqa: E402
+
 LIVE_PORTS = frozenset({7496, 7497, 5901, 7424, 8081, *range(42001, 42010), *range(42101, 42110)})
 PROJECT_PREFIX = "mmr-sbxtest"
 PRODUCTION_IMAGE = "mmr:latest"
 # The only services the sandbox test starts (review r2 #2). Plan 3 Task 10 adds research here.
 ALLOWED_SERVICES = frozenset({"sandbox", "fullstack-tests"})
 # Any of these on a rendered service's environment, with a non-empty value, means live broker/provider access.
-CREDENTIAL_PREFIXES = ("TWS_", "IB_", "TWS", "ALPACA_", "MASSIVE_", "TWELVEDATA_", "OPENROUTER_", "AWS_", "AZURE_")
-CREDENTIAL_NAMES = frozenset({"TRADING_MODE"})
+CREDENTIAL_PREFIXES = (*FORBIDDEN_ENV_PREFIXES, "TWS")
+CREDENTIAL_NAMES = frozenset({*FORBIDDEN_ENV_NAMES, "TRADING_MODE"})
+# Service keys whose value "host" shares a namespace with the host (and so with a live stack).
+HOST_NAMESPACE_KEYS = {"network_mode": "host network", "pid": "host pid", "ipc": "host ipc"}
 FORBIDDEN_SERVICES = frozenset({"ib-gateway"})
 
 
@@ -35,7 +42,8 @@ def _environment(service: dict) -> dict:
 
 
 def _is_credential(name: str) -> bool:
-    return name in CREDENTIAL_NAMES or name.startswith(CREDENTIAL_PREFIXES)
+    upper = name.upper()
+    return upper in CREDENTIAL_NAMES or upper.startswith(CREDENTIAL_PREFIXES)
 
 
 def _is_under(source: str, roots: list[Path]) -> bool:
@@ -49,6 +57,11 @@ def _service_problems(name: str, service: dict, *, forbidden_roots: list[Path]) 
         found.append(f"{name} is in the rendered config; the sandbox test needs no broker gateway")
     elif name not in ALLOWED_SERVICES:
         found.append(f"{name} is in the rendered config, not one of {sorted(ALLOWED_SERVICES)}")
+    for key, label in HOST_NAMESPACE_KEYS.items():
+        if str(service.get(key, "")) == "host":
+            found.append(f"{name} uses the {label} ({key}: host)")
+    if service.get("privileged"):
+        found.append(f"{name} is privileged")
     image = str(service.get("image", ""))
     if image == PRODUCTION_IMAGE:
         found.append(f"{name} uses the production image {image!r}; use a {PROJECT_PREFIX}:<run id> tag")
@@ -86,9 +99,24 @@ def problems(config: dict[str, Any], *, operator_home: str, repo_root: str) -> l
                 found.append(f"{name} and {built_images[image]} both build image {image!r}; use distinct tags")
             built_images[image] = name
         found.extend(_service_problems(name, service, forbidden_roots=forbidden_roots))
-    for name, volume in sorted((config.get("volumes") or {}).items()):
-        if not str((volume or {}).get("name", "")).startswith(f"{PROJECT_PREFIX}_"):
-            found.append(f"volume {name} is named {(volume or {}).get('name')!r}, outside the test project")
+    found.extend(_project_resource_problems("volume", config.get("volumes")))
+    found.extend(_project_resource_problems("network", config.get("networks")))
+    for kind in ("config", "secret"):
+        for name, item in sorted((config.get(f"{kind}s") or {}).items()):
+            if (item or {}).get("file"):
+                found.append(f"{kind} {name} reads the host file {item['file']}")
+    return found
+
+
+def _project_resource_problems(kind: str, resources: dict | None) -> list[str]:
+    """A named volume or network must be this project's own: never external, always mmr-sbxtest_*."""
+    found = []
+    for name, resource in sorted((resources or {}).items()):
+        resource = resource or {}
+        if resource.get("external"):
+            found.append(f"{kind} {name} is external, outside the test project")
+        elif not str(resource.get("name", "")).startswith(f"{PROJECT_PREFIX}_"):
+            found.append(f"{kind} {name} is named {resource.get('name')!r}, outside the test project")
     return found
 
 

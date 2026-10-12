@@ -17,9 +17,9 @@ UNREADABLE = "<unreadable>"   # a list entry no isolation check accepts
 
 _CAP_NAMES = {5: "CAP_KILL", 6: "CAP_SETGID", 7: "CAP_SETUID"}
 # Spec 10 names ALPACA_, MASSIVE_, TWELVEDATA_, IB_ and OPENROUTER_; the rest are other secrets the stack holds.
-_FORBIDDEN_PREFIXES = ("ALPACA_", "MASSIVE_", "TWELVEDATA_", "IB_", "TWS_", "OPENROUTER_",
-                       "AWS_", "AZURE_", "DASHBOARD_", "TELEGRAM", "ANTHROPIC_", "OPENAI_", "XAI_")
-_FORBIDDEN_NAMES = frozenset({"MMR_WEB_TOKEN", "MMR_SERVICE_HMAC_KEY_FILE", "MMR_RPC_KEYS_DIR"})
+FORBIDDEN_ENV_PREFIXES = ("ALPACA_", "MASSIVE_", "TWELVEDATA_", "IB_", "TWS_", "OPENROUTER_",
+                          "AWS_", "AZURE_", "DASHBOARD_", "TELEGRAM", "ANTHROPIC_", "OPENAI_", "XAI_")
+FORBIDDEN_ENV_NAMES = frozenset({"MMR_WEB_TOKEN", "MMR_SERVICE_HMAC_KEY_FILE", "MMR_RPC_KEYS_DIR"})
 # Mount targets the posture reports: secrets live under /home and /root, authored files under /store.
 _REPORTED_MOUNT_ROOTS = ("/home", "/store", "/root")
 _SIOCGIFADDR = 0x8915   # Linux ioctl: a device's primary IPv4 address
@@ -58,7 +58,7 @@ def decode_cap_eff(hex_value: str) -> list[str]:
 
 def forbidden_env_names() -> list[str]:
     return sorted(name for name in os.environ
-                  if name.upper().startswith(_FORBIDDEN_PREFIXES) or name.upper() in _FORBIDDEN_NAMES)
+                  if name.upper().startswith(FORBIDDEN_ENV_PREFIXES) or name.upper() in FORBIDDEN_ENV_NAMES)
 
 
 def interfaces(net_dir: str = "/sys/class/net") -> list[str]:

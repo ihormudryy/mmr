@@ -17,8 +17,10 @@ services:
       sandbox:
         condition: service_healthy
     # The base sets TRADING_MODE for the trader-facing fullstack tests; the sandbox test needs no mode.
+    # MMR_SBXTEST_STRICT: a missing precondition FAILS the sandbox module instead of skipping it (review).
     environment: !override
       MMR_FAKE_BROKER: "1"
+      MMR_SBXTEST_STRICT: "1"
       TZ: UTC
     command: ["python", "-m", "pytest", "tests/fullstack/test_sandbox_service.py", "-vv", "-rA", "--timeout=600"]
     # The checks write authored files to the store and reach both sockets through the sandbox's own named volumes.

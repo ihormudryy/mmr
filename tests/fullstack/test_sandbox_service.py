@@ -4,7 +4,8 @@ Runs only inside the `fullstack-tests` container, against its own compose projec
 
   scripts/run_sandbox_fullstack.sh
 
-Outside that container every test skips. Inside it, a sandbox that never answers FAILS the run; it never skips.
+Outside that container every test skips. Inside it (the runner sets MMR_SBXTEST_STRICT=1), a missing precondition
+or a sandbox that never answers FAILS the run; nothing skips.
 
 pytest runs this file top to bottom, and the order matters: the static posture first, then live sessions (each
 closed before any probe, ruling 29), then probes and the hostile escapes, then the leftover-process checks, and
@@ -24,7 +25,12 @@ from pathlib import Path
 
 import pytest
 
-docker = pytest.importorskip("docker", reason="docker-py not installed")
+# The runner's override sets this: then nothing may skip, because a run that skipped everything exits 0.
+STRICT = os.environ.get("MMR_SBXTEST_STRICT") == "1"
+if STRICT:
+    import docker
+else:
+    docker = pytest.importorskip("docker", reason="docker-py not installed")
 
 from trader.authored.sandbox_client import (  # noqa: E402
     SandboxClient, SandboxFault, SandboxProtocolError, SandboxUnavailable,
@@ -65,7 +71,10 @@ def _skip_reason() -> str | None:
     return None
 
 
-pytestmark = pytest.mark.skipif(_skip_reason() is not None, reason=_skip_reason() or "")
+_MISSING = _skip_reason()
+if STRICT and _MISSING is not None:
+    pytest.fail(f"MMR_SBXTEST_STRICT=1 but {_MISSING}", pytrace=False)
+pytestmark = pytest.mark.skipif(_MISSING is not None, reason=_MISSING or "")
 
 
 # ── fixtures and helpers ────────────────────────────────────────────────────
@@ -102,8 +111,10 @@ def _sandbox_container(client):
     project = me.labels["com.docker.compose.project"]
     if not project.startswith(SBXTEST_PROJECT_PREFIX):
         # Ruling 30: these tests write to the store and open sessions; never in a project that could be live.
-        pytest.skip(f"compose project {project!r} is not {SBXTEST_PROJECT_PREFIX}*: "
-                    "run scripts/run_sandbox_fullstack.sh")
+        reason = f"compose project {project!r} is not {SBXTEST_PROJECT_PREFIX}*: run scripts/run_sandbox_fullstack.sh"
+        if STRICT:
+            pytest.fail(reason)
+        pytest.skip(reason)
     found = client.containers.list(filters={"label": [
         f"com.docker.compose.project={project}", "com.docker.compose.service=sandbox"]})
     assert len(found) == 1, "expected one sandbox container"

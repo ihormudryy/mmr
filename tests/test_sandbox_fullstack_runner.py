@@ -54,6 +54,18 @@ def test_a_safe_config_passes():
     (lambda c: c["services"]["sandbox"].update(env_file=[{"path": "/repo/.env"}]), "live credentials"),
     (lambda c: c["services"]["sandbox"].update(env_file=[{"path": "/elsewhere/ib.env"}]), "live credentials"),
     (lambda c: c["volumes"].update(mmr_ai_data={"name": "mmr_mmr_ai_data"}), "outside the test project"),
+    (lambda c: c["services"]["sandbox"].update(network_mode="host"), "host network"),
+    (lambda c: c["services"]["sandbox"].update(privileged=True), "privileged"),
+    (lambda c: c["services"]["sandbox"].update(pid="host"), "host pid"),
+    (lambda c: c["services"]["sandbox"].update(ipc="host"), "host ipc"),
+    (lambda c: c.update(networks={"mmr-internal": {"name": "mmr_mmr-internal"}}), "network mmr-internal"),
+    (lambda c: c.update(networks={"shared": {"name": "mmr-sbxtest_shared", "external": True}}), "external"),
+    (lambda c: c.update(configs={"cfg": {"file": f"{HOME}/.config/mmr/trader.yaml"}}), "config cfg"),
+    (lambda c: c.update(secrets={"key": {"file": "/somewhere/ib.key"}}), "secret key"),
+    (lambda c: c["services"]["sandbox"].update(environment={"ANTHROPIC_API_KEY": "k"}), "credential/mode"),
+    (lambda c: c["services"]["sandbox"].update(environment={"DASHBOARD_PASSWORD": "k"}), "credential/mode"),
+    (lambda c: c["services"]["sandbox"].update(environment={"MMR_WEB_TOKEN": "k"}), "credential/mode"),
+    (lambda c: c["services"]["sandbox"].update(environment={"telegram_bot_token": "k"}), "credential/mode"),
 ])
 def test_each_way_to_touch_a_live_stack_is_refused(change, fragment):
     config = json.loads(json.dumps(SAFE))
@@ -71,6 +83,16 @@ def test_a_list_style_environment_is_inspected_too():
     config = json.loads(json.dumps(SAFE))
     config["services"]["sandbox"]["environment"] = ["TWS_PASSWORD=secret"]
     assert any("credential/mode" in line for line in problems(config, operator_home=HOME, repo_root="/repo"))
+
+
+def test_the_checker_refuses_every_name_the_sandbox_posture_forbids():
+    # One list: whatever the running sandbox reports as a forbidden env name, the runner refuses to inject.
+    from trader.sandbox.posture import FORBIDDEN_ENV_NAMES, FORBIDDEN_ENV_PREFIXES
+
+    from check_sbxtest_config import CREDENTIAL_NAMES, CREDENTIAL_PREFIXES  # noqa: E402
+
+    assert set(FORBIDDEN_ENV_PREFIXES) <= set(CREDENTIAL_PREFIXES)
+    assert FORBIDDEN_ENV_NAMES <= CREDENTIAL_NAMES and "TRADING_MODE" in CREDENTIAL_NAMES
 
 
 def test_the_live_port_list_covers_the_gateway_rpc_and_dashboard_ports():
@@ -96,22 +118,28 @@ def test_the_override_pins_the_two_services_to_test_tags_and_strips_live_ports()
     command = services["fullstack-tests"]["command"]
     assert "tests/fullstack/test_sandbox_service.py" in command and "--timeout=600" in command
     assert "-rA" in command                                       # every outcome is listed, failures included
-    assert "TRADING_MODE" not in services["fullstack-tests"]["environment"]
+    environment = services["fullstack-tests"]["environment"]
+    assert "TRADING_MODE" not in environment
+    # Without these the module would skip everything and pytest would exit 0 (review): pin them.
+    assert environment["MMR_FAKE_BROKER"] == "1" and environment["MMR_SBXTEST_STRICT"] == "1"
     for name in ("ib-gateway", "trader", "dashboard"):
         assert services[name]["ports"] == []
 
 
-def run_with_fake_docker(tmp_path, *, run_status: int = 0, **env):
+PASSED_SUMMARY = "============================== 34 passed in 13.48s =============================="
+
+
+def run_with_fake_docker(tmp_path, *, run_status: int = 0, run_output: str = PASSED_SUMMARY, **env):
     bin_dir, log = tmp_path / "bin", tmp_path / "docker.log"
     bin_dir.mkdir()
     rendered = json.dumps(SAFE)
     # `docker` logs its whole environment and argv, so a test can prove env -i stripped the operator's variables.
-    # `run` (the pytest container) exits with ``run_status``; `logs` prints a marker.
+    # `run` (the pytest container) prints ``run_output`` and exits with ``run_status``; `logs` prints a marker.
     (bin_dir / "docker").write_text(
         f'#!/bin/bash\n{{ echo "ENV:"; env; echo "ARGV: $*"; }} >> {log}\n'
         f'if [[ " $* " == *" config "* ]]; then echo \'{rendered}\'; fi\n'
         f'if [[ " $* " == *" logs "* ]]; then echo SANDBOX-LOG-LINES; fi\n'
-        f'if [[ " $* " == *" run "* ]]; then exit {run_status}; fi\n')
+        f'if [[ " $* " == *" run "* ]]; then echo {json.dumps(run_output)}; exit {run_status}; fi\n')
     (bin_dir / "docker").chmod(0o755)
     (bin_dir / "uv").write_text(f'#!/bin/bash\n{{ echo "ENV:"; env; echo "ARGV: uv HOME=$HOME $*"; }} >> {log}\n')
     (bin_dir / "uv").chmod(0o755)
@@ -151,6 +179,32 @@ def test_a_failed_test_run_returns_its_status_and_shows_the_sandbox_logs(tmp_pat
     assert result.returncode == 1
     assert "SANDBOX-LOG-LINES" in result.stdout + result.stderr
     assert any(" down -v " in f" {call} " for call in _argv(lines))              # cleanup still runs
+
+
+@pytest.mark.parametrize("summary", [
+    "======================== 30 passed, 4 skipped in 9.00s =========================",
+    "============================= 34 skipped in 0.10s ==============================",
+    "============================ no tests ran in 0.01s =============================",
+    "=================== 33 passed, 1 deselected in 9.00s ===================",
+    "",
+])
+def test_a_run_that_skipped_or_ran_nothing_is_a_failure_even_when_pytest_exits_0(tmp_path, summary):
+    result, lines = run_with_fake_docker(tmp_path, run_output=summary)
+    assert result.returncode != 0
+    assert "every test must pass" in result.stderr
+    assert any(" down -v " in f" {call} " for call in _argv(lines))
+
+
+def test_a_long_run_summary_with_its_clock_time_still_passes(tmp_path):
+    result, _ = run_with_fake_docker(tmp_path, run_output="=========== 34 passed in 75.32s (0:01:15) ===========")
+    assert result.returncode == 0, result.stderr
+
+
+def test_cleanup_removes_only_the_runs_own_test_images(tmp_path):
+    result, lines = run_with_fake_docker(tmp_path, MMR_BUILD_ID="abc123-test")
+    assert result.returncode == 0, result.stderr
+    removals = [call for call in _argv(lines) if call.startswith("image rm ")]
+    assert removals == ["image rm mmr-sbxtest:abc123-test mmr-sbxtest:abc123-test-test"]
 
 
 def test_a_passing_test_run_returns_0_without_the_sandbox_logs(tmp_path):
@@ -267,3 +321,28 @@ def test_only_the_sbxtest_override_gives_the_test_runner_the_sandbox_volumes():
     # The trader-facing fullstack run uses compose project `mmr`; its runner must never mount the store or sockets.
     base = {v["source"] for v in volumes(load_compose()["services"]["fullstack-tests"])}
     assert not {"mmr_authored_strategies", "mmr_sandbox_live", "mmr_sandbox_research"} & base
+
+
+def _run_the_container_module(tmp_path, **env):
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    (stub / "docker.py").write_text("def from_env():\n    raise RuntimeError('stub')\n")
+    clean = {k: v for k, v in os.environ.items() if k not in ("MMR_FAKE_BROKER", "MMR_SBXTEST_STRICT")}
+    return subprocess.run(
+        [sys.executable, "-m", "pytest", "tests/fullstack/test_sandbox_service.py", "-q", "-p", "no:cacheprovider"],
+        cwd=ROOT, capture_output=True, text=True, timeout=120,
+        env={**clean, "PYTHONPATH": str(stub), **env})
+
+
+def test_outside_the_runner_the_container_module_skips(tmp_path):
+    result = _run_the_container_module(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "skipped" in result.stdout and "passed" not in result.stdout
+
+
+def test_in_strict_mode_a_missing_precondition_fails_the_module_instead_of_skipping(tmp_path):
+    # The override sets MMR_SBXTEST_STRICT=1; here the socket volumes are missing (this host is not the container).
+    result = _run_the_container_module(tmp_path, MMR_FAKE_BROKER="1", MMR_SBXTEST_STRICT="1")
+    assert result.returncode != 0
+    assert "skipped" not in result.stdout.splitlines()[-1]
+    assert "socket volumes are not mounted" in result.stdout + result.stderr

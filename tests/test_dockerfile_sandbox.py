@@ -72,3 +72,8 @@ def test_the_escape_corpus_and_probes_are_not_dockerignored():
     needed = ("tests", "tests/authored", "tests/authored/escapes", "trader", "trader/sandbox", "trader/sandbox/probes")
     assert ignored.isdisjoint(needed)
     assert not any("escape" in pattern or "probes" in pattern for pattern in ignored)
+
+
+def test_no_host_bytecode_reaches_the_image():
+    # Task 11 review: the top-level `__pycache__` line let nested host .pyc files (pytest-rewritten) into the image.
+    assert "**/__pycache__" in DOCKERIGNORE and "**/*.pyc" in DOCKERIGNORE

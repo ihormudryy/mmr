@@ -43,8 +43,11 @@ for var in DOCKER_HOST DOCKER_CONTEXT; do                       # which daemon t
     clean+=("$var=${!var}")
   fi
 done
+# Only this run's own two tags: never mmr:latest or any other image.
+TEST_IMAGES=("$MMR_SBXTEST_IMAGE" "$MMR_SBXTEST_IMAGE-test")
 cleanup() {
   "${clean[@]}" "${compose[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+  "${clean[@]}" docker image rm "${TEST_IMAGES[@]}" >/dev/null 2>&1 || true
   rm -rf "$TEST_HOME"
 }
 trap cleanup EXIT
@@ -63,10 +66,21 @@ cp -R config_defaults/. "$TEST_HOME/.config/mmr/"
 # The sandbox runs detached, so no compose watcher aborts the run when the restart test stops it; the tests run
 # in a one-off container (`run` publishes no port without --service-ports).
 "${clean[@]}" "${compose[@]}" up -d --wait --wait-timeout "$WAIT_TIMEOUT_S" sandbox
-if "${clean[@]}" "${compose[@]}" run --rm --no-deps fullstack-tests; then
-  exit 0
+PYTEST_OUT="$TEST_HOME/pytest.out"
+if "${clean[@]}" "${compose[@]}" run --rm --no-deps -T fullstack-tests | tee "$PYTEST_OUT"; then
+  status=0
 else
   status=$?
+fi
+# pytest exits 0 when every test skipped or none ran (review): only "<N> passed in <time>" with nothing else counts.
+ALL_PASSED='^=+ [0-9]+ passed in [0-9.]+s( \([0-9:]+\))? =+$'
+summary=$(grep -E '^=+ .* in [0-9.]+s' "$PYTEST_OUT" | tail -n 1 || true)
+if [[ "$status" -eq 0 && ! "$summary" =~ $ALL_PASSED ]]; then
+  echo "refusing to report success: every test must pass, none may skip; pytest said: '${summary}'" >&2
+  status=3
+fi
+if [[ "$status" -eq 0 ]]; then
+  exit 0
 fi
 echo "sandbox full-stack tests failed (exit ${status}); the sandbox log follows:" >&2
 "${clean[@]}" "${compose[@]}" logs --no-color sandbox >&2 || true

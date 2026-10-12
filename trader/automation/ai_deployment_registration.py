@@ -21,6 +21,7 @@ from trader.automation.ai_deployments import (
 from trader.automation.ai_judgment_port import JudgmentFacts, strategy_key
 from trader.automation.strategy_binding import bar_size_key, same_values
 from trader.research.canonical import canonical_json_bytes
+from trader.research.strategy_key import is_authored_path
 from trader.research.strategy_paths import normalize_strategy_path
 
 KEYS = frozenset({"judgment_id", "bundle_digest", "deployment"})
@@ -76,12 +77,15 @@ def binding_differences(deployment: AiDeployment, bundle: BundleFacts, cases: Se
 
 class AiDeploymentRegistrar:
     def __init__(self, *, journal: Any, deployments: Any, versions: Any, activity: Any, judgments: Any,
-                 cooldowns: Any, bundles: Any, calendar: Any, expiry_sessions: int, now: Callable[[], dt.datetime]):
+                 cooldowns: Any, bundles: Any, calendar: Any, expiry_sessions: int, now: Callable[[], dt.datetime],
+                 authored: Any = None):
         """``journal`` is the trader's DomainJournal. A seal takes its write lock, as a withdrawal does, so a
-        renewal and a withdrawal of its prior version commit one after the other (Plan 5)."""
+        renewal and a withdrawal of its prior version commit one after the other (Plan 5). ``authored`` is the
+        AuthoredStrategyStore (SP3 Plan 3): the staged-deploy gate of an authored deployment."""
         self._journal, self._deployments, self._versions, self._activity = journal, deployments, versions, activity
         self._judgments, self._cooldowns, self._bundles = judgments, cooldowns, bundles
         self._calendar, self._expiry_sessions, self._now = calendar, expiry_sessions, now
+        self._authored = authored
 
     def register(self, body: Mapping[str, Any], *, principal: str, command_id: str) -> dict:
         judgment_id, bundle_digest, deployment = self._parse(body)
@@ -90,6 +94,9 @@ class AiDeploymentRegistrar:
         bound = self._versions.bound_to_judgment(judgment_id)
         if bound is not None:                       # exact retry on a later day, or another body
             return self._existing_outcome(bound, digest_of_request)
+        authored = is_authored_path(deployment.strategy_path)
+        if authored:                                # SP3 spec 7.9: before any bundle read or seal
+            self._authored_gate().registration_refusal(deployment, judgment_id, kind=judgment.kind)
         prior, initial = self._line(judgment, deployment)
         now = self._now()
         if self._bundles.manifest_artifact_id(bundle_digest) != initial.artifact_id:
@@ -124,8 +131,12 @@ class AiDeploymentRegistrar:
                 raise DeploymentRefused("FAMILY_COOLING_DOWN", "the strategy key is cooling down")
             self._require_room_in_tx(conn, stands, today=ny_date(now), excluding=prior)
             self._deployments.register_in_tx(conn, deployment, principal=principal, command_id=command_id)
+            if authored:                           # review r1 #5: a failed run recorded after the preflight wins
+                self._authored.require_proven_in_tx(conn, deployment)
             digest, created = self._versions.seal_in_tx(conn, version, request_digest=digest_of_request,
                                                         principal=principal, command_id=command_id)
+            if authored and created and judgment.kind == INITIAL:
+                self._authored.mark_deployed_in_tx(conn, deployment, judgment_id, digest, self._now())
             return self._outcome(digest, version, created=created)
         return self._journal.mutate_batch_work(self._journal.connect(), lambda conn, _append: write(conn))
 
@@ -136,6 +147,11 @@ class AiDeploymentRegistrar:
         A command that only replayed an existing version committed nothing and gets None."""
         sealed = self._versions.sealed_by_command(command_id)
         return None if sealed is None else self._outcome(sealed.digest, sealed.version, created=True)
+
+    def _authored_gate(self) -> Any:
+        if self._authored is None:
+            raise DeploymentRefused("AUTHORED_STRATEGIES_DISABLED", "this trader has no authored-strategy store")
+        return self._authored
 
     def _existing_outcome(self, bound: Any, digest_of_request: str) -> dict:
         if bound.request_digest != digest_of_request:

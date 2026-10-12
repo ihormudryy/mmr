@@ -14,7 +14,9 @@ from trader.automation.authored_schema import apply_authored_migrations
 from trader.automation.authored_strategies import (
     DEPLOYED, EVALUATING, SHADOW, AuthoredRecord, AuthoredState, AuthoredStrategyStore, move_in_tx, record_in_tx,
 )
-from trader.automation.authored_wire import ReportAuthoredEvaluationRequest, SubmitAuthoredStrategyRequest
+from trader.automation.authored_wire import (
+    RecordIsolationProofRequest, ReportAuthoredEvaluationRequest, SubmitAuthoredStrategyRequest,
+)
 from trader.automation.calendar_policy import XNYSCalendarPolicy
 from trader.automation.backtest_judge_schema import apply_backtest_judge_migrations
 from trader.data.duckdb_store import DuckDBConnection
@@ -154,3 +156,10 @@ def deployed(world: AuthoredWorld, range_bars: int = 15, version: str = VERSION)
           evaluation_request_id=None)
     moved(world, digest, DEPLOYED, deployment_version=version)
     return digest
+
+
+def proof_request(image: str = IMAGE, *, passed: bool = True, ran_at=NOW) -> RecordIsolationProofRequest:
+    return RecordIsolationProofRequest.model_validate({
+        "image_digest": image, "passed": passed, "ran_at": ran_at.isoformat(),
+        "checks": [{"name": "hostile.os_kill_parent", "passed": passed, "detail": "EPERM"},
+                   {"name": "host.network_none", "passed": True, "detail": "NetworkMode=none"}]})

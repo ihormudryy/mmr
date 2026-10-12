@@ -265,6 +265,7 @@ class World:
         self._withdrawal_gate = deployment_withdrawal_gate_in_tx(versions=self.versions)
         self.experiment_store = None
         self._experiment_gate = None
+        self._authored_gate = None
         self.policy_publish(PAPER_LIMITS)
         self.evidence = FailingEvidence(AiPaperEvidence(
             broker=self.broker, quotes=self.quotes, margin=self.margin,
@@ -325,7 +326,54 @@ class World:
         if self._intent_hook is not None:
             self._intent_hook(conn, request)
         return self._withdrawal_gate(conn, request) or (
-            None if self._experiment_gate is None else self._experiment_gate(conn, request))
+            None if self._experiment_gate is None else self._experiment_gate(conn, request)) or (
+            None if self._authored_gate is None else self._authored_gate(conn, request))
+
+    def arm_authored(self, store_dir):
+        """SP3 Plan 3 (review r2 #3): a DEPLOYED authored record behind its own base deployment and an INITIAL
+        version, plus the SUBMITTING gate and a ``renew`` that seals a renewal version on the same base. Returns
+        ``ArmedAuthored(store, digest, base, initial_version, renew)``; ``renew()`` returns the new version.
+        The store shares the journal (as the trader wires it) and becomes the activity's authored store, so
+        admission and final dispatch ask it too."""
+        from tests.automation.authored_fixtures import submit_request
+        from trader.automation.ai_deployment_versions import RENEWAL
+        from trader.automation.authored_config import AuthoredStrategiesConfig
+        from trader.automation.authored_files import AuthoredFileStore
+        from trader.automation.authored_schema import apply_authored_migrations
+        from trader.automation.authored_strategies import (
+            DEPLOYED, EVALUATING, SHADOW, AuthoredStrategyStore, move_in_tx, record_in_tx,
+        )
+        from trader.research.strategy_key import authored_strategy_path
+
+        apply_authored_migrations(SchemaMigrator(self.db))
+        store = AuthoredStrategyStore(self.db, config=AuthoredStrategiesConfig(enabled=True),
+                                      files=AuthoredFileStore(store_dir), now=self.clock, journal=self.journal)
+        digest = store.submit(submit_request())["record"]["digest"]
+        record = {**GOOD, "strategy_path": authored_strategy_path(digest), "strategy_digest": digest,
+                  "class_name": "RangeBreak", "params": {"RANGE_BARS": 15}, "evidence_ref": "trial:authored"}
+        base, _ = self.deployments.register(AiDeployment.from_json(record), principal="ai_research",
+                                            command_id="dep-authored")
+
+        def seal(judgment_id, *, prior=None):
+            kind = INITIAL if prior is None else RENEWAL
+            self.judgments.seed(deploy_facts(record, judgment_id, kind=kind, renews=prior))
+            version = DeploymentVersion(base, judgment_id, kind, prior, dt.date(2026, 7, 17), dt.date(2026, 8, 14))
+            return self.db.transaction(lambda conn: self.versions.seal_in_tx(
+                conn, version, request_digest="sha256:" + hashlib.sha256(judgment_id.encode()).hexdigest(),
+                principal="ai_research", command_id=f"seed-{judgment_id}"))[0]
+
+        initial = seal("jdg-authored-1")
+        steps = ((EVALUATING, {"evaluation_request_id": "sha256:" + "1" * 64}),
+                 (SHADOW, {"verdict": "DEPLOY", "judgment_id": "jdg-authored-1", "evaluation_request_id": None}),
+                 (DEPLOYED, {"deployment_version": initial}))
+        for target, changes in steps:
+            self.db.transaction(lambda conn, target=target, changes=changes: move_in_tx(
+                conn, record_in_tx(conn, digest), target, event="TEST", reason=None, now=self.clock(), **changes))
+        self.activity._authored = store
+        self._authored_gate = store.send_gate_in_tx
+        renew_ids = iter(f"jdg-authored-{n}" for n in range(2, 9))
+        return SimpleNamespace(store=store, digest=digest, base=base, version=initial,
+                               renew=lambda prior=initial: seal(next(renew_ids), prior=prior))
 
     def arm_experiment(self, *, process_started_at=None):
         """A real ARMED experiment row, read by the saga's send gate on its SUBMITTING transaction."""

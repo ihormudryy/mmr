@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 
 from trader.automation.ai_deployments import STRATEGY_KIND, AiDeployment, DeploymentRefused
 from trader.automation.ai_judgment_port import strategy_key
+from trader.automation.authored_refusals import AUTHORED_STRATEGIES_DISABLED
+from trader.research.strategy_key import is_authored_path
 
 logger = logging.getLogger(__name__)
 
@@ -91,12 +93,14 @@ class ActiveDeployment:
 
 class DeploymentActivity:
     def __init__(self, *, versions: Any, deployments: Any, judgments: Any, cooldowns: Any, max_active: int,
-                 now: Callable[[], dt.datetime]):
+                 now: Callable[[], dt.datetime], authored: Any = None):
+        """``authored`` is the AuthoredStrategyStore (SP3 Plan 3 ruling 16); an authored ENTER without it is refused."""
         if type(max_active) is not int or max_active < 0:
             raise ValueError("max_active must be an integer >= 0")
         self._versions, self._deployments = versions, deployments
         self._judgments, self._cooldowns = judgments, cooldowns
         self._max_active, self._now = max_active, now
+        self._authored = authored
 
     @property
     def max_active(self) -> int:
@@ -132,9 +136,13 @@ class DeploymentActivity:
     def active(self) -> tuple[ActiveDeployment, ...]:
         chosen = []
         for digest, status in sorted(self.statuses().items()):
-            if status == ACTIVE:
-                version = self._versions.get(digest)
-                chosen.append(ActiveDeployment(digest, version, self._deployments.get_sealed(version.base_digest)))
+            if status != ACTIVE:
+                continue
+            version = self._versions.get(digest)
+            deployment = self._deployments.get_sealed(version.base_digest)
+            if is_authored_path(deployment.strategy_path) and self._authored_refusal(deployment):
+                continue        # SP3 ruling 16: a retired or switched-off authored strategy is not loaded
+            chosen.append(ActiveDeployment(digest, version, deployment))
         return tuple(chosen)
 
     def entry_refusal(self, *, deployment_digest: str, version_digest: Optional[str],
@@ -155,11 +163,20 @@ class DeploymentActivity:
         if status != ACTIVE:
             return "DEPLOYMENT_NOT_ACTIVE"
         deployment = self._deployments.get_sealed(deployment_digest)
+        if is_authored_path(deployment.strategy_path):
+            code = self._authored_refusal(deployment)
+            if code:
+                return code
         if self._cooldowns.cooling_down(strategy_key(deployment.strategy_path, deployment.class_name), self._now()):
             return "FAMILY_COOLING_DOWN"
         if not _same_digest(source_digest, deployment.strategy_digest):
             return "STRATEGY_SOURCE_MISMATCH"
         return None
+
+    def _authored_refusal(self, deployment: AiDeployment) -> Optional[str]:
+        if self._authored is None:
+            return AUTHORED_STRATEGIES_DISABLED
+        return self._authored.entry_refusal(deployment)
 
 
 def deployment_withdrawal_gate_in_tx(*, versions: Any):

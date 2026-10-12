@@ -25,12 +25,12 @@ from trader.automation.ai_deployment_activity import (
     ACTIVE, JUDGMENT_ENDED, NOT_STARTED, OVER_CAP, SUPERSEDED, WITHDRAWN,
 )
 from trader.automation.ai_deployment_versions import WITHDRAWAL_ENTRY_IN_FLIGHT
-from trader.automation.ai_deployments import DeploymentRefused
+from trader.automation.ai_deployments import AiDeployment, DeploymentRefused
 from trader.automation.authored_config import AuthoredStrategiesConfig
 from trader.automation.authored_files import AuthoredFileStore
 from trader.automation.authored_refusals import (
-    AUTHORED_CAP_FULL, AUTHORED_STATE_CONFLICT, AUTHORED_STRATEGIES_DISABLED, AUTHORED_STRATEGY_UNKNOWN,
-    AuthoredRefused, AuthoredStateConflict,
+    AUTHORED_CAP_FULL, AUTHORED_ISOLATION_UNPROVEN, AUTHORED_STATE_CONFLICT, AUTHORED_STRATEGIES_DISABLED,
+    AUTHORED_STRATEGY_UNKNOWN, AuthoredRefused, AuthoredStateConflict,
 )
 from trader.automation.authored_submission import check_submission
 from trader.automation.authored_wire import (
@@ -41,6 +41,7 @@ from trader.automation.evaluation_claims import STRATEGY_NOT_ALLOWED, ClaimRefus
 from trader.automation.strategy_binding import bar_size_key
 from trader.research.canonical import canonical_json_bytes
 from trader.research.evaluation_request import EvaluationRequestBody
+from trader.research.strategy_key import authored_digest_of_path, is_authored_path
 
 logger = logging.getLogger(__name__)
 
@@ -391,17 +392,50 @@ def _point_problem(tunables: Mapping[str, Mapping[str, float]], name: str, value
     return None
 
 
+def _running_image_in_tx(conn: Any) -> Optional[str]:
+    row = conn.execute("SELECT sandbox_image_digest FROM authored_strategies WHERE sandbox_image_seen_at "
+                       "IS NOT NULL ORDER BY sandbox_image_seen_at DESC, digest LIMIT 1").fetchone()
+    return None if row is None else row[0]
+
+
+def _authored_digest_of_version_in_tx(conn: Any, version_digest: str) -> Optional[str]:
+    """The authored file digest behind a deployment version, via its base deployment's strategy_path, or None for
+    a catalogue or unknown version (review r2 #3). Works for an initial or a renewed version (both share the base)."""
+    row = conn.execute("SELECT d.record_json FROM ai_deployment_versions v JOIN ai_deployments d "
+                       "ON d.digest = v.base_digest WHERE v.digest = ?", [version_digest]).fetchone()
+    if row is None:
+        return None
+    path = json.loads(row[0]).get("strategy_path", "")
+    return authored_digest_of_path(path) if is_authored_path(path) else None
+
+
+def _may_register(record: AuthoredRecord, judgment_id: str, class_name: str, kind: str) -> bool:
+    """Ruling 10: an INITIAL DEPLOY waits in SHADOW for its own judgment; a renewal keeps a DEPLOYED record."""
+    if record.class_name != class_name:
+        return False
+    if kind == "RENEWAL":
+        return record.state == DEPLOYED
+    return record.state == SHADOW and record.verdict == "DEPLOY" and record.judgment_id == judgment_id
+
+
 class AuthoredStrategyStore:
     """The trader's authority over authored strategies (SP3 spec 7.3). One instance per trader."""
 
     def __init__(self, db: Any, *, config: AuthoredStrategiesConfig, files: AuthoredFileStore,
                  now: Callable[[], dt.datetime], proofs: Any = None, calendar: Any = None,
                  shadow_sessions: int = 20, lines: Optional[Callable[[], Any]] = None,
-                 withdraw: Optional[Callable[[str], bool]] = None):
+                 withdraw: Optional[Callable[[str], bool]] = None, journal: Any = None):
         """``proofs`` (IsolationProofs) gates registration; ``calendar``, ``shadow_sessions`` and ``lines``
         (a callable returning DeploymentLines) drive the lazy expiry of ruling 11; ``withdraw`` (the SP2c
-        version withdrawal, Task 6) ends a retired record's deployment line (ruling 18, decision D4)."""
+        version withdrawal, Task 6) ends a retired record's deployment line (ruling 18, decision D4).
+
+        ``journal`` is the trader's DomainJournal over the same database. With it a move out of DEPLOYED or
+        SHADOW (retire, refresh) takes the journal's write lock, as the saga's SUBMITTING row and the
+        registration seal do, so ``send_gate_in_tx`` and ``mark_deployed_in_tx`` never miss a retirement or an
+        expiry that committed beside them (DuckDB snapshots alone would let both commit). Without it those
+        writes take only the database's own lock: for tests and tools that have no saga."""
         self._db = db
+        self._journal = journal
         self._config = config
         self._files = files
         self._now = now
@@ -418,6 +452,93 @@ class AuthoredStrategyStore:
 
     def get(self, digest: str) -> Optional[AuthoredRecord]:
         return self._db.transaction(lambda conn: record_in_tx(conn, digest))
+
+    def _write(self, tx: Callable[[Any], Any]) -> Any:
+        """One write transaction, under the journal's write lock when the store has the journal.
+        ``tx`` must not call back into the journal or the database."""
+        if self._journal is None:
+            return self._db.transaction(tx)
+        return self._journal.mutate_batch_work(self._journal.connect(), lambda conn, _append: tx(conn))
+
+    def running_image(self) -> Optional[str]:
+        """Ruling 12: the trader cannot reach the sandbox; the image is the one in research's latest STARTED."""
+        return self._db.transaction(_running_image_in_tx)
+
+    def require_proven_in_tx(self, conn: Any, deployment: AiDeployment) -> None:
+        """Ruling 12 (review r1 #5): the build that evaluated this record (its own STARTED) and the build research
+        reported last must both have a passing newest proof. Run before the seal and again inside it, so a
+        failed run recorded after the preflight stops the seal. The binding check of the build that will run the
+        code live is the strategy service's, at every new live session (Plan 4 ruling 19)."""
+        record = record_in_tx(conn, authored_digest_of_path(deployment.strategy_path))
+        builds = (None if record is None else record.sandbox_image_digest, _running_image_in_tx(conn))
+        unproven = [build or "(none reported)" for build in dict.fromkeys(builds)
+                    if self._proofs is None or not self._proofs.passing_for_in_tx(conn, build)]
+        if unproven:
+            raise DeploymentRefused(AUTHORED_ISOLATION_UNPROVEN,
+                                    f"no passing isolation proof for the sandbox build {', '.join(unproven)}; "
+                                    "run mmr ai-author prove-isolation")
+
+    def send_gate_in_tx(self, conn: Any, request: Any) -> Optional[str]:
+        """Review r1 #4 and r2 #3: the last check of an authored ENTER, on the saga's SUBMITTING transaction. With
+        the journal wired, a retirement commits either before this read (the send is refused) or after the
+        SUBMITTING row (the entry was already in flight, as with an SP2c withdrawal). A switch-off is a restart.
+
+        The authored record is resolved from the entering version's **base deployment**, not from the record's own
+        `deployment_version`: a renewal seals a new version on the same base, and the record keeps the initial
+        version in that column (the authored line is not renewed, Plan 4 ruling 21, but a renewal must still be
+        fenced). So every version of an authored line is gated by the record's current state."""
+        from trader.automation.ai_paper_evidence import AI_PAPER_ACTION
+
+        body = getattr(request, "body", None) or {}
+        if getattr(request, "action", None) != AI_PAPER_ACTION or body.get("action") != "ENTER":
+            return None
+        version = body.get("deployment_version")
+        if version is None:
+            return None
+        digest = _authored_digest_of_version_in_tx(conn, version)
+        if digest is None:
+            return None                                   # a catalogue version (or unknown: handled elsewhere)
+        if not self._config.enabled:
+            return AUTHORED_STRATEGIES_DISABLED
+        record = record_in_tx(conn, digest)
+        return None if record is not None and record.state == DEPLOYED else "DEPLOYMENT_NOT_ACTIVE"
+
+    def registration_refusal(self, deployment: AiDeployment, judgment_id: str, *, kind: str) -> None:
+        """Spec 7.3, 7.9 and 8 before an authored deployment registers; raises DeploymentRefused."""
+        digest = authored_digest_of_path(deployment.strategy_path)
+        if digest != deployment.strategy_digest:
+            raise DeploymentRefused("JUDGMENT_MISMATCH", "the authored path names another file than strategy_digest")
+        if not self._config.enabled:
+            raise DeploymentRefused(AUTHORED_STRATEGIES_DISABLED, "ai_paper.authored_strategies.enabled is false")
+        record = self.get(digest)
+        if record is None:
+            raise DeploymentRefused(AUTHORED_STRATEGY_UNKNOWN, f"no authored strategy has digest {digest}")
+        if not _may_register(record, judgment_id, deployment.class_name, kind):
+            raise DeploymentRefused(AUTHORED_STATE_CONFLICT,
+                                    f"the record is {record.state.value}, verdict {record.verdict} of "
+                                    f"{record.judgment_id}; this is a {kind} registration of {judgment_id}")
+        self._db.transaction(lambda conn: self.require_proven_in_tx(conn, deployment))
+
+    def mark_deployed_in_tx(self, conn: Any, deployment: AiDeployment, judgment_id: str, version_digest: str,
+                            now: dt.datetime) -> None:
+        """Inside the seal transaction: SHADOW -> DEPLOYED, or the whole registration rolls back."""
+        record = record_in_tx(conn, authored_digest_of_path(deployment.strategy_path))
+        if record is None or not _may_register(record, judgment_id, deployment.class_name, "INITIAL"):
+            raise DeploymentRefused(AUTHORED_STATE_CONFLICT, "the authored record moved before the seal")
+        try:
+            move_in_tx(conn, record, DEPLOYED, event="REGISTERED", reason=None, now=now,
+                       deployment_version=version_digest)
+        except AuthoredStateConflict as conflict:
+            raise DeploymentRefused(AUTHORED_STATE_CONFLICT, conflict.detail) from None
+
+    def entry_refusal(self, deployment: AiDeployment) -> Optional[str]:
+        """Ruling 16, for an authored ENTER at admission and at final dispatch. Closes never ask."""
+        if not self._config.enabled:
+            return AUTHORED_STRATEGIES_DISABLED
+        record = self.get(authored_digest_of_path(deployment.strategy_path))
+        if record is None or record.state != DEPLOYED:
+            return "DEPLOYMENT_NOT_ACTIVE"
+        return None
 
     def submit(self, request: SubmitAuthoredStrategyRequest) -> dict:
         """Two submits of one digest run one after the other, so the second finds the first's record and
@@ -523,7 +644,7 @@ class AuthoredStrategyStore:
             return "UPDATED", move_in_tx(conn, record, RETIRED, event="RETIRED_BY_STRATEGY", reason=SANDBOX_ERROR,
                                          now=now, detail=f"{request.code}: {request.detail}")
         try:
-            status, record = self._db.transaction(write)
+            status, record = self._write(write)
         except AuthoredRefused as refused:
             return refused.reply()
         version = self._version_to_withdraw(record)
@@ -570,7 +691,7 @@ class AuthoredStrategyStore:
                 if current is not None and current.state == record.state \
                         and current.state_changed_at == record.state_changed_at:
                     move_in_tx(conn, current, target, event="WINDOW_ENDED", reason=reason, now=now)
-        self._db.transaction(write)
+        self._write(write)
 
     def _withdraw_again(self, record: AuthoredRecord) -> None:
         """Best effort: the record stays RETIRED whatever happens, and a failure never breaks a read or a submit.

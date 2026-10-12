@@ -59,6 +59,8 @@ x-mmr-build: &mmr-build
   # silently ship pytest/docker-py in every one of these five production
   # services. Only `fullstack-tests` (below) overrides this to `test`.
   target: runtime
+  args:
+    MMR_BUILD_ID: ${MMR_BUILD_ID:-unset}
 
 x-mmr-common-env: &mmr-common-env
   TRADER_CONFIG: /home/trader/.config/mmr/trader.yaml
@@ -399,6 +401,8 @@ services:
       # command time (strategy load verifies once; trader never trusts a
       # strategy-service "verified" boolean).
       - ${HOME}/.local/share/mmr/artifacts:/home/trader/.local/share/mmr/artifacts:ro
+      # The live sandbox socket (SP3 Plan 2); Plan 4's live proxy connects here.
+      - mmr_sandbox_live:/run/sandbox-live
     healthcheck:
       test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 42105), timeout=3).close()"]
       interval: 30s
@@ -704,12 +708,73 @@ services:
       - /dev/null:/home/trader/.config/mmr/service_hmac.key:ro
       - mmr_db_data:/home/trader/.local/share/mmr/data
       - mmr_research_data:/home/trader/.local/share/mmr/research
+      # The research sandbox socket (SP3 Plan 2); Plan 4's proxy strategy connects here.
+      - mmr_sandbox_research:/run/sandbox-research
       - ${HOME}/.local/share/mmr/artifacts:/home/trader/.local/share/mmr/artifacts
       - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
     healthcheck:
       test: ["CMD", "python3", "-c", "import socket; socket.create_connection((socket.gethostname(), 42106), timeout=3).close()"]
       interval: 30s
       timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # ── sandbox: runs authored strategy code, nothing else (SP3 Plan 2, spec 7.5) ──
+  # Deliberately does NOT inherit x-mmr-hardening (it sets `networks`, which clashes
+  # with network_mode: none) or x-mmr-common-env (that anchor carries Alpaca/IB keys).
+  # One supervisor (uid 0; CHOWN only at startup, then SETUID/SETGID/KILL) forks one
+  # child per session, drops it to a slot uid (20001..20007) before any authored code
+  # loads. No network, read-only root, its own seccomp profile. It mounts only the
+  # read-only store and the two socket volumes: no keys, no config, no DB, no secrets.
+  # The baked ~/.config is closed to other users by the Dockerfile (mode 0700), not by a
+  # mount, because the isolation proof refuses any mount under /home or /root.
+  # The command takes NO arguments: only that path drops CAP_CHOWN before serving.
+  # `entrypoint: []` skips docker-entrypoint.sh (root-only chown work, IB settings).
+  # The socket volumes are named volumes, root-owned when mounted; the supervisor sets
+  # their group and mode itself, so there is no init chown.
+  sandbox:
+    build: *mmr-build
+    image: mmr:latest
+    profiles: ["ai", "test"]
+    restart: unless-stopped
+    working_dir: /home/trader/mmr
+    entrypoint: []
+    command: ["python", "-m", "trader.sandbox_service"]
+    user: "0"
+    init: true
+    read_only: true
+    network_mode: none
+    ipc: none
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, KILL]
+    security_opt:
+      - "no-new-privileges:true"
+      - "seccomp=./config_defaults/sandbox-seccomp.json"
+    pids_limit: 64
+    cpus: 2
+    mem_limit: 4g
+    # The child closes inherited fds up to this limit, so keep it small and fixed.
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 1024
+    environment:
+      TZ: UTC
+      PYTHONDONTWRITEBYTECODE: "1"
+      HOME: /tmp
+      TMPDIR: /tmp
+      NUMBA_CACHE_DIR: /tmp/numba
+      MPLCONFIGDIR: /tmp/mpl
+    tmpfs:
+      - "/tmp:size=67108864,mode=0755,noexec,nosuid,nodev"
+    volumes:
+      - mmr_authored_strategies:/store:ro
+      - mmr_sandbox_live:/run/sandbox-live
+      - mmr_sandbox_research:/run/sandbox-research
+    healthcheck:
+      test: ["CMD", "python", "-m", "trader.sandbox_service", "--health"]
+      interval: 30s
+      timeout: 10s
       retries: 3
       start_period: 30s
 
@@ -859,3 +924,6 @@ volumes:
   mmr_db_data:
   mmr_ai_data:
   mmr_research_data:
+  mmr_authored_strategies:
+  mmr_sandbox_live:
+  mmr_sandbox_research:

@@ -58,6 +58,11 @@ Each ruling is one line; the owner confirms them in the index under "Owner rulin
 22. **Plan 3 ruling 22 (decision D2):** The sandbox "image digest" is Plan 2's build id (Plan 2 ruling 1: `PONG.image_digest`, read from `/etc/mmr-build-id` baked into the image), text matching `^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$` (`IMAGE_ID`, the same text as Plan 2's `BUILD_ID_RE`) and never `unset`. One spelling everywhere: the `STARTED` report, the proof, `get_isolation_proof` and the strategy load check.
 23. **Plan 3 ruling 23:** The operator runs `./docker.sh -k` before deploying this plan (new `ai_author` pair); `docker.sh` already refuses to start while a bound key file is missing.
 
+## Plan 2 handoff (2026-10-12)
+
+- Run `mmr ai-author prove-isolation` while the research pool is quiet: its `slot_wiped_between_sessions` check needs every research slot used and then found empty (2 × pool size sessions in a row, at most 3 ×), so a running research evaluation can make it hit `SANDBOX_BUSY` or miss a slot and fail closed (never pass). While the proof runs, the sandbox refuses new live sessions (`SANDBOX_BUSY`, `isolation probe running`). The proof also runs the probe checks `seccomp_denies_ptrace`, `child_runs_as_slot_uid` and `child_holds_only_its_pipe` (Plan 2 ruling 27).
+- Store files must stay regular 0644 files: a file the sandbox may not read is `SANDBOX_UNAVAILABLE` (Plan 2 ruling 34), a missing, non-regular or mismatched one `SANDBOX_DIGEST_MISMATCH` (Plan 2 ruling 9).
+
 ## Cross-plan additions
 
 Plans 4 and 5 use these exact names. Plan 2 must provide the two items marked **Plan 2**.

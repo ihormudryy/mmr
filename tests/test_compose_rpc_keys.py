@@ -28,7 +28,7 @@ def test_each_signing_service_mounts_its_own_public_key(compose, name, principal
 
 def test_every_long_lived_service_is_classified(compose):
     for name, svc in compose["services"].items():
-        if name in ("ib-gateway", "fullstack-tests", "keygen"):
+        if name in ("ib-gateway", "fullstack-tests", "keygen", "sandbox"):
             continue
         assert name in SERVICE_PRINCIPAL, name
 

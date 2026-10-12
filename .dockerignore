@@ -21,6 +21,9 @@ third_party
 .mypy_cache
 .pytest_cache
 __pycache__
+# Nested ones too: host-written (pytest-rewritten) bytecode must not reach the image.
+**/__pycache__
+**/*.pyc
 logs
 !data/*.csv
 # Local tooling and agent state: never part of the image

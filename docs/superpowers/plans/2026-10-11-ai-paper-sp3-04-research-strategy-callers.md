@@ -57,6 +57,15 @@ Task 13 checks these lines against the index.
 24. **Plan 4 ruling 24 (dropped by decision D8):** the equivalence test uses Plan 1's `tests/authored/fixtures/orb_authored.py`, which now has the catalogue's `MIN_BARS = 40` gate (Plan 1 ruling 10) and matches the catalogue ORB bar for bar on this plan's synthetic bars. Plan 4 has no ORB port of its own.
 25. **Plan 4 ruling 25 (owner ruling 2026-10-11, spec 14):** an authored evaluation uses the most recent `research_service.authored_evaluation_sessions` (default 302) sessions, with SP2c's folds and embargo and the holdout scaled in proportion (39 of 302); a catalogue evaluation keeps `period_sessions` (Task 12).
 
+## Plan 2 handoff (2026-10-12)
+
+What Plan 2 shipped that this plan's code and tests must follow:
+
+- A sandbox-side failure (fork or socketpair, the child's privilege drop, rlimits or setup, an internal error) is the new code `SANDBOX_UNAVAILABLE` (Plan 2 ruling 34); `SandboxClient` raises `SandboxUnavailable` for it, as for `SANDBOX_BUSY`. Only `SANDBOX_ERROR` and `SANDBOX_DIGEST_MISMATCH` are faults of the strategy (rulings 8, 9 here are unchanged).
+- An in-process harness that calls `Supervisor.handle` must give each session its own `conn_id` (one session per connection, Plan 2 ruling 7) and pass `wiper=lambda slot: True` (the real wiper forks a helper); Task 11's harness (`tests/authored/test_orb_equivalence.py`) does both.
+- A harness that serves sockets (`trader.sandbox.server.serve`) must pass `socket_gid=os.getgid()` and use a short socket directory (`tempfile.mkdtemp(prefix="sbx", dir="/tmp")`): macOS caps a Unix socket path at 104 bytes.
+- Plan 3 writes store files as regular 0644 files: the sandbox opens them with `O_NOFOLLOW` and refuses a symlink or a FIFO (`SANDBOX_DIGEST_MISMATCH`, Plan 2 ruling 9); a file it may not read is `SANDBOX_UNAVAILABLE` (an operations problem, Plan 2 ruling 34).
+
 ## Cross-plan requirements
 
 All six were settled at integration (2026-10-11); kept here so a reviewer can trace them.
@@ -3242,7 +3251,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Test: `tests/authored/test_orb_equivalence.py`
 
 **Interfaces:**
-- Consumes: Plan 1's ORB fixture `tests/authored/fixtures/orb_authored.py` (`OpeningRangeBreakout`, `MIN_BARS = 40`; decision D8) through Task 2 `orb_fixture_source`; Task 2 `FakeSandbox`; Task 3 `AuthoredProxyStrategy`, `RESEARCH_SESSION_CONID`; Task 9 `AuthoredLiveStrategy`; the catalogue `strategies/opening_range_breakout.py`; Plan 2 `Supervisor`, `LIVE_POOL_SIZE`, `RESEARCH_POOL_SIZE`, `InProcessSpawner`, `parse_request`, `SANDBOX_BUSY`, `SANDBOX_ERROR`.
+- Consumes: Plan 1's ORB fixture `tests/authored/fixtures/orb_authored.py` (`OpeningRangeBreakout`, `MIN_BARS = 40`; decision D8) through Task 2 `orb_fixture_source`; Task 2 `FakeSandbox`; Task 3 `AuthoredProxyStrategy`, `RESEARCH_SESSION_CONID`; Task 9 `AuthoredLiveStrategy`; the catalogue `strategies/opening_range_breakout.py`; Plan 2 `Supervisor`, `LIVE_POOL_SIZE`, `RESEARCH_POOL_SIZE`, `InProcessSpawner`, `parse_request`, `SANDBOX_BUSY`, `SANDBOX_UNAVAILABLE`, `SANDBOX_ERROR`.
 - Produces: nothing new (spec 10 *equivalence* and *lookahead by construction*).
 
 The port sends no `close_by_time` and no risk (ruling 15), so trades differ from the catalogue's; the claim is the signal (action and probability) on every bar. The third test runs the port in Plan 2's real child runtime (static check, import guard, reduced built-ins) through the supervisor with its in-process spawner (Plan 2 ruling 12).
@@ -3253,6 +3262,7 @@ The port sends no `close_by_time` and no risk (ruling 15), so trades differ from
 # tests/authored/test_orb_equivalence.py
 """SP3 spec 10 (equivalence): ORB ported to AuthoredStrategy gives the same signals bar for bar through the
 sandbox as the catalogue ORB, in a backtest (research proxy), live (strategy proxy) and in Plan 2's child runtime."""
+import itertools
 import logging
 
 import exchange_calendars as xcals
@@ -3320,22 +3330,27 @@ def research_signals(client, digest, frame):
     return [signal_key(proxy.on_bar(frame.iloc[:i + 1], state, i)) for i in range(len(frame))]
 
 
+# Plan 2 ruling 7: one session per connection. Each session gets its own connection id, as the server gives it.
+_connection_ids = itertools.count(1)
+
+
 class SupervisorSession:
     """Plan 2's supervisor called in this process; maps replies as Plan 2's SandboxClient does."""
 
-    def __init__(self, supervisor, session_id):
-        self._supervisor, self._id = supervisor, session_id
+    def __init__(self, supervisor, conn_id, session_id):
+        self._supervisor, self._conn_id, self._id = supervisor, conn_id, session_id
 
     def bar(self, conid, t, open, high, low, close, volume):
-        reply = _call(self._supervisor, {"type": "BAR", "session": self._id, "conid": conid, "t": t.isoformat(),
-                                         "open": open, "high": high, "low": low, "close": close, "volume": volume})
+        reply = _call(self._supervisor, self._conn_id,
+                      {"type": "BAR", "session": self._id, "conid": conid, "t": t.isoformat(),
+                       "open": open, "high": high, "low": low, "close": close, "volume": volume})
         if reply["type"] != "SIGNAL":
             _raise_for(reply)
         return None if reply["action"] is None else Decision(action=reply["action"],
                                                              probability=float(reply["probability"]))
 
     def close(self):
-        _call(self._supervisor, {"type": "CLOSE", "session": self._id})
+        _call(self._supervisor, self._conn_id, {"type": "CLOSE", "session": self._id})
 
 
 class SupervisorClient:
@@ -3343,19 +3358,22 @@ class SupervisorClient:
         self._supervisor = supervisor
 
     def open_session(self, digest, class_name, params, bar_size, conids):
-        reply = _call(self._supervisor, {"type": "OPEN", "digest": digest, "class": class_name,
-                                         "params": dict(params), "bar_size": bar_size, "conids": list(conids)})
+        conn_id = next(_connection_ids)
+        reply = _call(self._supervisor, conn_id, {"type": "OPEN", "digest": digest, "class": class_name,
+                                                  "params": dict(params), "bar_size": bar_size,
+                                                  "conids": list(conids)})
         if reply["type"] != "OPENED":
             _raise_for(reply)
-        return SupervisorSession(self._supervisor, reply["session"])
+        return SupervisorSession(self._supervisor, conn_id, reply["session"])
 
 
-def _call(supervisor, request):
-    return supervisor.handle("research", 1, protocol.parse_request({"v": 1, **request}))
+def _call(supervisor, conn_id, request):
+    return supervisor.handle("research", conn_id, protocol.parse_request({"v": 1, **request}))
 
 
 def _raise_for(reply):
-    if reply.get("code") == protocol.SANDBOX_BUSY:
+    # Availability, as the client maps it (Plan 2 ruling 34): BUSY and UNAVAILABLE are never the strategy's fault.
+    if reply.get("code") in (protocol.SANDBOX_BUSY, protocol.SANDBOX_UNAVAILABLE):
         raise SandboxUnavailable(reply.get("detail", ""))
     raise SandboxFault(reply.get("detail", ""), code=reply.get("code", protocol.SANDBOX_ERROR))
 
@@ -3367,7 +3385,8 @@ def plan_2_sandbox(store_dir, source):
     supervisor = Supervisor(spawners={"live": InProcessSpawner(), "research": InProcessSpawner()},
                             pool_sizes={"live": LIVE_POOL_SIZE, "research": RESEARCH_POOL_SIZE},
                             store_dir=str(store_dir),
-                            image_digest=IMAGE_DIGEST, posture={})
+                            image_digest=IMAGE_DIGEST, posture={},
+                            wiper=lambda slot: True)   # the real wiper forks a helper against /tmp/s2000X
     return SupervisorClient(supervisor), digest
 
 

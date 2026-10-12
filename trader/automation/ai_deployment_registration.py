@@ -131,8 +131,8 @@ class AiDeploymentRegistrar:
                 raise DeploymentRefused("FAMILY_COOLING_DOWN", "the strategy key is cooling down")
             self._require_room_in_tx(conn, stands, today=ny_date(now), excluding=prior)
             self._deployments.register_in_tx(conn, deployment, principal=principal, command_id=command_id)
-            if authored:                           # review r1 #5: a failed run recorded after the preflight wins
-                self._authored.require_proven_in_tx(conn, deployment)
+            if authored:                           # review r1 #5: a move or failed run since the preflight wins
+                self._authored.require_registrable_in_tx(conn, deployment, judgment_id, kind=judgment.kind)
             digest, created = self._versions.seal_in_tx(conn, version, request_digest=digest_of_request,
                                                         principal=principal, command_id=command_id)
             if authored and created and judgment.kind == INITIAL:

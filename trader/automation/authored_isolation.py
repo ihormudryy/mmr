@@ -42,9 +42,13 @@ def _proof(row: tuple) -> IsolationProof:
 
 
 class IsolationProofs:
-    def __init__(self, db: Any, *, now: Callable[[], dt.datetime]):
+    def __init__(self, db: Any, *, now: Callable[[], dt.datetime], journal: Any = None):
+        """``journal`` is the trader's DomainJournal over the same database. With it a proof is written under the
+        journal's write lock, as the registration seal is, so a failing run either commits before the seal (and
+        the seal sees it) or after it; never unseen beside it. Without it only the database's own lock is taken."""
         self._db = db
         self._now = now
+        self._journal = journal
 
     def record(self, request: RecordIsolationProofRequest, *, principal: str) -> dict:
         body = request.model_dump()
@@ -63,7 +67,9 @@ class IsolationProofs:
                           canonical_json_bytes(list(checks)).decode("utf-8"), proof.ran_at, proof.recorded_at,
                           principal])
             return {"status": "RECORDED", "proof": proof.to_json()}
-        return self._db.transaction(write)
+        if self._journal is None:
+            return self._db.transaction(write)
+        return self._journal.mutate_batch_work(self._journal.connect(), lambda conn, _append: write(conn))
 
     def latest_in_tx(self, conn: Any, image_digest: Optional[str]) -> Optional[IsolationProof]:
         """The newest proof of ``image_digest`` (by recording time), or the newest of all when None."""

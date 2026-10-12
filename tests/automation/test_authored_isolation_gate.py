@@ -3,6 +3,7 @@ Authority; rulings 10, 12, 16, 21)."""
 from __future__ import annotations
 
 import datetime as dt
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -67,6 +68,16 @@ def test_each_image_needs_its_own_run(tmp_path):                                
     assert proofs.passing_for(IMAGE) and not proofs.passing_for(OTHER_IMAGE) and not proofs.passing_for(None)
 
 
+@pytest.mark.parametrize("seconds", range(4))
+@pytest.mark.parametrize("order", [(True, False), (False, True)])
+def test_a_failing_run_recorded_at_the_same_moment_as_a_pass_wins(tmp_path, order, seconds):   # fix round 1
+    proofs = IsolationProofs(authored_journal(tmp_path), now=Clock(NOW))   # fixed: one recorded_at for both
+    ran_at = NOW - dt.timedelta(seconds=seconds)       # other proof ids, so no id order can decide the tie
+    for passed in order:
+        proofs.record(proof_request(passed=passed, ran_at=ran_at), principal="cli")
+    assert not proofs.passing_for(IMAGE)
+
+
 @pytest.mark.parametrize("change", [
     {"passed": True, "checks": [{"name": "a", "passed": False, "detail": ""}]},      # ruling 21
     {"checks": [{"name": "a", "passed": True, "detail": ""}, {"name": "a", "passed": True, "detail": ""}]},
@@ -96,7 +107,7 @@ class Stack:
         self.journal = DomainJournal(self.db)
         self.journal.migrate(migrator)
         clock = lambda: self.now                                                   # noqa: E731
-        self.proofs = IsolationProofs(self.db, now=clock)
+        self.proofs = IsolationProofs(self.db, now=clock, journal=self.journal)
         self.deployments = AiDeploymentStore(self.db, now=clock)
         self.versions = AiDeploymentVersionStore(self.journal, now=clock)
         self.judgments, self.cooldowns, self.bundles = SeededJudgments(), Cooldowns(), FakeBundles()
@@ -107,7 +118,7 @@ class Stack:
         clock = lambda: self.now                                                   # noqa: E731
         self.store = AuthoredStrategyStore(self.db, config=AuthoredStrategiesConfig(enabled=enabled),
                                            files=AuthoredFileStore(self.tmp_path / "store"), now=clock,
-                                           proofs=self.proofs)
+                                           proofs=self.proofs, journal=self.journal)
         self.activity = DeploymentActivity(versions=self.versions, deployments=self.deployments,
                                            judgments=self.judgments, cooldowns=self.cooldowns, max_active=3,
                                            now=clock, authored=self.store)
@@ -285,3 +296,81 @@ def test_an_authored_deployment_without_a_store_never_enters(tmp_path):
                               cooldowns=s.cooldowns, max_active=3, now=lambda: s.now)
     assert bare.entry_refusal(deployment_digest=base, version_digest=version,
                               source_digest=digest) == "AUTHORED_STRATEGIES_DISABLED"
+
+
+# -- fix round 1 ---------------------------------------------------------------------------------------------
+
+def test_the_evaluated_build_must_be_proven_even_when_the_latest_build_is(tmp_path):        # review r1 #5
+    s = Stack(tmp_path)
+    s.proofs.record(proof_request(IMAGE), principal="cli")
+    _first, first_record = s.awaiting(range_bars=15, judgment_id="jdg-00000001", image=OTHER_IMAGE)
+    s.now = NOW + dt.timedelta(minutes=5)
+    s.awaiting(range_bars=16, judgment_id="jdg-00000002", image=IMAGE)     # research now runs a proven build
+    assert s.store.running_image() == IMAGE
+    assert s.refused("jdg-00000001", first_record) == "AUTHORED_ISOLATION_UNPROVEN"
+    assert s.versions.sealed() == ()
+
+
+def test_images_seen_at_the_same_moment_must_all_be_proven(tmp_path):
+    s = Stack(tmp_path)
+    s.proofs.record(proof_request(IMAGE), principal="cli")
+    # Whichever record sorts first gets the proven build, so a tie broken by record digest would pick it.
+    first, second = sorted([(digest_of(source(15)), 15), (digest_of(source(16)), 16)])
+    _digest, record = s.awaiting(range_bars=first[1], judgment_id="jdg-00000001", image=IMAGE)
+    s.awaiting(range_bars=second[1], judgment_id="jdg-00000002", image=OTHER_IMAGE)   # same instant
+    assert s.refused("jdg-00000001", record) == "AUTHORED_ISOLATION_UNPROVEN"
+    s.proofs.record(proof_request(OTHER_IMAGE), principal="cli")
+    assert s.register("jdg-00000001", record)["created"] is True
+
+
+def test_a_proof_recorded_during_the_seal_waits_for_it(tmp_path):
+    """A proof and the seal take the journal's write lock, so a failing run is either seen inside the seal or
+    recorded after it; it never commits unseen while the seal transaction is open."""
+    s = Stack(tmp_path)
+    s.proofs.record(proof_request(IMAGE), principal="cli")
+    digest, record = s.awaiting()
+    s.now = NOW + dt.timedelta(minutes=1)
+    replies = []
+    failing = threading.Thread(target=lambda: replies.append(
+        s.proofs.record(proof_request(IMAGE, passed=False, ran_at=s.now), principal="cli")))
+    recheck = s.store.require_registrable_in_tx
+
+    def record_during_the_seal(*args, **kwargs):
+        failing.start()
+        failing.join(timeout=0.5)
+        assert failing.is_alive()                        # held by the journal's write lock, not committed
+        return recheck(*args, **kwargs)
+    s.store.require_registrable_in_tx = record_during_the_seal
+    assert s.register("jdg-00000001", record)["created"] is True     # sealed before the failing run
+    failing.join(timeout=10)
+    assert replies[0]["status"] == "RECORDED" and not s.proofs.passing_for(IMAGE)
+    assert s.store.get(digest).state == DEPLOYED
+
+
+def renewal(s: Stack, digest: str, version: str) -> dict:
+    record = s.deployment_record(digest, 15)
+    s.judgments.seed(deploy_facts(record, "jdg-00000002", kind="RENEWAL", renews=version))
+    return record
+
+
+def test_a_renewal_of_a_deployed_record_registers(tmp_path):
+    s = Stack(tmp_path)
+    digest, _base, version = registered(s)
+    outcome = s.register("jdg-00000002", renewal(s, digest, version))
+    assert (outcome["created"], outcome["kind"]) == (True, "RENEWAL")
+    assert s.store.get(digest).state == DEPLOYED
+
+
+def test_a_retirement_between_the_preflight_and_the_seal_stops_a_renewal(tmp_path):         # fix round 1
+    s = Stack(tmp_path)
+    digest, _base, version = registered(s)
+    record = renewal(s, digest, version)
+    preflight = s.store.registration_refusal
+
+    def preflight_then_retire(*args, **kwargs):
+        preflight(*args, **kwargs)                       # the record was DEPLOYED
+        s.store.retire(RetireAuthoredStrategyRequest.model_validate(
+            {"digest": digest, "code": "SANDBOX_ERROR", "detail": "child crashed"}))
+    s.store.registration_refusal = preflight_then_retire
+    assert s.refused("jdg-00000002", record) == "AUTHORED_STATE_CONFLICT"
+    assert [sealed.digest for sealed in s.versions.sealed()] == [version]

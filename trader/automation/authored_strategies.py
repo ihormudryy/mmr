@@ -392,10 +392,13 @@ def _point_problem(tunables: Mapping[str, Mapping[str, float]], name: str, value
     return None
 
 
-def _running_image_in_tx(conn: Any) -> Optional[str]:
-    row = conn.execute("SELECT sandbox_image_digest FROM authored_strategies WHERE sandbox_image_seen_at "
-                       "IS NOT NULL ORDER BY sandbox_image_seen_at DESC, digest LIMIT 1").fetchone()
-    return None if row is None else row[0]
+def _running_images_in_tx(conn: Any) -> tuple[str, ...]:
+    """The build in research's latest STARTED. Builds seen at the same instant are all the latest, so a tie can
+    only add a build that must be proven, never hide one."""
+    rows = conn.execute("SELECT DISTINCT sandbox_image_digest FROM authored_strategies WHERE sandbox_image_seen_at "
+                        "= (SELECT MAX(sandbox_image_seen_at) FROM authored_strategies) "
+                        "ORDER BY sandbox_image_digest").fetchall()
+    return tuple(row[0] for row in rows)
 
 
 def _authored_digest_of_version_in_tx(conn: Any, version_digest: str) -> Optional[str]:
@@ -461,8 +464,10 @@ class AuthoredStrategyStore:
         return self._journal.mutate_batch_work(self._journal.connect(), lambda conn, _append: tx(conn))
 
     def running_image(self) -> Optional[str]:
-        """Ruling 12: the trader cannot reach the sandbox; the image is the one in research's latest STARTED."""
-        return self._db.transaction(_running_image_in_tx)
+        """Ruling 12: the trader cannot reach the sandbox; the image is the one in research's latest STARTED.
+        Of builds seen at the same instant this names the first; the registration gate checks them all."""
+        images = self._db.transaction(_running_images_in_tx)
+        return images[0] if images else None
 
     def require_proven_in_tx(self, conn: Any, deployment: AiDeployment) -> None:
         """Ruling 12 (review r1 #5): the build that evaluated this record (its own STARTED) and the build research
@@ -470,7 +475,8 @@ class AuthoredStrategyStore:
         failed run recorded after the preflight stops the seal. The binding check of the build that will run the
         code live is the strategy service's, at every new live session (Plan 4 ruling 19)."""
         record = record_in_tx(conn, authored_digest_of_path(deployment.strategy_path))
-        builds = (None if record is None else record.sandbox_image_digest, _running_image_in_tx(conn))
+        evaluated = None if record is None else record.sandbox_image_digest
+        builds = (evaluated, *(_running_images_in_tx(conn) or (None,)))
         unproven = [build or "(none reported)" for build in dict.fromkeys(builds)
                     if self._proofs is None or not self._proofs.passing_for_in_tx(conn, build)]
         if unproven:
@@ -518,6 +524,20 @@ class AuthoredStrategyStore:
                                     f"the record is {record.state.value}, verdict {record.verdict} of "
                                     f"{record.judgment_id}; this is a {kind} registration of {judgment_id}")
         self._db.transaction(lambda conn: self.require_proven_in_tx(conn, deployment))
+
+    def require_registrable_in_tx(self, conn: Any, deployment: AiDeployment, judgment_id: str, *,
+                                  kind: str) -> None:
+        """Inside the seal transaction, the preflight again: the record still awaits this registration (a
+        retirement since the preflight refuses a renewal too) and both builds are still proven."""
+        if not self._config.enabled:
+            raise DeploymentRefused(AUTHORED_STRATEGIES_DISABLED, "ai_paper.authored_strategies.enabled is false")
+        record = record_in_tx(conn, authored_digest_of_path(deployment.strategy_path))
+        if record is None or not _may_register(record, judgment_id, deployment.class_name, kind):
+            found = "missing" if record is None else record.state.value
+            raise DeploymentRefused(AUTHORED_STATE_CONFLICT,
+                                    f"the authored record is {found} since the preflight; this is a {kind} "
+                                    f"registration of {judgment_id}")
+        self.require_proven_in_tx(conn, deployment)
 
     def mark_deployed_in_tx(self, conn: Any, deployment: AiDeployment, judgment_id: str, version_digest: str,
                             now: dt.datetime) -> None:
@@ -740,8 +760,8 @@ class AuthoredStrategyStore:
         raced = record_in_tx(conn, record.digest)
         if raced is not None:                     # the same file, submitted twice at once
             return "EXISTING", raced
-        # Count and insert are safe only because every write to this journal path holds the single
-        # DuckDBConnection instance's lock; DuckDB itself would not serialize two such transactions.
+        # Every insert holds the DuckDBConnection lock, so two submits never count together. A move out of a
+        # counted state (retire, refresh, report) may commit beside this count; it can only make it too high.
         counted = counted_in_tx(conn)
         if counted >= self._config.max_active:
             raise AuthoredRefused(AUTHORED_CAP_FULL, self._cap_detail(counted))

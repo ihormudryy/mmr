@@ -511,8 +511,9 @@ def test_a_stop_and_start_gives_a_fresh_tmpfs_a_new_boot_and_a_clean_close(sandb
     sandbox.reload()
     logs = sandbox.logs(since=since).decode("utf-8", errors="replace")
     assert "sandbox stopped" in logs, logs[-2000:]                      # Server.close ran with a real child open
-    code, out = _exec(sandbox, ["stat", f"/tmp/s{uid}/left-before-restart"])
-    assert code != 0, out                                               # the tmpfs is fresh
+    # As the slot uid: root here has no DAC capability, so its stat would fail on the 0700 dir either way.
+    code, out = _exec(sandbox, ["ls", "-A", f"/tmp/s{uid}"], user=f"{uid}:{SBXCHILD_GID}")
+    assert code == 0 and out.strip() == "", out                         # the tmpfs is fresh
     for slot in SLOT_UIDS:
         code, out = _exec(sandbox, ["stat", "-c", "%u:%g %a", f"/tmp/s{slot}"])
         assert code == 0 and out.strip() == f"{slot}:{SBXCHILD_GID} 700", out

@@ -11,11 +11,11 @@ import re
 from typing import Mapping
 
 KNOWN_PRINCIPALS: frozenset[str] = frozenset({
-    "trader", "strategy", "cli", "dashboard", "ai_supervisor", "ai_research", "research",
+    "trader", "strategy", "cli", "dashboard", "ai_supervisor", "ai_research", "research", "ai_author",
 })
 SERVER_PRINCIPALS: frozenset[str] = frozenset({"trader", "strategy", "research"})
 # Principals the SDK may sign as (``MMR_RPC_PRINCIPAL``).
-CLIENT_PRINCIPALS: frozenset[str] = frozenset({"cli", "ai_supervisor", "ai_research"})
+CLIENT_PRINCIPALS: frozenset[str] = frozenset({"cli", "ai_supervisor", "ai_research", "ai_author"})
 # Reserved names: no key, no allow-list entry. telegram_bridge arrives in SP2;
 # scheduler has no trading RPC rights (owner answer 3).
 RESERVED_PRINCIPALS: frozenset[str] = frozenset({"telegram_bridge", "scheduler"})
@@ -23,7 +23,8 @@ RESERVED_PRINCIPALS: frozenset[str] = frozenset({"telegram_bridge", "scheduler"}
 CONTROLLER_PRINCIPAL = "ai_supervisor"
 
 SERVER_ACCEPTS: Mapping[str, frozenset[str]] = {
-    "trader": frozenset({"cli", "dashboard", "strategy", "ai_supervisor", "ai_research", "research"}),
+    "trader": frozenset({"cli", "dashboard", "strategy", "ai_supervisor", "ai_research", "research",
+                         "ai_author"}),
     "strategy": frozenset({"cli", "dashboard", "trader"}),
     # SP2c spec 5.1: like strategy, research is a server that also calls the trader.
     "research": frozenset({"ai_research", "cli"}),
@@ -37,6 +38,8 @@ CALLS: Mapping[str, frozenset[str]] = {
     "ai_supervisor": frozenset({"trader"}),
     "ai_research": frozenset({"trader", "research"}),
     "research": frozenset({"trader"}),
+    # SP3 spec 5: the author writes files through the trader only; it never reaches research or the sandbox.
+    "ai_author": frozenset({"trader"}),
 }
 
 _PRINCIPAL_NAME = re.compile(r"[a-z][a-z_]{1,31}")
@@ -142,6 +145,14 @@ TRADER_ACL: Mapping[tuple[str, str], frozenset[str]] = {
     ("query", "get_backtest_judgment"): frozenset({"research", "ai_research", "cli", "dashboard"}),
     # SP2c Plan 3 (spec 7): only the research service records shadow rows.
     ("command", "record_shadow_result"): frozenset({"research"}),
+    # SP3 Plan 3 (spec 5, 7.3, 7.9): authored strategies. Explicit sets per method; each handler re-checks.
+    ("command", "submit_authored_strategy"): frozenset({"ai_author"}),
+    ("query", "get_authored_strategies"): frozenset({"ai_author"}),
+    ("query", "list_authored_strategies"): HUMAN,                       # Plan 3 ruling 14
+    ("command", "report_authored_evaluation"): frozenset({"research"}),
+    ("command", "retire_authored_strategy"): frozenset({"strategy"}),
+    ("command", "record_isolation_proof"): frozenset({"cli"}),
+    ("query", "get_isolation_proof"): frozenset({"cli", "strategy"}),  # Plan 3 ruling 13
     # SP1 experiments (Plan 4 K14): explicit sets per method. ai_supervisor may pause (risk-reducing)
     # and read; only operators start, resume and stop.
     ("command", "start_experiment"): frozenset({"cli", "dashboard"}),
@@ -194,9 +205,9 @@ SERVICE_PRINCIPAL: Mapping[str, str | None] = {
     "scheduler": None, "data": None, "ai": "ai_supervisor", "research": "research",
 }
 
-# A service that signs as more than one principal. SP2 spec 4: the ai service holds the
-# ai_supervisor and ai_research keys (accepted limit: two keys in one process are not isolation).
-SERVICE_EXTRA_PRINCIPALS: Mapping[str, tuple[str, ...]] = {"ai": ("ai_research",)}
+# A service that signs as more than one principal. SP2 spec 4 and SP3 spec 5: the ai service holds the
+# ai_supervisor, ai_research and ai_author keys (accepted limit: keys in one process are not isolation).
+SERVICE_EXTRA_PRINCIPALS: Mapping[str, tuple[str, ...]] = {"ai": ("ai_research", "ai_author")}
 
 
 def service_principals(service: str) -> tuple[str, ...]:

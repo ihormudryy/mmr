@@ -43,8 +43,9 @@ def test_backtest_judge_rights_are_exact():
 def test_research_has_no_trading_policy_or_decision_right():                       # review focus 5
     rights = {key for key, allowed in TRADER_ACL.items() if "research" in allowed}
     expected = {key for key, allowed in BACKTEST_JUDGE_RIGHTS.items() if "research" in allowed}
-    assert rights == expected | {("command", "record_shadow_result")}
+    assert rights == expected | {("command", "record_shadow_result"), ("command", "report_authored_evaluation")}
     assert TRADER_ACL[("command", "record_shadow_result")] == {"research"}
+    assert TRADER_ACL[("command", "report_authored_evaluation")] == {"research"}
 
 
 def test_service_identity_and_key_files():

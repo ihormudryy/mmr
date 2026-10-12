@@ -37,10 +37,10 @@ def test_ai_reaches_the_research_server_by_its_compose_name(ai):
     assert "research" in load_compose()["services"]
 
 
-def test_ai_sees_its_two_key_pairs_and_the_trader_public_key_only(ai):
+def test_ai_sees_its_three_key_pairs_and_two_public_keys_only(ai):
     assert visible_rpc_files(ai) == service_rpc_files("ai") == {
-        "ai_supervisor.key", "ai_supervisor.pub", "ai_research.key", "ai_research.pub", "trader.pub",
-        "research.pub"}
+        "ai_supervisor.key", "ai_supervisor.pub", "ai_research.key", "ai_research.pub",
+        "ai_author.key", "ai_author.pub", "trader.pub", "research.pub"}
 
 
 def visible_config_files(service) -> set[str]:

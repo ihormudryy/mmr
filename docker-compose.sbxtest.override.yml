@@ -2,7 +2,8 @@
 # host. Applied ONLY by scripts/run_sandbox_fullstack.sh (never auto-loaded), after docker-compose.test.override.yml.
 # The runner renders and starts only `sandbox` and `fullstack-tests`, so ib-gateway (and trader, strategy, data,
 # dashboard, scheduler) never start. Both rendered services use a test-only image tag; fullstack-tests runs the
-# sandbox test and depends only on a healthy `sandbox`; no host port is published; nothing reads .env.
+# sandbox test and depends only on a healthy `sandbox` (the runner starts it with `up -d --wait` and then
+# runs the tests with `run --rm --no-deps`); no host port is published; nothing reads .env.
 # scripts/check_sbxtest_config.py refuses the run if the rendered config names another service, publishes a port,
 # carries a credential variable with a value, binds a path under the operator's ~/.config/mmr or
 # ~/.local/share/mmr, reads an env file, or still carries the mmr:latest tag.
@@ -19,7 +20,7 @@ services:
     environment: !override
       MMR_FAKE_BROKER: "1"
       TZ: UTC
-    command: ["python", "-m", "pytest", "tests/fullstack/test_sandbox_service.py", "-q", "--timeout=600"]
+    command: ["python", "-m", "pytest", "tests/fullstack/test_sandbox_service.py", "-vv", "-rA", "--timeout=600"]
     # The checks write authored files to the store and reach both sockets through the sandbox's own named volumes.
     # Only here, not in docker-compose.yml: the trader-facing fullstack run (project `mmr`) never mounts them.
     volumes:

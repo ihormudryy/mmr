@@ -93,21 +93,25 @@ def test_the_override_pins_the_two_services_to_test_tags_and_strips_live_ports()
     services = load_override(SBXTEST_OVERRIDE.name)["services"]
     assert services["sandbox"]["image"] == "${MMR_SBXTEST_IMAGE}"
     assert services["fullstack-tests"]["image"] == "${MMR_SBXTEST_IMAGE}-test"
-    assert services["fullstack-tests"]["command"][-3:] == ["tests/fullstack/test_sandbox_service.py", "-q",
-                                                         "--timeout=600"]
+    command = services["fullstack-tests"]["command"]
+    assert "tests/fullstack/test_sandbox_service.py" in command and "--timeout=600" in command
+    assert "-rA" in command                                       # every outcome is listed, failures included
     assert "TRADING_MODE" not in services["fullstack-tests"]["environment"]
     for name in ("ib-gateway", "trader", "dashboard"):
         assert services[name]["ports"] == []
 
 
-def run_with_fake_docker(tmp_path, **env):
+def run_with_fake_docker(tmp_path, *, run_status: int = 0, **env):
     bin_dir, log = tmp_path / "bin", tmp_path / "docker.log"
     bin_dir.mkdir()
     rendered = json.dumps(SAFE)
     # `docker` logs its whole environment and argv, so a test can prove env -i stripped the operator's variables.
+    # `run` (the pytest container) exits with ``run_status``; `logs` prints a marker.
     (bin_dir / "docker").write_text(
         f'#!/bin/bash\n{{ echo "ENV:"; env; echo "ARGV: $*"; }} >> {log}\n'
-        f'if [[ " $* " == *" config "* ]]; then echo \'{rendered}\'; fi\n')
+        f'if [[ " $* " == *" config "* ]]; then echo \'{rendered}\'; fi\n'
+        f'if [[ " $* " == *" logs "* ]]; then echo SANDBOX-LOG-LINES; fi\n'
+        f'if [[ " $* " == *" run "* ]]; then exit {run_status}; fi\n')
     (bin_dir / "docker").chmod(0o755)
     (bin_dir / "uv").write_text(f'#!/bin/bash\n{{ echo "ENV:"; env; echo "ARGV: uv HOME=$HOME $*"; }} >> {log}\n')
     (bin_dir / "uv").chmod(0o755)
@@ -129,11 +133,30 @@ def test_the_runner_uses_a_throwaway_home_the_test_project_and_only_the_two_serv
     assert all(not call.startswith(f"uv HOME={HOME} ") for call in argv)         # never the operator's home
     keys = next(call for call in argv if "keys init" in call)                    # test-only keys
     assert "--keys-dir" in keys and f"{HOME}/" not in keys
+    build = next(call for call in compose if " build " in f" {call} ")
+    assert build.rstrip().endswith("build sandbox fullstack-tests")              # only the two services
     up = next(call for call in compose if " up " in f" {call} ")
-    assert up.rstrip().endswith("sandbox fullstack-tests")                       # only the two services
-    assert "--exit-code-from fullstack-tests" in up                              # pytest's status is the run's
-    assert "ib-gateway" not in " ".join(compose) and "trader" not in up
+    # Detached: no compose watcher, so the restart test's sandbox exit cannot abort the run (phase 2, run 1).
+    assert " -d " in f" {up} " and "--wait" in up and up.rstrip().endswith(" sandbox")
+    run = next(call for call in compose if " run " in f" {call} ")
+    assert "--rm" in run and "--no-deps" in run and run.rstrip().endswith(" fullstack-tests")
+    assert "--service-ports" not in run                                          # still no published port
+    assert compose.index(build) < compose.index(up) < compose.index(run)
+    assert "ib-gateway" not in " ".join(compose) and "trader" not in up + run
     assert any(" down -v " in f" {call} " for call in compose)
+
+
+def test_a_failed_test_run_returns_its_status_and_shows_the_sandbox_logs(tmp_path):
+    result, lines = run_with_fake_docker(tmp_path, run_status=1)
+    assert result.returncode == 1
+    assert "SANDBOX-LOG-LINES" in result.stdout + result.stderr
+    assert any(" down -v " in f" {call} " for call in _argv(lines))              # cleanup still runs
+
+
+def test_a_passing_test_run_returns_0_without_the_sandbox_logs(tmp_path):
+    result, _ = run_with_fake_docker(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "SANDBOX-LOG-LINES" not in result.stdout + result.stderr
 
 
 def test_the_throwaway_home_is_removed_when_the_run_ends(tmp_path):

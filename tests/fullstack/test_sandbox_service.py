@@ -110,9 +110,28 @@ def _sandbox_container(client):
     return found[0]
 
 
+_EXEC_BEGIN = "__sbxtest_exec_begin__"
+_EXEC_DONE = "__sbxtest_exec_done__"
+_EXEC_ATTEMPTS = 10
+
+
 def _exec(container, command: list[str], *, user: str = "") -> tuple[int, str]:
-    result = container.exec_run(command, user=user, demux=False)
-    return result.exit_code, (result.output or b"").decode("utf-8", errors="replace")
+    """Run an idempotent read in the container: (exit code, output).
+
+    On Docker Desktop, docker exec can drop what a short command writes before the output stream is attached
+    (phase 2: `cat` and `stat` answered exit 0 with no output). So the command runs between two markers: a reply
+    that lacks either one may have lost output, and the command is run again."""
+    script = f'printf "{_EXEC_BEGIN}\\n"; "$@"; status=$?; printf "\\n{_EXEC_DONE}%d\\n" "$status"'
+    for attempt in range(_EXEC_ATTEMPTS):
+        result = container.exec_run(["sh", "-c", script, "sh", *command], user=user, demux=False)
+        text = (result.output or b"").decode("utf-8", errors="replace")
+        _, begin, rest = text.partition(_EXEC_BEGIN + "\n")
+        output, done, status = rest.rpartition("\n" + _EXEC_DONE)
+        if begin and done:
+            return int(status.strip()), output
+        time.sleep(0.1 * (attempt + 1))
+    pytest.fail(f"docker exec lost the output of {command[:2]} {_EXEC_ATTEMPTS} times; "
+                f"last exit {result.exit_code}, {len(text)} chars: {text[:300]!r} ... {text[-300:]!r}")
 
 
 def _python(container, source: str, *, user: str = "") -> tuple[int, str]:
@@ -502,7 +521,8 @@ def test_a_stop_and_start_gives_a_fresh_tmpfs_a_new_boot_and_a_clean_close(sandb
     since = int(time.time()) - 1
     # SIGTERM to docker-init from inside, as tests/fullstack/test_process_supervision.py does: not a "manual
     # stop", so restart: unless-stopped brings the same container back with a fresh tmpfs.
-    _python(sandbox, "import os, signal; os.kill(1, signal.SIGTERM)")   # the image has no procps
+    # Not _exec: it may run a command again. The image has no procps, so python sends the signal.
+    sandbox.exec_run(["python", "-c", "import os, signal; os.kill(1, signal.SIGTERM)"])
     after = _wait_for_new_boot(boot.boot_id)
     assert after.image_digest == boot.image_digest
     with pytest.raises(SandboxUnavailable):

@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import json
+import logging
 import threading
 from dataclasses import dataclass, replace
 from enum import StrEnum
@@ -19,15 +20,25 @@ from types import MappingProxyType
 from typing import Any, Callable, Iterator, Mapping, Optional
 
 from trader.authored.keys import authored_key, source_digest
+from trader.automation.ai_deployment_activity import EXPIRED as VERSION_EXPIRED
+from trader.automation.ai_deployment_activity import JUDGMENT_ENDED, SUPERSEDED, WITHDRAWN
+from trader.automation.ai_deployment_versions import WITHDRAWAL_ENTRY_IN_FLIGHT
+from trader.automation.ai_deployments import DeploymentRefused
 from trader.automation.authored_config import AuthoredStrategiesConfig
 from trader.automation.authored_files import AuthoredFileStore
 from trader.automation.authored_refusals import (
-    AUTHORED_CAP_FULL, AUTHORED_STRATEGIES_DISABLED, AuthoredRefused, AuthoredStateConflict,
+    AUTHORED_CAP_FULL, AUTHORED_STRATEGIES_DISABLED, AUTHORED_STRATEGY_UNKNOWN, AuthoredRefused,
+    AuthoredStateConflict,
 )
 from trader.automation.authored_submission import check_submission
-from trader.automation.authored_wire import SubmitAuthoredStrategyRequest
-from trader.automation.evaluation_claims import utc
+from trader.automation.authored_wire import (
+    ReportAuthoredEvaluationRequest, RetireAuthoredStrategyRequest, SubmitAuthoredStrategyRequest,
+)
+from trader.automation.backtest_judgments import JudgmentRefused, nth_session_after
+from trader.automation.evaluation_claims import ny_day, utc
 from trader.research.canonical import canonical_json_bytes
+
+logger = logging.getLogger(__name__)
 
 FILE_SCHEMA = "mmr.authored-strategy.v1"
 
@@ -230,6 +241,78 @@ def _reply(status: str, record: AuthoredRecord, **extra: Any) -> dict:
             **extra}
 
 
+# Ruling 18 and decision D4: a retired record's version is withdrawn through the SP2c path, as the strategy.
+AUTHORED_RETIRE_REASON = "AUTHORED_SANDBOX_ERROR"
+
+
+def authored_retire_command_id(version_digest: str) -> str:
+    """One withdrawal per version: a resend reuses the id, and SP2c answers an already withdrawn version False."""
+    return f"authored-retire:{version_digest}"
+
+
+def withdraw_with(versions: Any) -> Callable[[str], bool]:
+    """The ``withdraw`` port of AuthoredStrategyStore over SP2c's AiDeploymentVersionStore."""
+    def withdraw(version_digest: str) -> bool:
+        return versions.withdraw(version_digest, reason=AUTHORED_RETIRE_REASON, principal="strategy",
+                                 command_id=authored_retire_command_id(version_digest))
+    return withdraw
+
+
+# Ruling 11: where a DEPLOYED record goes when its version line ends.
+_LINE_ENDINGS: Mapping[str, tuple[AuthoredState, str]] = MappingProxyType({
+    WITHDRAWN: (RETIRED, OWNER_RETIRED),
+    VERSION_EXPIRED: (EXPIRED, DEPLOY_EXPIRED),
+    JUDGMENT_ENDED: (EXPIRED, RENEWAL_ENDED),
+})
+
+
+def _already_reported(record: AuthoredRecord, request: ReportAuthoredEvaluationRequest) -> bool:
+    """Ruling 17: the same event for the same request (and image) was applied before."""
+    return any(entry.get("event") == request.event and entry.get("request_id") == request.request_id
+               and entry.get("image") == request.sandbox_image_digest for entry in record.history)
+
+
+def _apply_report(conn: Any, record: AuthoredRecord, request: ReportAuthoredEvaluationRequest,
+                  now: dt.datetime) -> AuthoredRecord:
+    detail = request.detail or None
+    if request.event == "STARTED":
+        return note_in_tx(conn, record, event="STARTED", now=now, request_id=request.request_id, detail=detail,
+                          image=request.sandbox_image_digest, sandbox_image_digest=request.sandbox_image_digest,
+                          sandbox_image_seen_at=utc(now))
+    if request.event == "SANDBOX_ERROR":
+        return move_in_tx(conn, record, REJECTED, event="SANDBOX_ERROR", reason=SANDBOX_ERROR, now=now,
+                          request_id=request.request_id, detail=detail, evaluation_request_id=None)
+    attempts = record.attempts + 1
+    target, reason = (FAILED, SANDBOX_UNAVAILABLE) if attempts >= UNAVAILABLE_ATTEMPTS else (STORED, None)
+    return move_in_tx(conn, record, target, event="SANDBOX_UNAVAILABLE", reason=reason, now=now,
+                      request_id=request.request_id, detail=detail, attempts=attempts, evaluation_request_id=None)
+
+
+def _existing_in_tx(conn: Any, digest: str) -> AuthoredRecord:
+    record = record_in_tx(conn, digest)
+    if record is None:
+        raise AuthoredRefused(AUTHORED_STRATEGY_UNKNOWN, f"no authored strategy has digest {digest}")
+    return record
+
+
+class DeploymentLines:
+    """Where an authored deployment's version line ends: its last version after renewals (ruling 11)."""
+
+    def __init__(self, *, activity: Any, versions: Any):
+        self._activity = activity
+        self._versions = versions
+
+    def end_status(self, version_digest: str) -> Optional[str]:
+        statuses = self._activity.statuses()
+        renewed_by = {sealed.version.prior_version: sealed.digest for sealed in self._versions.sealed()
+                      if sealed.version.prior_version is not None}
+        current, seen = version_digest, set()
+        while statuses.get(current) == SUPERSEDED and current in renewed_by and current not in seen:
+            seen.add(current)
+            current = renewed_by[current]
+        return statuses.get(current)
+
+
 class _DigestLocks:
     """One lock per digest while someone holds or waits for it; the entry is dropped after the last one."""
 
@@ -297,6 +380,7 @@ class AuthoredStrategyStore:
             return _reply("EXISTING", existing)
         try:
             self._require_enabled()
+            self.refresh()
             self._require_room()
             checked = check_submission(request, self._config)
             record = new_record(digest=digest, class_name=checked.class_name, bar_size=checked.bar_size,
@@ -312,11 +396,99 @@ class AuthoredStrategyStore:
 
     def overview(self) -> dict:
         """``get_authored_strategies`` and ``list_authored_strategies``: every record, the cap and the switch."""
+        self.refresh()
         records, judged = self._db.transaction(lambda conn: (records_in_tx(conn), judged_count_in_tx(conn)))
         counted = sum(1 for record in records if record.state in COUNTED_STATES)
         return {"enabled": self._config.enabled, "max_active": self._config.max_active, "counted": counted,
                 "room": max(0, self._config.max_active - counted), "judged_count": judged,
                 "bar_sizes": list(self._config.bar_sizes), "records": [record.to_json() for record in records]}
+
+    def report(self, request: ReportAuthoredEvaluationRequest) -> dict:
+        """Research's facts about one evaluation (spec 7.6, 8; ruling 17). The switch is not checked: an
+        evaluation already claimed must finish (ruling 8)."""
+        now = utc(self._now())
+
+        def write(conn: Any) -> tuple[str, AuthoredRecord, int]:
+            record = _existing_in_tx(conn, request.digest)
+            if _already_reported(record, request):
+                return "UNCHANGED", record, judged_count_in_tx(conn)
+            if record.state != EVALUATING or record.evaluation_request_id != request.request_id:
+                raise AuthoredStateConflict(f"the record is {record.state.value} on {record.evaluation_request_id}; "
+                                            f"the report names {request.request_id}")
+            return "UPDATED", _apply_report(conn, record, request, now), judged_count_in_tx(conn)
+        try:
+            status, record, judged = self._db.transaction(write)
+        except AuthoredRefused as refused:
+            return refused.reply(judged_count=None)
+        return _reply(status, record, judged_count=judged)
+
+    def retire(self, request: RetireAuthoredStrategyRequest) -> dict:
+        """The strategy service retires a DEPLOYED record after a live fault (spec 7.6, 8; ruling 18).
+
+        The record moves first, so entries are refused at once (ruling 16) and the reason is SANDBOX_ERROR even
+        if the trader dies before the next step. Then the version is withdrawn through the SP2c path (D4), so
+        the line ends WITHDRAWN and a restart never lists it. A withdrawal refused while an entry is being sent
+        is a retryable refusal; the strategy service resends until UPDATED or UNCHANGED (Plan 4 ruling 18)."""
+        now = utc(self._now())
+
+        def write(conn: Any) -> tuple[str, AuthoredRecord]:
+            record = _existing_in_tx(conn, request.digest)
+            if record.state == RETIRED:
+                return "UNCHANGED", record
+            if record.state != DEPLOYED:
+                raise AuthoredStateConflict(
+                    f"only a DEPLOYED authored strategy retires; this one is {record.state.value}")
+            return "UPDATED", move_in_tx(conn, record, RETIRED, event="RETIRED_BY_STRATEGY", reason=SANDBOX_ERROR,
+                                         now=now, detail=f"{request.code}: {request.detail}")
+        try:
+            status, record = self._db.transaction(write)
+        except AuthoredRefused as refused:
+            return refused.reply()
+        if record.deployment_version is not None and self._withdraw is not None:
+            try:
+                self._withdraw(record.deployment_version)
+            except DeploymentRefused as refused:
+                logger.error("authored strategy %s is RETIRED; withdrawing %s refused: %s", record.digest,
+                             record.deployment_version, refused)
+                not_withdrawn = AuthoredRefused(
+                    refused.code, f"the record is RETIRED; its version is not withdrawn yet: {refused.message}",
+                    retryable=refused.code == WITHDRAWAL_ENTRY_IN_FLIGHT)
+                return {**not_withdrawn.reply(), "record": record.to_json()}
+        return _reply(status, record)
+
+    def refresh(self) -> None:
+        """Ruling 11: a SHADOW or DEPLOYED record leaves the count when its window ends. Other stores are read
+        first, outside the transaction; each record moves only if it did not move meanwhile."""
+        now = utc(self._now())
+        records = self._db.transaction(records_in_tx)
+        endings = [(record, ending) for record in records if (ending := self._ending(record, now)) is not None]
+        if not endings:
+            return
+
+        def write(conn: Any) -> None:
+            for record, (target, reason) in endings:
+                current = record_in_tx(conn, record.digest)
+                if current is not None and current.state == record.state \
+                        and current.state_changed_at == record.state_changed_at:
+                    move_in_tx(conn, current, target, event="WINDOW_ENDED", reason=reason, now=now)
+        self._db.transaction(write)
+
+    def _ending(self, record: AuthoredRecord, now: dt.datetime) -> Optional[tuple[AuthoredState, str]]:
+        if record.state == SHADOW:
+            return self._shadow_ending(record, now)
+        if record.state == DEPLOYED and record.deployment_version is not None and self._lines is not None:
+            return _LINE_ENDINGS.get(self._lines().end_status(record.deployment_version))
+        return None
+
+    def _shadow_ending(self, record: AuthoredRecord, now: dt.datetime) -> Optional[tuple[AuthoredState, str]]:
+        if self._calendar is None:
+            return None
+        try:
+            last = nth_session_after(self._calendar, ny_day(record.state_changed_at), self._shadow_sessions)
+        except JudgmentRefused as refused:          # the calendar cannot serve: stay counted, the safe side
+            logger.error("authored strategy %s stays SHADOW: %s", record.digest, refused.detail)
+            return None
+        return (EXPIRED, SHADOW_EXPIRED) if ny_day(now) > last else None
 
     def _require_enabled(self) -> None:
         if not self._config.enabled:

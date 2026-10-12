@@ -11,8 +11,10 @@ from tests.automation.backtest_judge_fixtures import NOW, Clock
 from trader.automation.authored_config import AuthoredStrategiesConfig
 from trader.automation.authored_files import AuthoredFileStore
 from trader.automation.authored_schema import apply_authored_migrations
-from trader.automation.authored_strategies import AuthoredStrategyStore
-from trader.automation.authored_wire import SubmitAuthoredStrategyRequest
+from trader.automation.authored_strategies import (
+    DEPLOYED, EVALUATING, SHADOW, AuthoredRecord, AuthoredState, AuthoredStrategyStore, move_in_tx, record_in_tx,
+)
+from trader.automation.authored_wire import ReportAuthoredEvaluationRequest, SubmitAuthoredStrategyRequest
 from trader.automation.calendar_policy import XNYSCalendarPolicy
 from trader.automation.backtest_judge_schema import apply_backtest_judge_migrations
 from trader.data.duckdb_store import DuckDBConnection
@@ -120,3 +122,35 @@ def stored(world: AuthoredWorld, range_bars: int = 15) -> str:
 def stored_files(world: AuthoredWorld) -> list[Path]:
     root = world.tmp_path / "store"
     return sorted(root.glob("*.py")) if root.exists() else []
+
+
+VERSION = "sha256:" + "7" * 64
+
+
+def evaluating(world: AuthoredWorld, digest: str, request_id_: str) -> AuthoredRecord:
+    """What an accepted SP2c claim does (Task 7): STORED -> EVALUATING on ``request_id_``."""
+    return world.db.transaction(lambda conn: move_in_tx(
+        conn, record_in_tx(conn, digest), EVALUATING, event="CLAIMED", reason=None, now=world.clock(),
+        request_id=request_id_, evaluation_request_id=request_id_))
+
+
+def moved(world: AuthoredWorld, digest: str, target: AuthoredState, *, reason: Optional[str] = None,
+          **changes: Any) -> AuthoredRecord:
+    return world.db.transaction(lambda conn: move_in_tx(
+        conn, record_in_tx(conn, digest), target, event="TEST", reason=reason, now=world.clock(), **changes))
+
+
+def report(world: AuthoredWorld, digest: str, request_id_: str, event: str, image: Optional[str] = None) -> dict:
+    return world.store.report(ReportAuthoredEvaluationRequest.model_validate({
+        "digest": digest, "request_id": request_id_, "event": event, "sandbox_image_digest": image,
+        "detail": ""}))
+
+
+def deployed(world: AuthoredWorld, range_bars: int = 15, version: str = VERSION) -> str:
+    """A record judged DEPLOY and registered as ``version`` (what Tasks 7 and 8 do through SP2c)."""
+    digest = stored(world, range_bars)
+    evaluating(world, digest, request_id(range_bars))
+    moved(world, digest, SHADOW, reason="AWAITING_REGISTRATION", verdict="DEPLOY", judgment_id="jdg-00000001",
+          evaluation_request_id=None)
+    moved(world, digest, DEPLOYED, deployment_version=version)
+    return digest

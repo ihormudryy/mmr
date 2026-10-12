@@ -9,15 +9,23 @@ ending ``_in_tx`` run inside the caller's ``DuckDBConnection.transaction`` and n
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import json
+import threading
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Iterator, Mapping, Optional
 
-from trader.authored.keys import authored_key
-from trader.automation.authored_refusals import AuthoredStateConflict
+from trader.authored.keys import authored_key, source_digest
+from trader.automation.authored_config import AuthoredStrategiesConfig
+from trader.automation.authored_files import AuthoredFileStore
+from trader.automation.authored_refusals import (
+    AUTHORED_CAP_FULL, AUTHORED_STRATEGIES_DISABLED, AuthoredRefused, AuthoredStateConflict,
+)
+from trader.automation.authored_submission import check_submission
+from trader.automation.authored_wire import SubmitAuthoredStrategyRequest
 from trader.automation.evaluation_claims import utc
 from trader.research.canonical import canonical_json_bytes
 
@@ -215,3 +223,120 @@ def note_in_tx(conn: Any, record: AuthoredRecord, *, event: str, now: dt.datetim
     noted = replace(record, history=record.history + (entry,), **changes)
     _replace_in_tx(conn, record, noted)
     return noted
+
+
+def _reply(status: str, record: AuthoredRecord, **extra: Any) -> dict:
+    return {"status": status, "code": None, "detail": None, "retryable": False, "record": record.to_json(),
+            **extra}
+
+
+class _DigestLocks:
+    """One lock per digest while someone holds or waits for it; the entry is dropped after the last one."""
+
+    def __init__(self):
+        self._guard = threading.Lock()
+        self._held: dict[str, tuple[threading.Lock, int]] = {}
+
+    @contextlib.contextmanager
+    def hold(self, digest: str) -> Iterator[None]:
+        with self._guard:
+            lock, users = self._held.get(digest, (threading.Lock(), 0))
+            self._held[digest] = (lock, users + 1)
+        try:
+            with lock:
+                yield
+        finally:
+            with self._guard:
+                lock, users = self._held[digest]
+                if users == 1:
+                    del self._held[digest]
+                else:
+                    self._held[digest] = (lock, users - 1)
+
+
+class AuthoredStrategyStore:
+    """The trader's authority over authored strategies (SP3 spec 7.3). One instance per trader."""
+
+    def __init__(self, db: Any, *, config: AuthoredStrategiesConfig, files: AuthoredFileStore,
+                 now: Callable[[], dt.datetime], proofs: Any = None, calendar: Any = None,
+                 shadow_sessions: int = 20, lines: Optional[Callable[[], Any]] = None,
+                 withdraw: Optional[Callable[[str], bool]] = None):
+        """``proofs`` (IsolationProofs) gates registration; ``calendar``, ``shadow_sessions`` and ``lines``
+        (a callable returning DeploymentLines) drive the lazy expiry of ruling 11; ``withdraw`` (the SP2c
+        version withdrawal, Task 6) ends a retired record's deployment line (ruling 18, decision D4)."""
+        self._db = db
+        self._config = config
+        self._files = files
+        self._now = now
+        self._proofs = proofs
+        self._calendar = calendar
+        self._shadow_sessions = shadow_sessions
+        self._lines = lines
+        self._withdraw = withdraw
+        self._submit_locks = _DigestLocks()
+
+    @property
+    def config(self) -> AuthoredStrategiesConfig:
+        return self._config
+
+    def get(self, digest: str) -> Optional[AuthoredRecord]:
+        return self._db.transaction(lambda conn: record_in_tx(conn, digest))
+
+    def submit(self, request: SubmitAuthoredStrategyRequest) -> dict:
+        """Two submits of one digest run one after the other, so the second finds the first's record and
+        never writes its own ``.json`` beside it. Different digests still race for the cap, which the
+        insert transaction counts."""
+        source = request.source.encode("utf-8")
+        digest = source_digest(source)
+        with self._submit_locks.hold(digest):
+            return self._submit_held(request, source, digest)
+
+    def _submit_held(self, request: SubmitAuthoredStrategyRequest, source: bytes, digest: str) -> dict:
+        existing = self.get(digest)
+        if existing is not None:                  # ruling 6: before the switch, the cap and the checks
+            return _reply("EXISTING", existing)
+        try:
+            self._require_enabled()
+            self._require_room()
+            checked = check_submission(request, self._config)
+            record = new_record(digest=digest, class_name=checked.class_name, bar_size=checked.bar_size,
+                                tunables=checked.tunables, note=request.note, author_model=request.author_model,
+                                now=self._now())
+            self._files.write(digest, source, record.file_metadata())      # the file before the record
+            status, saved = self._db.transaction(lambda conn: self._insert_in_tx(conn, record))
+        except AuthoredRefused as refused:
+            return refused.reply()
+        if status == "EXISTING":                  # another store instance committed the digest first
+            self._files.write(digest, source, saved.file_metadata())
+        return _reply(status, saved)
+
+    def overview(self) -> dict:
+        """``get_authored_strategies`` and ``list_authored_strategies``: every record, the cap and the switch."""
+        records, judged = self._db.transaction(lambda conn: (records_in_tx(conn), judged_count_in_tx(conn)))
+        counted = sum(1 for record in records if record.state in COUNTED_STATES)
+        return {"enabled": self._config.enabled, "max_active": self._config.max_active, "counted": counted,
+                "room": max(0, self._config.max_active - counted), "judged_count": judged,
+                "bar_sizes": list(self._config.bar_sizes), "records": [record.to_json() for record in records]}
+
+    def _require_enabled(self) -> None:
+        if not self._config.enabled:
+            raise AuthoredRefused(AUTHORED_STRATEGIES_DISABLED, "ai_paper.authored_strategies.enabled is false")
+
+    def _require_room(self) -> None:
+        """A cheap check before the static check and the file write; the insert counts again."""
+        counted = self._db.transaction(counted_in_tx)
+        if counted >= self._config.max_active:
+            raise AuthoredRefused(AUTHORED_CAP_FULL, self._cap_detail(counted))
+
+    def _insert_in_tx(self, conn: Any, record: AuthoredRecord) -> tuple[str, AuthoredRecord]:
+        raced = record_in_tx(conn, record.digest)
+        if raced is not None:                     # the same file, submitted twice at once
+            return "EXISTING", raced
+        counted = counted_in_tx(conn)
+        if counted >= self._config.max_active:
+            raise AuthoredRefused(AUTHORED_CAP_FULL, self._cap_detail(counted))
+        insert_in_tx(conn, record)
+        return "STORED", record
+
+    def _cap_detail(self, counted: int) -> str:
+        return f"{counted} of {self._config.max_active} authored strategies are STORED, EVALUATING, SHADOW or DEPLOYED"

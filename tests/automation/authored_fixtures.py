@@ -2,9 +2,18 @@
 from __future__ import annotations
 
 import hashlib
+import re
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any, Optional
 
+from tests.automation.backtest_judge_fixtures import NOW, Clock
+from trader.automation.authored_config import AuthoredStrategiesConfig
+from trader.automation.authored_files import AuthoredFileStore
 from trader.automation.authored_schema import apply_authored_migrations
+from trader.automation.authored_strategies import AuthoredStrategyStore
+from trader.automation.authored_wire import SubmitAuthoredStrategyRequest
+from trader.automation.calendar_policy import XNYSCalendarPolicy
 from trader.automation.backtest_judge_schema import apply_backtest_judge_migrations
 from trader.data.duckdb_store import DuckDBConnection
 from trader.data.schema_migrations import SchemaMigrator
@@ -63,3 +72,51 @@ def authored_journal(tmp_path: Path) -> DuckDBConnection:
     apply_backtest_judge_migrations(migrator)
     apply_authored_migrations(migrator)
     return db
+
+
+def submit_request(text: Optional[str] = None, **changes: Any) -> SubmitAuthoredStrategyRequest:
+    text = text or VALID_SOURCE
+    found = re.search(r"RANGE_BARS = (\d+)", text)
+    raw = {"source": text, "tunables": tunables_for(int(found.group(1)) if found else 15), "bar_size": "5 mins",
+           "note": "breaks above the range of the last bars", "author_model": "openrouter/author-1"}
+    raw.update(changes)
+    return SubmitAuthoredStrategyRequest.model_validate(raw)
+
+
+@dataclass
+class AuthoredWorld:
+    db: DuckDBConnection
+    clock: Clock
+    store: AuthoredStrategyStore
+    tmp_path: Path
+
+
+def _store(db, clock, tmp_path, *, lines=None, calendar=None, proofs=None, withdraw=None,
+           **config) -> AuthoredStrategyStore:
+    return AuthoredStrategyStore(db, config=replace(AuthoredStrategiesConfig(enabled=True), **config),
+                                 files=AuthoredFileStore(tmp_path / "store"), now=clock, proofs=proofs,
+                                 calendar=calendar or XNYSCalendarPolicy(), shadow_sessions=20, lines=lines,
+                                 withdraw=withdraw)
+
+
+def authored_world(tmp_path: Path, *, lines=None, calendar=None, proofs=None, withdraw=None,
+                   **config) -> AuthoredWorld:
+    db, clock = authored_journal(tmp_path), Clock(NOW)
+    return AuthoredWorld(db, clock, _store(db, clock, tmp_path, lines=lines, calendar=calendar, proofs=proofs,
+                                           withdraw=withdraw, **config), tmp_path)
+
+
+def with_config(world: AuthoredWorld, **config) -> AuthoredStrategyStore:
+    """Another store on the same journal and files, as after a trader restart with an edited trader.yaml."""
+    return _store(world.db, world.clock, world.tmp_path, **config)
+
+
+def stored(world: AuthoredWorld, range_bars: int = 15) -> str:
+    reply = world.store.submit(submit_request(source(range_bars)))
+    assert reply["status"] == "STORED", reply
+    return reply["record"]["digest"]
+
+
+def stored_files(world: AuthoredWorld) -> list[Path]:
+    root = world.tmp_path / "store"
+    return sorted(root.glob("*.py")) if root.exists() else []

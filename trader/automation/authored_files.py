@@ -93,8 +93,9 @@ class AuthoredFileStore:
     def _holds_metadata(self, path: Path, wanted: bytes) -> bool:
         """True when ``path`` already holds ``wanted``.
 
-        Callers write only for a digest without a journal record, so a different but valid ``.json``
-        is an orphan of an attempt whose record never committed, and is replaced.
+        Callers write either for a digest without a journal record or with the committed record's own
+        metadata, so a different but valid ``.json`` is an orphan of an attempt whose record never
+        committed (or that lost a race to another submit), and is replaced.
         """
         data = self._existing(path)
         if data is None:

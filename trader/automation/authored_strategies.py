@@ -30,7 +30,7 @@ from trader.automation.authored_config import AuthoredStrategiesConfig
 from trader.automation.authored_files import AuthoredFileStore
 from trader.automation.authored_refusals import (
     AUTHORED_CAP_FULL, AUTHORED_ISOLATION_UNPROVEN, AUTHORED_STATE_CONFLICT, AUTHORED_STRATEGIES_DISABLED,
-    AUTHORED_STRATEGY_UNKNOWN, AuthoredRefused, AuthoredStateConflict,
+    AUTHORED_STRATEGY_UNKNOWN, AUTHORED_WITHDRAWAL_FAILED, AuthoredRefused, AuthoredStateConflict,
 )
 from trader.automation.authored_submission import check_submission
 from trader.automation.authored_wire import (
@@ -667,18 +667,33 @@ class AuthoredStrategyStore:
             status, record = self._write(write)
         except AuthoredRefused as refused:
             return refused.reply()
-        version = self._version_to_withdraw(record)
-        if version is not None and self._withdraw is not None:
-            try:
-                self._withdraw(version)
-            except DeploymentRefused as refused:
-                logger.error("authored strategy %s is RETIRED; withdrawing %s refused: %s", record.digest,
-                             version, refused)
-                not_withdrawn = AuthoredRefused(
-                    refused.code, f"the record is RETIRED; its version is not withdrawn yet: {refused.message}",
-                    retryable=self._withdrawal_retryable(refused.code))
-                return {**not_withdrawn.reply(), "record": record.to_json()}
+        not_withdrawn = self._withdraw_retired(record)
+        if not_withdrawn is not None:
+            return {**not_withdrawn.reply(), "record": record.to_json()}
         return _reply(status, record)
+
+    def _withdraw_retired(self, record: AuthoredRecord) -> Optional[AuthoredRefused]:
+        """Withdraw a retired record's live version; the refusal to send back when that did not happen.
+
+        An SP2c refusal keeps its code. Any other failure is retryable: the record is RETIRED already, a resend
+        withdraws again and so does ``refresh``."""
+        version = self._version_to_withdraw(record)
+        if version is None or self._withdraw is None:
+            return None
+        try:
+            self._withdraw(version)
+        except DeploymentRefused as refused:
+            logger.error("authored strategy %s is RETIRED; withdrawing %s refused: %s", record.digest, version,
+                         refused)
+            return AuthoredRefused(refused.code,
+                                   f"the record is RETIRED; its version is not withdrawn yet: {refused.message}",
+                                   retryable=self._withdrawal_retryable(refused.code))
+        except Exception as error:
+            logger.exception("authored strategy %s is RETIRED; withdrawing %s failed", record.digest, version)
+            return AuthoredRefused(AUTHORED_WITHDRAWAL_FAILED,
+                                   f"the record is RETIRED; withdrawing {version} failed "
+                                   f"({type(error).__name__}); resend", retryable=True)
+        return None
 
     def _withdrawal_retryable(self, code: str) -> bool:
         """A resend finds a newer last version only through ``lines``; without them it would repeat forever."""

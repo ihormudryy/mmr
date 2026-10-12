@@ -280,9 +280,9 @@ def test_refresh_withdraws_a_retired_line_whose_withdrawal_was_lost(tmp_path):  
     lines = line_of({VERSION: "ACTIVE"}, VERSION)
     w = authored_world(tmp_path, withdraw=withdrawals, lines=lambda: lines)
     digest = deployed(w)
-    with pytest.raises(RuntimeError):
-        w.store.retire(retire_request(digest))
-    assert w.store.get(digest).state.value == "RETIRED"
+    reply = w.store.retire(retire_request(digest))           # Task 9: a retryable refusal, not a raw error
+    assert (reply["status"], reply["code"], reply["retryable"]) == ("REFUSED", "AUTHORED_WITHDRAWAL_FAILED", True)
+    assert reply["record"]["state"] == "RETIRED" and w.store.get(digest).state.value == "RETIRED"
     record = w.store.overview()["records"][0]
     assert withdrawals.calls == [VERSION, VERSION]
     assert (record["state"], record["reason"]) == ("RETIRED", "SANDBOX_ERROR")

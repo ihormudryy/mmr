@@ -96,3 +96,21 @@ def test_a_retirement_waits_for_a_submitting_row_on_the_journal_lock(world, tmp_
     retirement.join(timeout=10)
     assert receipt.state == "SUBMITTED" and len(world.dispatch.plans) == 1     # in flight before the retirement
     assert replies[0]["record"]["state"] == "RETIRED"
+
+
+def test_the_command_stack_hands_the_saga_the_authored_check(world, tmp_path):
+    from types import SimpleNamespace
+
+    from trader.automation.ai_paper_decision import AI_PAPER_ACTION
+    from trader.trading.command_stack import _AiPaperParts, _ai_paper_send_gate_in_tx
+
+    armed = world.arm_authored(tmp_path / "store")
+    parts = _AiPaperParts(config=None, policy=world.policy, entry_filter=world.entry_filter,
+                          deployments=world.deployments, scope_checks=None, filter_refusal=None,
+                          versions=world.versions, activity=world.activity, authored=armed.store)
+    gate = _ai_paper_send_gate_in_tx(parts)
+    request = SimpleNamespace(action=AI_PAPER_ACTION, body=world.body(
+        deployment_digest=armed.base, deployment_version=armed.renew(), source_digest=armed.digest))
+    assert world.db.transaction(lambda conn: gate(conn, request)) is None      # entry on a renewed version
+    retire(armed.store, armed.digest)
+    assert world.db.transaction(lambda conn: gate(conn, request)) == "DEPLOYMENT_NOT_ACTIVE"

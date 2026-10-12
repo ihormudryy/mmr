@@ -168,8 +168,9 @@ class AuthoredLiveStrategy(Strategy):
         try:
             proven = self._proof_gate(build) is True
         except Exception as exc:
-            logger.warning("authored strategy %s: the isolation proof check for build %s failed: %s",
-                           self.name, build, exc)
+            if not self._in_unproven:                          # once per episode, like the isolation alarm
+                logger.warning("authored strategy %s: the isolation proof check for build %s failed: %s",
+                               self.name, build, exc)
             proven = False
         if not proven:
             raise _UnprovenBuild(build)

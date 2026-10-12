@@ -39,6 +39,10 @@ STRATEGY_FAULT_CODES = frozenset({SANDBOX_ERROR, SANDBOX_DIGEST_MISMATCH})
 _RETRYABLE_ERRORS = (SandboxUnavailable, SandboxProtocolError, OSError)
 
 
+def _utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
 class _UnprovenBuild(Exception):
     def __init__(self, build: Any):
         super().__init__(build)
@@ -72,7 +76,8 @@ def _bound_conids(conids: Sequence[int]) -> tuple[int, ...]:
 
 class AuthoredLiveStrategy(Strategy):
     def __init__(self, *, client: Any, digest: str, class_name: str, params: Mapping[str, float], bar_size: str,
-                 conids: Sequence[int], on_fault: Callable[[str, str], None], proof_gate: Callable[[str], bool]):
+                 conids: Sequence[int], on_fault: Callable[[str, str], None], proof_gate: Callable[[str], bool],
+                 now: Callable[[], dt.datetime] = _utc_now):
         super().__init__()
         # Plan 4 ruling 19 (review r1 #6): True only for a build with a passing isolation proof. Asked before
         # every OPEN for the build PING reported, and on every bar for the build the session's OPENED reported,
@@ -84,10 +89,13 @@ class AuthoredLiveStrategy(Strategy):
         self._bound_conids = _bound_conids(conids)
         self._client, self._class_name, self._params, self._bar_size = client, class_name, dict(params), bar_size
         self._on_fault = on_fault
+        self._now = now
         self._current: Optional[_DaySession] = None
         # The tick thread sends; the reconcile thread may close. One bar at a time on the session (Plan 2 ruling 25).
         self._lock = threading.Lock()
         self._faulted = False
+        self._closed = False             # close_sessions() is final: no PING, OPEN or BAR after it
+        self._future_warned: set[tuple[int, dt.date]] = set()
         self._in_outage = False
         self._in_unproven = False
 
@@ -104,10 +112,13 @@ class AuthoredLiveStrategy(Strategy):
                            "no signal", self.name, conid)
             return None
         with self._lock:
-            if self._faulted:
+            if self._faulted or self._closed:
+                return None
+            day = self._newest_bar_day(conid, prices)
+            if day is None:                    # nothing reaches the sandbox: the alarm flags stay as they are
                 return None
             try:
-                decision = self._decide(conid, prices)
+                decision = self._decide(conid, prices, day)
             except SandboxFault as fault:
                 if fault.code not in STRATEGY_FAULT_CODES:
                     self._end_session_with_outage(fault)
@@ -135,17 +146,31 @@ class AuthoredLiveStrategy(Strategy):
     def authored_binding_intact(self) -> bool:
         """The dispatch check (Plan 4 ruling 20): never after a fault, and only for the digest the deployment bound."""
         bound = getattr(self, "ai_source_digest", None)
-        return not self._faulted and isinstance(bound, str) and hmac.compare_digest(self.digest, bound)
+        return not (self._faulted or self._closed) and isinstance(bound, str) and hmac.compare_digest(self.digest, bound)
 
     def close_sessions(self) -> None:
+        """Final: the reconcile thread unloads the instance, and a tick thread that still holds it opens nothing."""
         with self._lock:
+            self._closed = True
             self._end_session()
 
-    def _decide(self, conid: int, prices: pd.DataFrame) -> Optional[Decision]:
+    def _newest_bar_day(self, conid: int, prices: pd.DataFrame) -> Optional[dt.date]:
+        """The New York date of the newest bar, or None when that bar decides nothing: one the protocol refuses
+        (ruling 16), or one dated after today, which would pin the session to a future day."""
         newest = bar_fields(prices.index[-1], prices[list(OHLCV)].iloc[-1].tolist())
-        if newest is None:              # it decides nothing, and its time must not roll the session (ruling 16)
+        if newest is None:
             return None
         day = newest["t"].astimezone(NEW_YORK).date()
+        today = self._now().astimezone(NEW_YORK).date()
+        if day <= today:
+            return day
+        if (conid, day) not in self._future_warned:
+            self._future_warned.add((conid, day))
+            logger.warning("authored strategy %s: conid %s has a bar dated %s, after today (%s) in New York; "
+                           "skipped, no signal", self.name, conid, day, today)
+        return None
+
+    def _decide(self, conid: int, prices: pd.DataFrame, day: dt.date) -> Optional[Decision]:
         if self._current is not None and day > self._current.day:      # a conid still on yesterday never rolls back
             self._end_session()
         if self._current is None:
@@ -177,8 +202,12 @@ class AuthoredLiveStrategy(Strategy):
 
     def _end_session(self) -> None:
         current, self._current = self._current, None
-        if current is not None:
+        if current is None:
+            return
+        try:
             next(iter(current.streams.values())).close()                   # closes the session for every conid
+        except Exception as exc:                                           # the session is dropped here either way
+            logger.warning("authored strategy %s: closing its live session failed: %s", self.name, exc)
 
     def _end_session_with_outage(self, exc: BaseException) -> None:
         self._end_session()
@@ -205,8 +234,8 @@ class AuthoredLiveStrategy(Strategy):
 
     def _stop_after_fault(self) -> None:
         self._faulted = True
-        self._end_session()                                                # a fault ends the session for every conid
         self.disable()
+        self._end_session()                                                # a fault ends the session for every conid
 
     def _report_fault(self, fault: SandboxFault) -> None:
         alarm = DIGEST_ALARM if fault.code == SANDBOX_DIGEST_MISMATCH else SANDBOX_FAULT_ALARM

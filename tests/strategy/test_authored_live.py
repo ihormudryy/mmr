@@ -29,13 +29,14 @@ def live_sandbox(**kwargs):
 
 
 def live(sandbox, faults, name="counts_bars", class_name="CountsBars", params=None, conids=(CONID,),
-         proven=None, proof_gate=None):
+         proven=None, proof_gate=None, now=None):
     digest = sandbox.add(caller_source(name))
     proven = {sandbox.image_digest} if proven is None else proven     # the builds with a passing proof
     strategy = AuthoredLiveStrategy(client=sandbox, digest=digest, class_name=class_name, params=params or {},
                                     bar_size="1 min", conids=conids,
                                     on_fault=lambda d, code: faults.append((d, code)),
-                                    proof_gate=proof_gate or (lambda build: build in proven))
+                                    proof_gate=proof_gate or (lambda build: build in proven),
+                                    **({} if now is None else {"now": now}))
     strategy.install(StrategyContext(name="aidv-test", bar_size=BarSize.Mins1, conids=list(conids), universe=None,
                                      historical_days_prior=5, paper_only=True, storage=None, universe_accessor=None,
                                      logger=logging))
@@ -381,6 +382,66 @@ def test_a_warm_up_bar_before_1970_is_skipped():                                
     frame = pd.concat([bars(1, start="1969-12-31 14:30"), bars(5)])
     assert strategy.on_prices(frame).probability == 5 / 10000
     assert len(sandbox.sessions[0].stamps) == 5
+
+
+def test_closing_the_sessions_is_final():                                       # review fix round 1
+    sandbox, faults = live_sandbox(), []
+    strategy = live(sandbox, faults)
+    assert strategy.on_prices(bars(3)) is not None
+    strategy.close_sessions()                         # the reconcile thread unloads it
+    assert strategy.on_prices(bars(4)) is None        # a tick thread that still held it
+    assert sandbox.open_sessions == [] and len(sandbox.sessions) == 1
+    assert not strategy.authored_binding_intact()
+
+
+def test_a_bar_dated_after_today_is_skipped_and_does_not_pin_the_session(caplog):     # review fix round 1
+    sandbox, faults = live_sandbox(), []
+    today = pd.Timestamp("2024-03-04 15:00", tz="UTC").to_pydatetime()
+    strategy = live(sandbox, faults, conids=(CONID, OTHER), now=lambda: today)
+    strategy._dispatch_conid = CONID
+    assert strategy.on_prices(bars(10)).probability == 10 / 10000
+    strategy._dispatch_conid = OTHER
+    with caplog.at_level(logging.WARNING):
+        assert strategy.on_prices(bars(5, start="2024-03-05 14:30")) is None
+        assert strategy.on_prices(bars(6, start="2024-03-05 14:30")) is None
+    assert caplog.text.count("after today") == 1                       # once per conid per day
+    assert len(sandbox.sessions) == 1 and not sandbox.sessions[0].closed
+    assert sandbox.sessions[0].stamps_of(OTHER) == []
+    strategy._dispatch_conid = CONID
+    assert strategy.on_prices(bars(11)).probability == 11 / 10000      # same session, still today's
+    assert len(sandbox.sessions) == 1
+
+
+def test_an_outage_across_a_skipped_bar_alarms_once_and_never_recovers_falsely(caplog):   # review fix round 1
+    sandbox, faults = live_sandbox(), []
+    strategy, frame = live(sandbox, faults), bars(23)
+    frame.iloc[21, frame.columns.get_loc("close")] = np.nan
+    strategy.on_prices(frame.iloc[:20])
+    sandbox.unavailable = True
+    with caplog.at_level(logging.INFO):
+        assert strategy.on_prices(frame.iloc[:21]) is None
+        assert strategy.on_prices(frame.iloc[:22]) is None             # a NaN newest bar: the sandbox is not asked
+        assert strategy.on_prices(frame.iloc[:23]) is None
+    assert caplog.text.count(SANDBOX_UNAVAILABLE_ALARM) == 1
+    assert "answers again" not in caplog.text
+
+
+def test_a_fault_whose_close_raises_still_retires_and_disables():              # review fix round 1
+    from trader.authored.sandbox_client import SandboxFault, SandboxProtocolError
+    sandbox, faults = live_sandbox(), []
+    strategy = live(sandbox, faults)
+    assert strategy.on_prices(bars(3)) is not None
+    session = sandbox.sessions[0]
+
+    def faulting_bar(*args, **kwargs):
+        raise SandboxFault("boom", code=SANDBOX_ERROR)
+
+    def broken_close():
+        raise SandboxProtocolError("close failed")
+    session.bar, session.close = faulting_bar, broken_close
+    assert strategy.on_prices(bars(4)) is None
+    assert faults == [(strategy.digest, SANDBOX_ERROR)] and strategy.state == StrategyState.DISABLED
+    assert strategy.on_prices(bars(5)) is None and len(sandbox.sessions) == 1
 
 
 def test_closing_the_sessions_frees_the_slots():

@@ -65,6 +65,9 @@ _COLUMNS = ("digest", "class_name", "bar_size", "tunables_json", "note", "author
             "attempts", "evaluation_request_id", "sandbox_image_digest", "sandbox_image_seen_at", "verdict",
             "judgment_id", "deployment_version", "created_at", "state_changed_at", "history_json")
 _SELECT = f"SELECT {', '.join(_COLUMNS)} FROM authored_strategies"
+# What a move or a note may change beside its own state, reason and history; identity never changes.
+CHANGEABLE_FIELDS = frozenset({"attempts", "evaluation_request_id", "sandbox_image_digest", "sandbox_image_seen_at",
+                               "verdict", "judgment_id", "deployment_version"})
 
 
 @dataclass(frozen=True)
@@ -170,6 +173,12 @@ def insert_in_tx(conn: Any, record: AuthoredRecord) -> None:
     conn.execute(f"INSERT INTO authored_strategies ({', '.join(_COLUMNS)}) VALUES ({marks})", _values(record))
 
 
+def _require_changeable(changes: Mapping[str, Any]) -> None:
+    refused = sorted(set(changes) - CHANGEABLE_FIELDS)
+    if refused:
+        raise ValueError(f"a move or note cannot change {', '.join(refused)}")
+
+
 def _replace_in_tx(conn: Any, expected: AuthoredRecord, updated: AuthoredRecord) -> None:
     assignments = ", ".join(f"{name} = ?" for name in _COLUMNS[1:])
     changed = conn.execute(
@@ -184,6 +193,7 @@ def _replace_in_tx(conn: Any, expected: AuthoredRecord, updated: AuthoredRecord)
 def move_in_tx(conn: Any, record: AuthoredRecord, target: AuthoredState, *, event: str, reason: Optional[str],
                now: dt.datetime, request_id: Optional[str] = None, detail: Optional[str] = None,
                **changes: Any) -> AuthoredRecord:
+    _require_changeable(changes)
     if target not in TRANSITIONS.get(record.state, frozenset()):
         raise AuthoredStateConflict(f"{record.state.value} cannot move to {target.value}")
     now = utc(now)
@@ -199,6 +209,7 @@ def note_in_tx(conn: Any, record: AuthoredRecord, *, event: str, now: dt.datetim
                request_id: Optional[str] = None, detail: Optional[str] = None, image: Optional[str] = None,
                **changes: Any) -> AuthoredRecord:
     """A history entry without a state change (research's STARTED report)."""
+    _require_changeable(changes)
     entry = _entry(utc(now), event=event, source=record.state, target=record.state, reason=record.reason,
                    request_id=request_id, detail=detail, image=image)
     noted = replace(record, history=record.history + (entry,), **changes)

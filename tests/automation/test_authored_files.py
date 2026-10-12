@@ -166,3 +166,21 @@ def test_an_fsync_failure_is_a_store_error_and_leaves_no_temp_file(tmp_path, mon
     with pytest.raises(AuthoredStoreError, match=f"fsync .* errno {errno.ENOSPC}"):
         AuthoredFileStore(tmp_path / "store").write(DIGEST, DATA, {})
     assert not list((tmp_path / "store").iterdir())
+
+
+def test_each_file_has_mode_0644_before_it_is_flushed_and_renamed(tmp_path, monkeypatch):
+    modes_at_fsync = []
+    real_fsync = os.fsync
+
+    def recording_fsync(descriptor):
+        info = os.fstat(descriptor)
+        if stat.S_ISREG(info.st_mode):
+            modes_at_fsync.append(stat.S_IMODE(info.st_mode))
+        return real_fsync(descriptor)
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+    previous = os.umask(0o077)
+    try:
+        AuthoredFileStore(tmp_path / "store").write(DIGEST, DATA, {"note": "n"})
+    finally:
+        os.umask(previous)
+    assert modes_at_fsync == [0o644, 0o644]

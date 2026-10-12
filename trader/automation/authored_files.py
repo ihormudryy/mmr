@@ -135,10 +135,10 @@ class AuthoredFileStore:
             with _os_step("write", temp), os.fdopen(descriptor, "wb") as handle:
                 handle.write(data)
                 handle.flush()
+                with _os_step("chmod", temp):
+                    os.fchmod(handle.fileno(), FILE_MODE)
                 with _os_step("fsync", temp):
                     os.fsync(handle.fileno())
-            with _os_step("chmod", temp):
-                os.chmod(temp, FILE_MODE)
             with _os_step("rename", path):
                 os.replace(temp, path)
         except BaseException:

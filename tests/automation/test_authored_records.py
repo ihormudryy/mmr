@@ -121,3 +121,42 @@ def test_a_move_of_a_record_that_is_not_stored_is_refused(tmp_path):
     with pytest.raises(AuthoredStateConflict):
         db.transaction(lambda conn: move_in_tx(conn, fresh(), EVALUATING, event="CLAIMED", reason=None, now=NOW))
     assert db.transaction(records_in_tx) == ()
+
+
+IDENTITY_AND_STATE = ["state", "reason", "history", "digest", "class_name", "bar_size", "tunables", "note",
+                      "author_model", "created_at", "state_changed_at", "unknown_field"]
+
+
+@pytest.mark.parametrize("field", [f for f in IDENTITY_AND_STATE if f != "reason"])   # a move sets reason itself
+def test_a_move_cannot_change_identity_state_or_history_fields(tmp_path, field):
+    db = authored_journal(tmp_path)
+    record = fresh()
+    db.transaction(lambda conn: insert_in_tx(conn, record))
+    with pytest.raises(ValueError, match=field):
+        db.transaction(lambda conn: move_in_tx(conn, record, EVALUATING, event="CLAIMED", reason=None, now=NOW,
+                                               **{field: DEPLOYED}))
+    assert db.transaction(lambda conn: record_in_tx(conn, DIGEST)) == record
+
+
+@pytest.mark.parametrize("field", IDENTITY_AND_STATE)
+def test_a_note_cannot_change_identity_state_or_history_fields(tmp_path, field):
+    db = authored_journal(tmp_path)
+    record = fresh()
+    db.transaction(lambda conn: insert_in_tx(conn, record))
+    with pytest.raises(ValueError, match=field):
+        db.transaction(lambda conn: note_in_tx(conn, record, event="STARTED", now=NOW, **{field: DEPLOYED}))
+    assert db.transaction(lambda conn: record_in_tx(conn, DIGEST)) == record
+
+
+def test_a_note_may_change_the_evaluation_fields(tmp_path):
+    db = authored_journal(tmp_path)
+    record = fresh()
+    db.transaction(lambda conn: insert_in_tx(conn, record))
+    evaluating = db.transaction(lambda conn: move_in_tx(conn, record, EVALUATING, event="CLAIMED", reason=None,
+                                                        now=NOW, request_id=request_id(1)))
+    noted = db.transaction(lambda conn: note_in_tx(conn, evaluating, event="STARTED", now=NOW,
+                                                   request_id=request_id(1), image="a1b2c3d-20261011T220000Z",
+                                                   sandbox_image_digest="a1b2c3d-20261011T220000Z",
+                                                   sandbox_image_seen_at=NOW, attempts=1))
+    assert (noted.state, noted.attempts, noted.sandbox_image_digest) == (EVALUATING, 1, "a1b2c3d-20261011T220000Z")
+    assert db.transaction(lambda conn: record_in_tx(conn, DIGEST)) == noted

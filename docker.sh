@@ -4,6 +4,8 @@ set -o errexit -o pipefail -o noclobber -o nounset
 
 # usually /home/trader/mmr
 BUILDDIR=$(cd $(dirname "$0"); pwd)
+# Relative --restore / --identity-file paths are the operator's, so remember where they ran us.
+INVOCATION_DIR="$PWD"
 
 # Sibling news scraper repo. Default to ~/dev/news so the standard checkout
 # layout works out of the box; override with NEWS_DIR=/path/to/news.
@@ -24,7 +26,7 @@ echo_usage() {
     echo "  -l (logs: tail logs from all containers)"
     echo "  -r (restart-ib: restart the IB Gateway container)"
     echo "  -e [service] (exec: shell into trader by default; valid services:"
-    echo "      trader, data, strategy, dashboard, scheduler, ib-gateway)"
+    echo "      trader, data, strategy, dashboard, scheduler, ib-gateway, sandbox)"
     echo "  -n (news: bring up the news scraper stack at \$NEWS_DIR)"
     echo "  -B [name] (backup DuckDB files to ~/.local/share/mmr/backups/)"
     echo "  -k [--rotate P] (RPC keys: mmr keys init in the one-shot keygen container)"
@@ -106,6 +108,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+_abs() { case "$1" in /*) printf '%s' "$1";; *) printf '%s/%s' "$INVOCATION_DIR" "$1";; esac; }
+[[ -n "$KEYS_ARCHIVE" ]] && KEYS_ARCHIVE="$(_abs "$KEYS_ARCHIVE")"
+[[ -n "$KEYS_IDENTITY_FILE" ]] && KEYS_IDENTITY_FILE="$(_abs "$KEYS_IDENTITY_FILE")"
+# Compose reads relative paths (such as the sandbox seccomp profile) against the
+# current directory, so always run it from the repo root (SP3 Plan 2 ruling 17).
+cd "$BUILDDIR"
+
 if [[ $b == "n" && $c == "n" && $f == "n" && $u == "n" && $d == "n" && $s == "n" && $a == "n" && $g == "n" && $l == "n" && $e == "n" && $i == "n" && $r == "n" && $n == "n" && $B == "n" && $k == "n" && $K == "n" ]]; then
     echo_usage
     exit 0
@@ -124,7 +133,7 @@ fi
 
 if [[ $e == "y" ]]; then
     case "$EXEC_SERVICE" in
-        trader|data|strategy|dashboard|scheduler|ib-gateway) ;;
+        trader|data|strategy|dashboard|scheduler|ib-gateway|sandbox) ;;
         *)
             echo "Unknown exec service: $EXEC_SERVICE"
             exit 1
@@ -616,7 +625,19 @@ ensure_split_config() {
     _retire_hmac_config "$trader_config"
 }
 
+# The id names one build. It is baked into the image, so only build() sets it.
+_export_build_id() {
+    if [[ -z "${MMR_BUILD_ID:-}" ]]; then
+        local sha stamp
+        sha=$(git -C "$BUILDDIR" rev-parse --short HEAD 2>/dev/null || echo nogit)
+        stamp=$(date -u +%Y%m%dT%H%M%SZ)
+        export MMR_BUILD_ID="${sha}-${stamp}"
+    fi
+    echo "MMR_BUILD_ID=${MMR_BUILD_ID}"
+}
+
 build() {
+    _export_build_id
     echo "Building MMR image..."
     echo ""
     $COMPOSE -f "$BUILDDIR/docker-compose.yml" build

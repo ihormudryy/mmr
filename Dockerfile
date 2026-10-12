@@ -6,6 +6,10 @@ ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Build identity baked at image build time (SP3 Plan 2 ruling 1). docker.sh passes
+# MMR_BUILD_ID; a plain `docker build` leaves it "unset" and the sandbox refuses to start.
+ARG MMR_BUILD_ID=unset
+
 # Pin a fixed UID/GID (rather than whatever `useradd` picks next) so the
 # G0 Compose split's `user: trader` + `read_only: true` hardening has a
 # stable, documented identity: host-bind-mounted directories
@@ -18,6 +22,14 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN groupadd -g 1000 trader \
     && useradd -u 1000 -g 1000 -m -d /home/trader -s /bin/bash -G sudo trader \
     && mkdir -p /tmp
+
+# Sandbox child identities (SP3 Plan 2, spec 7.5): one uid per session slot, in a
+# group of their own, none in sudo or trader. The sandbox supervisor drops each
+# forked child to one of these before any authored code loads.
+RUN groupadd -g 20000 sbxchild \
+    && for uid in $(seq 20001 20007); do \
+         useradd -u "$uid" -g 20000 -M -N -s /usr/sbin/nologin "sbx$uid"; \
+       done
 
 # System packages (no TWS/VNC/X11 — IB Gateway runs in a separate container).
 # Python 3.12.13 is provided by the python:3.12.13-slim-bookworm base image.
@@ -101,6 +113,14 @@ RUN mkdir -p /home/trader/.config/mmr \
     && chown -R trader:trader /home/trader/.config/mmr
 
 RUN chmod +x /home/trader/mmr/scripts/docker-entrypoint.sh
+
+# Bake the build id so the running sandbox cannot misreport its own image (ruling 1).
+RUN printf '%s\n' "${MMR_BUILD_ID}" > /etc/mmr-build-id && chmod 0444 /etc/mmr-build-id
+LABEL mmr.build_id="${MMR_BUILD_ID}"
+
+# The authored-strategy store is mounted read-only here on the sandbox; create it so
+# a fresh volume belongs to trader (the trader service, Plan 3, writes it).
+RUN mkdir -p /store && chown trader:trader /store && chmod 0755 /store
 
 # Default the image itself to the unprivileged user (defense-in-depth for
 # anyone who `docker run`s the image directly without Compose's explicit

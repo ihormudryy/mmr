@@ -59,6 +59,8 @@ x-mmr-build: &mmr-build
   # silently ship pytest/docker-py in every one of these five production
   # services. Only `fullstack-tests` (below) overrides this to `test`.
   target: runtime
+  args:
+    MMR_BUILD_ID: ${MMR_BUILD_ID:-unset}
 
 x-mmr-common-env: &mmr-common-env
   TRADER_CONFIG: /home/trader/.config/mmr/trader.yaml

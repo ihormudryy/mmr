@@ -16,11 +16,25 @@ from trader.automation.evaluation_claims import utc
 from trader.research.canonical import canonical_json_bytes, sha256_digest
 
 PROOF_DOMAIN = "mmr.authored.isolation-proof.v1"
+PROOF_FROM_THE_FUTURE = "PROOF_FROM_THE_FUTURE"
+# How far a run's ran_at may lie after the trader's clock: host and trader clocks differ a little. A run further
+# ahead would outrank every later real run of its image, because the newest run is the one that ran last.
+MAX_PROOF_CLOCK_SKEW = dt.timedelta(minutes=5)
 _COLUMNS = "proof_id, image_digest, passed, checks_json, ran_at, recorded_at, principal"
 # The newest run is the one that ran last, whenever its result was recorded: a delayed pass of an earlier run
 # never outranks a later failing run. Among runs at the same moment a failing one wins, so a tie never proves an
 # image. Recording time and proof id only make the order total.
 _NEWEST_FIRST = "ran_at DESC, passed ASC, recorded_at DESC, proof_id DESC"
+
+
+class IsolationProofRefused(Exception):
+    """A proof the trader will not record. Like a malformed body it is an RPC error, so the operator's
+    ``prove-isolation`` fails loudly instead of printing a refusal next to a passed run."""
+
+    def __init__(self, code: str, detail: str):
+        super().__init__(f"{code}: {detail}")
+        self.code = code
+        self.detail = detail
 
 
 @dataclass(frozen=True)
@@ -56,6 +70,11 @@ class IsolationProofs:
         body = request.model_dump()
         proof_id = "sha256:" + sha256_digest(PROOF_DOMAIN, body)
         checks = tuple(body["checks"])
+        now = utc(self._now())
+        if request.ran_at_utc() > now + MAX_PROOF_CLOCK_SKEW:
+            raise IsolationProofRefused(PROOF_FROM_THE_FUTURE,
+                                        f"ran_at {request.ran_at} is more than {MAX_PROOF_CLOCK_SKEW} after the "
+                                        f"trader's clock ({now.isoformat()})")
 
         def write(conn: Any) -> dict:
             row = conn.execute(f"SELECT {_COLUMNS} FROM authored_isolation_proofs WHERE proof_id = ?",
@@ -63,7 +82,7 @@ class IsolationProofs:
             if row is not None:                    # the same run sent twice
                 return {"status": "EXISTING", "proof": _proof(row).to_json()}
             proof = IsolationProof(proof_id, request.image_digest, request.passed, checks, request.ran_at_utc(),
-                                   utc(self._now()), principal)
+                                   now, principal)
             conn.execute(f"INSERT INTO authored_isolation_proofs ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)",
                          [proof.proof_id, proof.image_digest, proof.passed,
                           canonical_json_bytes(list(checks)).decode("utf-8"), proof.ran_at, proof.recorded_at,

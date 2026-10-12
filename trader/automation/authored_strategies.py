@@ -594,6 +594,9 @@ class AuthoredStrategyStore:
             expired = self._shadow_expired(record, utc(self._now()))
         except JudgmentRefused as refused:
             raise DeploymentRefused(CALENDAR_UNAVAILABLE, refused.detail) from None
+        except Exception as error:                  # as the registrar's own session check: any calendar fault
+            raise DeploymentRefused(CALENDAR_UNAVAILABLE,
+                                    f"the session calendar cannot serve: {type(error).__name__}") from None
         if expired:
             raise DeploymentRefused(AUTHORED_STATE_CONFLICT,
                                     f"the record's SHADOW window of {self._shadow_sessions} sessions has ended "

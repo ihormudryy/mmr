@@ -290,7 +290,8 @@ network none, read-only root, pids limit 64, no provider variables), a benign se
 prints one JSON proof with the build id the sandbox reports. The step refuses with `LIVE_SESSIONS_OPEN` (exit 3, nothing
 printed) while the sandbox reports an open live session, before or after the run. The host checks the JSON and records it
 with typed `record_isolation_proof` as `cli`. The newest proof of a build is the run that ran last (`ran_at`); a failing
-run at the same moment as a pass wins. Until every build research reported `STARTED` on the record's evaluation, and the
+run at the same moment as a pass wins. A proof whose `ran_at` is more than 5 minutes after the trader's clock is
+refused with the RPC error `PROOF_FROM_THE_FUTURE` and not stored. Until every build research reported `STARTED` on the record's evaluation, and the
 build it reported last, has a passing newest proof, the trader refuses an authored registration with
 `AUTHORED_ISOLATION_UNPROVEN`. A record past its `SHADOW` window is refused `AUTHORED_STATE_CONFLICT` even before a
 `list` expires it. A rebuilt image needs a new run. The strategy service's own check at load (the build id its `PING`

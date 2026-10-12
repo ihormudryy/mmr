@@ -1,6 +1,7 @@
 """SP3 Plan 3 Task 9: the seven methods over the real signed trader server (spec 5, 10 Keys and Authority)."""
 from __future__ import annotations
 
+import datetime as dt
 from types import SimpleNamespace
 
 import pytest
@@ -127,6 +128,14 @@ def test_the_operator_records_a_proof_and_the_strategy_reads_it(served):        
     assert served.call("strategy", "get_isolation_proof", {"image_digest": IMAGE}) == {
         "found": True, "proof": recorded["proof"]}
     assert served.call("cli", "get_isolation_proof", {"image_digest": OTHER_IMAGE}) == {"found": False, "proof": None}
+
+
+def test_a_proof_from_the_future_is_an_rpc_error_and_not_stored(served):
+    future = proof_request(ran_at=NOW + dt.timedelta(hours=1)).model_dump()
+    with pytest.raises(TypedRpcRemoteError) as exc:
+        served.call("cli", "record_isolation_proof", future)
+    assert exc.value.code == "PROOF_FROM_THE_FUTURE"
+    assert served.call("cli", "get_isolation_proof", {"image_digest": IMAGE}) == {"found": False, "proof": None}
 
 
 def test_an_unusable_store_is_an_rpc_error(served, monkeypatch):

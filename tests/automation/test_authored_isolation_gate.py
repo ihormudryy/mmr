@@ -26,7 +26,9 @@ from trader.automation.ai_paper_decision import apply_ai_paper_decision_migratio
 from trader.automation.ai_paper_evidence import AI_PAPER_ACTION
 from trader.automation.authored_config import AuthoredStrategiesConfig
 from trader.automation.authored_files import AuthoredFileStore
-from trader.automation.authored_isolation import IsolationProofs
+from trader.automation.authored_isolation import (
+    MAX_PROOF_CLOCK_SKEW, PROOF_FROM_THE_FUTURE, IsolationProofRefused, IsolationProofs,
+)
 from trader.automation.authored_strategies import (
     DEPLOYED, EVALUATING, SHADOW, AuthoredStrategyStore, move_in_tx, record_in_tx,
 )
@@ -88,6 +90,21 @@ def test_a_delayed_pass_of_an_earlier_run_never_outranks_a_later_failing_run(tmp
     proofs.record(proof_request(passed=True, ran_at=NOW + dt.timedelta(minutes=1)), principal="cli")
     assert not proofs.passing_for(IMAGE)
     assert proofs.latest(IMAGE).ran_at == NOW + dt.timedelta(minutes=2)
+
+
+def test_a_proof_that_ran_more_than_the_skew_after_the_trader_clock_is_refused(tmp_path):
+    proofs = IsolationProofs(authored_journal(tmp_path), now=Clock(NOW))
+    with pytest.raises(IsolationProofRefused) as refused:
+        proofs.record(proof_request(ran_at=NOW + dt.timedelta(hours=1)), principal="cli")
+    assert refused.value.code == PROOF_FROM_THE_FUTURE
+    assert proofs.latest(IMAGE) is None and proofs.latest(None) is None
+
+
+def test_a_proof_within_the_skew_after_the_trader_clock_is_stored(tmp_path):
+    proofs = IsolationProofs(authored_journal(tmp_path), now=Clock(NOW))
+    assert MAX_PROOF_CLOCK_SKEW == dt.timedelta(minutes=5)
+    reply = proofs.record(proof_request(ran_at=NOW + dt.timedelta(minutes=1)), principal="cli")
+    assert reply["status"] == "RECORDED" and proofs.passing_for(IMAGE)
 
 
 @pytest.mark.parametrize("change", [
@@ -465,3 +482,16 @@ def test_every_build_started_on_the_evaluated_request_must_be_proven(tmp_path): 
     s.proofs.record(proof_request(IMAGE), principal="cli")
     assert s.register("jdg-00000001", record)["created"] is True
     assert s.store.get(digest).state == DEPLOYED
+
+
+def test_any_calendar_exception_at_registration_refuses_with_the_calendar_code(tmp_path):
+    s = Stack(tmp_path)
+    s.proofs.record(proof_request(IMAGE), principal="cli")
+    _digest, record = s.awaiting()
+
+    class FailingCalendar:
+        def sessions_in_range(self, start, end):
+            raise RuntimeError("calendar backend down")
+    s.rebuild(enabled=True, calendar=FailingCalendar())
+    assert s.refused("jdg-00000001", record) == "DEPLOYMENT_CALENDAR_UNAVAILABLE"
+    assert s.versions.sealed() == ()

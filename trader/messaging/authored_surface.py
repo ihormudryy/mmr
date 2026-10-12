@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from trader.automation.authored_files import AuthoredStoreError
+from trader.automation.authored_isolation import IsolationProofRefused
 from trader.automation.authored_wire import (
     GetAuthoredStrategiesRequest, GetIsolationProofRequest, RecordIsolationProofRequest,
     ReportAuthoredEvaluationRequest, RetireAuthoredStrategyRequest, SubmitAuthoredStrategyRequest,
@@ -59,7 +60,10 @@ def register_authored_surface(registry: Any, *, authored: Any, proofs: Any) -> N
 
     def record_isolation_proof(parsed: RecordIsolationProofRequest, caller: RpcCaller) -> dict:
         _require(caller, OPERATOR, "record_isolation_proof")
-        return _loudly(lambda: proofs.record(parsed, principal=caller.principal))
+        try:
+            return _loudly(lambda: proofs.record(parsed, principal=caller.principal))
+        except IsolationProofRefused as refused:
+            raise _DispatchProblem(refused.code, refused.detail) from None
 
     def get_isolation_proof(parsed: GetIsolationProofRequest, caller: RpcCaller) -> dict:
         _require(caller, PROOF_READERS, "get_isolation_proof")

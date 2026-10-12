@@ -200,3 +200,62 @@ def test_the_line_end_follows_renewals_to_the_last_version():
     assert lines.end_status("v1") == "WITHDRAWN"
     assert lines.end_status("v3") == "WITHDRAWN"
     assert lines.end_status("unknown") is None
+
+
+def line_of(statuses: dict, *digests: str) -> DeploymentLines:
+    """A version line ``digests[0] -> digests[1] -> ...`` (each later one a renewal of the one before)."""
+    sealed = tuple(SimpleNamespace(digest=digest, version=SimpleNamespace(prior_version=prior))
+                   for prior, digest in zip((None,) + digests, digests))
+    return DeploymentLines(activity=SimpleNamespace(statuses=lambda: statuses),
+                           versions=SimpleNamespace(sealed=lambda: sealed))
+
+
+RENEWED = "sha256:" + "8" * 64
+
+
+def test_retire_withdraws_the_current_version_of_a_renewed_line(tmp_path):         # coordinator ruling, concern 1
+    withdrawals = FakeWithdrawals()
+    lines = line_of({VERSION: "SUPERSEDED", RENEWED: "ACTIVE"}, VERSION, RENEWED)
+    w = authored_world(tmp_path, withdraw=withdrawals, lines=lambda: lines)
+    digest = deployed(w)
+    reply = w.store.retire(retire_request(digest))
+    assert (reply["status"], reply["record"]["state"]) == ("UPDATED", "RETIRED")
+    assert withdrawals.calls == [RENEWED]
+
+
+@pytest.mark.parametrize("status", ["WITHDRAWN", "EXPIRED", "JUDGMENT_ENDED"])
+def test_retire_of_a_line_that_already_ended_withdraws_nothing(tmp_path, status):
+    withdrawals = FakeWithdrawals()
+    lines = line_of({VERSION: "SUPERSEDED", RENEWED: status}, VERSION, RENEWED)
+    w = authored_world(tmp_path, withdraw=withdrawals, lines=lambda: lines)
+    digest = deployed(w)
+    reply = w.store.retire(retire_request(digest))
+    assert (reply["status"], reply["record"]["state"], reply["record"]["reason"]) == (
+        "UPDATED", "RETIRED", "SANDBOX_ERROR")
+    assert withdrawals.calls == []
+
+
+def test_a_renewal_sealed_during_retirement_keeps_the_withdrawal_retryable(tmp_path):
+    def superseded(version_digest):
+        raise DeploymentRefused("VERSION_SUPERSEDED", f"{version_digest} is superseded")
+    lines = line_of({VERSION: "ACTIVE"}, VERSION)
+    w = authored_world(tmp_path, withdraw=superseded, lines=lambda: lines)
+    reply = w.store.retire(retire_request(deployed(w)))
+    assert (reply["status"], reply["code"], reply["retryable"], reply["record"]["state"]) == (
+        "REFUSED", "VERSION_SUPERSEDED", True, "RETIRED")
+
+
+@pytest.mark.parametrize("status, live", [("ACTIVE", RENEWED), ("NOT_STARTED", RENEWED), ("OVER_CAP", RENEWED),
+                                          ("WITHDRAWN", None), ("EXPIRED", None), ("JUDGMENT_ENDED", None)])
+def test_the_live_version_is_the_last_version_while_the_line_trades(status, live):
+    lines = line_of({VERSION: "SUPERSEDED", RENEWED: status}, VERSION, RENEWED)
+    assert lines.live_version(VERSION) == live
+    assert lines.live_version("sha256:" + "9" * 64) is None
+
+
+def test_without_lines_a_superseded_refusal_is_final(tmp_path):
+    def superseded(version_digest):
+        raise DeploymentRefused("VERSION_SUPERSEDED", f"{version_digest} is superseded")
+    w = authored_world(tmp_path, withdraw=superseded)
+    reply = w.store.retire(retire_request(deployed(w)))
+    assert (reply["code"], reply["retryable"], reply["record"]["state"]) == ("VERSION_SUPERSEDED", False, "RETIRED")

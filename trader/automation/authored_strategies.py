@@ -21,7 +21,9 @@ from typing import Any, Callable, Iterator, Mapping, Optional
 
 from trader.authored.keys import authored_key, source_digest
 from trader.automation.ai_deployment_activity import EXPIRED as VERSION_EXPIRED
-from trader.automation.ai_deployment_activity import JUDGMENT_ENDED, SUPERSEDED, WITHDRAWN
+from trader.automation.ai_deployment_activity import (
+    ACTIVE, JUDGMENT_ENDED, NOT_STARTED, OVER_CAP, SUPERSEDED, WITHDRAWN,
+)
 from trader.automation.ai_deployment_versions import WITHDRAWAL_ENTRY_IN_FLIGHT
 from trader.automation.ai_deployments import DeploymentRefused
 from trader.automation.authored_config import AuthoredStrategiesConfig
@@ -258,6 +260,10 @@ def withdraw_with(versions: Any) -> Callable[[str], bool]:
     return withdraw
 
 
+VERSION_SUPERSEDED = "VERSION_SUPERSEDED"          # SP2c withdraw's refusal of a renewed version
+# Version statuses of a line that has not ended: a retirement withdraws its last version.
+_TRADING_STATUSES = frozenset({ACTIVE, NOT_STARTED, OVER_CAP})
+
 # Ruling 11: where a DEPLOYED record goes when its version line ends.
 _LINE_ENDINGS: Mapping[str, tuple[AuthoredState, str]] = MappingProxyType({
     WITHDRAWN: (RETIRED, OWNER_RETIRED),
@@ -303,6 +309,14 @@ class DeploymentLines:
         self._versions = versions
 
     def end_status(self, version_digest: str) -> Optional[str]:
+        return self._last_version(version_digest)[1]
+
+    def live_version(self, version_digest: str) -> Optional[str]:
+        """The line's last version while it may still trade; None once the line has ended or is unknown."""
+        last, status = self._last_version(version_digest)
+        return last if status in _TRADING_STATUSES else None
+
+    def _last_version(self, version_digest: str) -> tuple[str, Optional[str]]:
         statuses = self._activity.statuses()
         renewed_by = {sealed.version.prior_version: sealed.digest for sealed in self._versions.sealed()
                       if sealed.version.prior_version is not None}
@@ -310,7 +324,7 @@ class DeploymentLines:
         while statuses.get(current) == SUPERSEDED and current in renewed_by and current not in seen:
             seen.add(current)
             current = renewed_by[current]
-        return statuses.get(current)
+        return current, statuses.get(current)
 
 
 class _DigestLocks:
@@ -444,17 +458,30 @@ class AuthoredStrategyStore:
             status, record = self._db.transaction(write)
         except AuthoredRefused as refused:
             return refused.reply()
-        if record.deployment_version is not None and self._withdraw is not None:
+        version = self._version_to_withdraw(record)
+        if version is not None and self._withdraw is not None:
             try:
-                self._withdraw(record.deployment_version)
+                self._withdraw(version)
             except DeploymentRefused as refused:
                 logger.error("authored strategy %s is RETIRED; withdrawing %s refused: %s", record.digest,
-                             record.deployment_version, refused)
+                             version, refused)
                 not_withdrawn = AuthoredRefused(
                     refused.code, f"the record is RETIRED; its version is not withdrawn yet: {refused.message}",
-                    retryable=refused.code == WITHDRAWAL_ENTRY_IN_FLIGHT)
+                    retryable=self._withdrawal_retryable(refused.code))
                 return {**not_withdrawn.reply(), "record": record.to_json()}
         return _reply(status, record)
+
+    def _withdrawal_retryable(self, code: str) -> bool:
+        """A resend finds a newer last version only through ``lines``; without them it would repeat forever."""
+        return code == WITHDRAWAL_ENTRY_IN_FLIGHT or (code == VERSION_SUPERSEDED and self._lines is not None)
+
+    def _version_to_withdraw(self, record: AuthoredRecord) -> Optional[str]:
+        """The line's current version, not the registered one: a renewal may have replaced it (the trader does
+        not rely on Plan 4 never renewing an authored line). None when the line already ended. Without
+        ``lines`` the registered version is the only one known."""
+        if record.deployment_version is None or self._lines is None:
+            return record.deployment_version
+        return self._lines().live_version(record.deployment_version)
 
     def refresh(self) -> None:
         """Ruling 11: a SHADOW or DEPLOYED record leaves the count when its window ends. Other stores are read

@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from tests.authored.fake_sandbox import FakeSandbox, caller_source
+from tests.authored.fake_sandbox import FakeSandbox, caller_source, fault
 from trader.objects import Action, BarSize
 from trader.sandbox.protocol import SANDBOX_DIGEST_MISMATCH, SANDBOX_ERROR
 from trader.strategy.authored_runtime import (DIGEST_ALARM, ISOLATION_ALARM, SANDBOX_FAULT_ALARM,
@@ -458,3 +458,60 @@ def test_the_binding_is_the_deployments_digest():
     assert strategy.authored_binding_intact()
     strategy.ai_source_digest = "sha256:" + "0" * 64
     assert not strategy.authored_binding_intact()
+
+
+# Final review I1: OPEN answers before any session reported a build, so the build is read again on a fault there.
+
+REBUILT = "e4f5a6b-20261012T090000Z"
+
+
+def test_an_open_fault_on_a_rebuilt_sandbox_is_an_outage_not_a_retirement(caplog):
+    sandbox, faults = live_sandbox(), []
+    strategy = live(sandbox, faults, proven={sandbox.image_digest})
+
+    def restart_then_refuse(*args, **kwargs):
+        sandbox.image_digest = REBUILT                       # restarted on build B, never proven
+        raise fault(SANDBOX_ERROR)                           # B's checker refuses the stored file at OPEN
+    sandbox.open_session = restart_then_refuse
+    with caplog.at_level(logging.ERROR):
+        assert strategy.on_prices(bars(5)) is None
+    assert faults == [] and SANDBOX_UNAVAILABLE_ALARM in caplog.text
+    assert strategy.state == StrategyState.RUNNING and strategy.authored_binding_intact()
+
+
+def test_an_open_fault_whose_second_ping_fails_is_an_outage_not_a_retirement(caplog):
+    sandbox, faults = live_sandbox(), []
+    strategy = live(sandbox, faults)
+
+    def refuse_then_vanish(*args, **kwargs):
+        sandbox.unavailable = True
+        raise fault(SANDBOX_DIGEST_MISMATCH)
+    sandbox.open_session = refuse_then_vanish
+    with caplog.at_level(logging.ERROR):
+        assert strategy.on_prices(bars(5)) is None
+    assert faults == [] and SANDBOX_UNAVAILABLE_ALARM in caplog.text and strategy.state == StrategyState.RUNNING
+
+
+def test_an_open_fault_on_the_same_build_still_retires(caplog):
+    sandbox, faults = live_sandbox(), []
+    strategy = live(sandbox, faults)
+
+    def refuse(*args, **kwargs):
+        raise fault(SANDBOX_ERROR)
+    sandbox.open_session = refuse
+    with caplog.at_level(logging.ERROR):
+        assert strategy.on_prices(bars(5)) is None
+    assert faults == [(strategy.digest, SANDBOX_ERROR)] and SANDBOX_FAULT_ALARM in caplog.text
+    assert strategy.state == StrategyState.DISABLED
+
+
+def test_a_fault_answered_to_ping_is_an_outage_not_a_retirement(caplog):
+    sandbox, faults = live_sandbox(), []
+    strategy = live(sandbox, faults)
+
+    def faulting_ping():
+        raise fault(SANDBOX_ERROR)
+    sandbox.ping = faulting_ping
+    with caplog.at_level(logging.ERROR):
+        assert strategy.on_prices(bars(5)) is None
+    assert faults == [] and SANDBOX_UNAVAILABLE_ALARM in caplog.text and strategy.state == StrategyState.RUNNING

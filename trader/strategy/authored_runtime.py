@@ -204,10 +204,37 @@ class AuthoredLiveStrategy(Strategy):
         return decisions[-1] if decisions else None
 
     def _open_day_session(self, day: dt.date) -> _DaySession:
-        self._require_proven(self._client.ping().image_digest)          # no OPEN (no class load) on an unproven build
-        session = self._client.open_session(self.digest, self._class_name, self._params, self._bar_size,
-                                            list(self._bound_conids))
+        build = self._ping_build()
+        self._require_proven(build)                                     # no OPEN (no class load) on an unproven build
+        try:
+            session = self._client.open_session(self.digest, self._class_name, self._params, self._bar_size,
+                                                list(self._bound_conids))
+        except SandboxFault as fault:
+            self._require_same_build(build, fault)
+            raise
         return _DaySession(session, {conid: BarStream(session, conid) for conid in self._bound_conids}, day)
+
+    def _ping_build(self) -> str:
+        """A fault answered to PING is not the strategy's: no session of it exists yet."""
+        try:
+            return self._client.ping().image_digest
+        except SandboxFault as fault:
+            raise SandboxUnavailable(f"PING answered {fault.code}") from fault
+
+    def _require_same_build(self, build: str, fault: SandboxFault) -> None:
+        """Final review I1 (research ruling F7b): a fault answered to OPEN came before any session reported its
+        build. A sandbox restarted onto another build must not retire the file, so the build is read again and a
+        change, or no answer, is an outage."""
+        if fault.code not in STRATEGY_FAULT_CODES:
+            return
+        try:
+            build_now = self._ping_build()
+        except _RETRYABLE_ERRORS as exc:
+            raise SandboxUnavailable(f"OPEN answered {fault.code} and the build cannot be read again: "
+                                     f"{type(exc).__name__}: {exc}") from fault
+        if build_now != build:
+            raise SandboxUnavailable(f"OPEN answered {fault.code} while the sandbox moved from build {build} "
+                                     f"to {build_now}") from fault
 
     def _require_proven(self, build: Any) -> None:
         """A gate that raises counts as unproven: fail closed."""

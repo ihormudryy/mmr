@@ -464,7 +464,6 @@ def test_an_authored_instance_that_keeps_crashing_is_re_enabled_with_a_growing_w
                                                          trader_command=world.command, now=lambda: clock[0])
     reconcile(world, [authored_active(world.sandbox)])
     instance = instance_of(world)
-    world.rt._load_enabled = lambda name: True                           # an operator enabled it once
     world.rt._maybe_check_exits = lambda *args: None
     frames = iter(bars(n) for n in range(3, 40))
     world.rt._strategy_frame = lambda conid, bar_size: next(frames)
@@ -495,6 +494,15 @@ def test_an_authored_instance_that_keeps_crashing_is_re_enabled_with_a_growing_w
     world.sandbox.open_sessions[0].bar = broken_open                     # the open session now breaks
     tick()
     assert after(59) == StrategyState.ERROR and after(2) == StrategyState.RUNNING
+
+
+def test_an_authored_instance_an_operator_disabled_is_not_re_enabled_after_an_error(world):
+    reconcile(world, [authored_active(world.sandbox)])
+    instance = instance_of(world)
+    world.rt._load_enabled = lambda name: False
+    instance.state = StrategyState.ERROR
+    world.rt._maybe_recover_from_instrument_error(instance)
+    assert instance.state == StrategyState.ERROR
 
 
 # Final review minor: a signal is dispatched only while the build it was decided on still has a passing proof.

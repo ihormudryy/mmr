@@ -845,9 +845,13 @@ class StrategyRuntime():
         strategy books recover without a manual restart."""
         if strategy.state != StrategyState.ERROR:
             return
-        if isinstance(strategy, AuthoredLiveStrategy) and not strategy.may_recover():
-            return          # each re-enable reopens a session and replays its warm-up: wait after a crash
-        if self._load_enabled(strategy.name) is not True:
+        if isinstance(strategy, AuthoredLiveStrategy):
+            if not strategy.may_recover():
+                return      # each re-enable reopens a session and replays its warm-up: wait after a crash
+            # Loaded enabled unless an operator disabled it (_build_authored_instance), so it recovers the same way.
+            if self._load_enabled(strategy.name) is False:
+                return
+        elif self._load_enabled(strategy.name) is not True:
             return
         strategy.enable()
         logging.info(

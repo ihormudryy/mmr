@@ -12,6 +12,7 @@ that matches the default action (runc skips it; crun may refuse it) -- ruling 16
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -19,10 +20,22 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT = ROOT / "config_defaults" / "docker-default-seccomp.json"
 OUT = ROOT / "config_defaults" / "sandbox-seccomp.json"
 DENIED = {"ptrace", "process_vm_readv", "process_vm_writev", "kcmp", "pidfd_open"}
+UPSTREAM_SHA = "9c1025c88ccaa517b648da571961838744ea2137f176bfe6a48b21294cae9c76"
+
+
+def read_pinned_default() -> dict:
+    raw = DEFAULT.read_bytes()
+    actual = hashlib.sha256(raw).hexdigest()
+    if actual != UPSTREAM_SHA:
+        raise SystemExit(f"{DEFAULT} sha256 is {actual}, expected {UPSTREAM_SHA}: do not hand-edit the vendored file")
+    return json.loads(raw)
 
 
 def build() -> dict:
-    profile = json.loads(DEFAULT.read_text())
+    profile = read_pinned_default()
+    found = {name for rule in profile["syscalls"] for name in rule["names"]} & DENIED
+    if found != DENIED:
+        raise SystemExit(f"upstream no longer names {sorted(DENIED - found)}: the removal list is stale")
     kept = []
     for rule in profile["syscalls"]:
         names = [name for name in rule["names"] if name not in DENIED]
@@ -33,8 +46,12 @@ def build() -> dict:
     return profile
 
 
+def render() -> str:
+    return json.dumps(build(), indent=2, sort_keys=False) + "\n"
+
+
 def main() -> None:
-    OUT.write_text(json.dumps(build(), indent=2, sort_keys=False) + "\n")
+    OUT.write_text(render())
 
 
 if __name__ == "__main__":

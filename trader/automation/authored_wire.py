@@ -24,7 +24,7 @@ MAX_DETAIL_CHARS = 500
 MAX_CHECKS = 64
 CHECK_NAME = re.compile(r"^[a-z0-9_.:-]{1,64}$")
 # Plan 2 ruling 1: the sandbox image's identity is its build id (<git sha>-<UTC time>), baked into the image.
-IMAGE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$")
+IMAGE_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}\Z")
 Number = Union[StrictInt, StrictFloat]
 
 

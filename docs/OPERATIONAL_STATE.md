@@ -378,7 +378,8 @@ message with no traceback.
 - Ruling 3: `RLIMIT_AS` is the address space at fork plus 256 MiB, not an absolute 256 MB (that would fail every pandas child).
 - Ruling 4: `RLIMIT_CPU` is a 4 h backstop. The 2 s wall time per step is the real limit.
 - Ruling 23: `noexec` on `/tmp` uses the compose short tmpfs string form. If a runtime ignores it, `noexec` rests on non-root, no-new-privileges and seccomp.
-- Ruling 22: Plan 3 must mount `mmr_authored_strategies` at `/store` read-write on `trader`. Until then the store volume has no writer.
+- Ruling 22 (done in SP3 Plan 3): the `trader` mounts `mmr_authored_strategies` read-write at `/store` (`MMR_AUTHORED_STORE_DIR=/store`) and is the only writer. The sandbox mounts it read-only.
+- Store temp files: a trader crash in the middle of a store write can leave `.<hex>.py.<random>.tmp` files in `/store`. They are harmless: nothing reads them, and the sandbox only opens `<digest>.py`. Delete them when you like.
 
 **Known limits.**
 - Children share one network namespace, so abstract Unix sockets could connect two children (ruling 21). The static checker is the layer that stops authored code from using sockets. Not fixed.

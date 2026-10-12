@@ -2,6 +2,8 @@ import os
 import socket
 import struct
 import sys
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -511,6 +513,128 @@ def test_a_closed_pipe_is_a_child_error():
 def test_the_parent_refuses_an_out_of_contract_child_reply(reply):
     with pytest.raises(ChildError):
         child_module.signal_from_reply(reply)
+
+
+def _trickle(sock, length=100, every_s=0.05):
+    """Send a frame header, then one body byte at a time: each recv returns quickly, the frame never ends."""
+    def run():
+        try:
+            sock.sendall(struct.pack(">I", length))
+            for _ in range(length):
+                time.sleep(every_s)
+                sock.sendall(b" ")
+        except OSError:
+            pass
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
+
+
+def test_a_trickling_peer_cannot_stretch_the_reply_deadline():
+    # Review fix round 1 (ruling 6): one deadline for the whole frame, not one per recv.
+    left, right = socket.socketpair()
+    with left, right:
+        _trickle(left)
+        started = time.monotonic()
+        with pytest.raises(ChildError, match="timed out"):
+            child_module.recv_frame(right, timeout_s=0.3)
+        assert time.monotonic() - started < 0.3 + 0.2
+
+
+def test_a_silent_peer_times_out():
+    left, right = socket.socketpair()
+    with left, right:
+        started = time.monotonic()
+        with pytest.raises(ChildError, match="timed out"):
+            child_module.recv_frame(right, timeout_s=0.2)
+        assert time.monotonic() - started < 0.2 + 0.2
+        assert right.gettimeout() is None
+
+
+def test_a_bar_reply_has_one_deadline_too():
+    left, right = socket.socketpair()
+    with left, right:
+        handle = child_module._ForkedChild(pid=-1, sock=right, reply_timeout_s=0.3)
+        _trickle(left)
+        started = time.monotonic()
+        with pytest.raises(ChildError, match="timed out"):
+            handle.send_bar(C1, T0, BAR)
+        assert time.monotonic() - started < 0.3 + 0.2
+
+
+def test_a_long_child_detail_is_truncated():
+    with pytest.raises(ChildError) as caught:
+        child_module.signal_from_reply({"ok": False, "detail": "x" * 10_000})
+    assert len(caught.value.detail) <= child_module.MAX_CHILD_DETAIL_CHARS
+
+
+def test_a_huge_integer_bar_value_is_a_fault():
+    runtime = _runtime()
+    runtime.load()
+    with pytest.raises(ChildError, match="close"):
+        runtime.on_bar(C1, T0, {**BAR, "close": 10 ** 400})
+
+
+def _serve_in_thread(spec):
+    parent, child = socket.socketpair()
+    result = {}
+    thread = threading.Thread(target=lambda: result.setdefault("code", child_module._serve_session(spec, child)),
+                              daemon=True)
+    thread.start()
+    return parent, child, thread, result
+
+
+def _spec(**overrides):
+    fields = dict(source=GOOD, class_name="Counter", params={"N": 1.0}, lookback=3, conids=(C1,),
+                  slot_uid=20001, slot_dir="/nonexistent", child_mem_bytes=1)
+    return child_module.SpawnSpec(**{**fields, **overrides})
+
+
+@pytest.mark.parametrize("bar_request", [
+    {"type": "BAR", "conid": C2, "t": T0.isoformat(), "ohlcv": BAR},
+    {"type": "BAR", "conid": C1, "t": "not a time", "ohlcv": BAR},
+])
+def test_the_child_exits_non_zero_after_a_bar_fault(bar_request):
+    parent, child, thread, result = _serve_in_thread(_spec())
+    with parent, child:
+        assert child_module.recv_frame(parent, timeout_s=5) == {"ok": True}
+        child_module.send_frame(parent, bar_request)
+        assert child_module.recv_frame(parent, timeout_s=5)["ok"] is False
+        thread.join(5)
+    assert result["code"] == child_module._EXIT_CHILD_CRASHED
+
+
+def test_the_child_exits_non_zero_after_a_load_fault():
+    parent, child, thread, result = _serve_in_thread(_spec(class_name="Other"))
+    with parent, child:
+        assert child_module.recv_frame(parent, timeout_s=5)["ok"] is False
+        thread.join(5)
+    assert result["code"] == child_module._EXIT_CHILD_CRASHED
+
+
+def test_the_child_exits_zero_on_close():
+    parent, child, thread, result = _serve_in_thread(_spec())
+    with parent, child:
+        assert child_module.recv_frame(parent, timeout_s=5) == {"ok": True}
+        child_module.send_frame(parent, {"type": "CLOSE"})
+        thread.join(5)
+    assert result["code"] == 0
+
+
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_a_failed_privilege_drop_reports_its_code_and_exits_71():
+    # A plain fork (no privileges): uid 0 is refused before any syscall, so no authored code runs.
+    parent, child = socket.socketpair()
+    pid = os.fork()
+    if pid == 0:
+        parent.close()
+        child_module._run_forked_child(_spec(slot_uid=0), child)   # always os._exit
+    child.close()
+    with parent:
+        reply = child_module.recv_frame(parent, timeout_s=5)
+    _, status = os.waitpid(pid, 0)
+    assert reply == {"ok": False, "detail": "PRIVILEGE_DROP_FAILED"}
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == child_module._EXIT_DROP_FAILED
 
 
 def test_the_parent_reads_a_good_child_reply_and_a_child_fault():

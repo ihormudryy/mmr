@@ -12,6 +12,7 @@ import os
 import resource
 import socket
 import struct
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import MappingProxyType, SimpleNamespace
@@ -29,6 +30,7 @@ SBXCHILD_GID = 20000                      # group sbxchild
 SLOT_UIDS = range(20001, 20008)           # seven slots: live 3 + research 4 (ruling 26)
 _EXIT_DROP_FAILED = 71                    # EX_OSERR: the privilege drop did not take
 _EXIT_CHILD_CRASHED = 70                  # EX_SOFTWARE: any other failure in the child
+MAX_CHILD_DETAIL_CHARS = 300              # a child's fault text is untrusted: bounded before it reaches a log
 
 
 class ChildError(Exception):
@@ -126,9 +128,15 @@ def _bar_values(ohlcv: Any) -> dict[str, float]:
     values = {}
     for column in OHLCV_COLUMNS:
         value = ohlcv.get(column)
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-            raise ChildError(f"bar {column} must be a finite number, got {value!r}")
-        values[column] = float(value)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ChildError(f"bar {column} must be a number, got {type(value).__name__}")
+        try:
+            number = float(value)
+        except OverflowError as exc:
+            raise ChildError(f"bar {column} is too large") from exc
+        if not math.isfinite(number):
+            raise ChildError(f"bar {column} must be finite, got {number!r}")
+        values[column] = number
     return values
 
 
@@ -223,13 +231,22 @@ def send_frame(sock: socket.socket, obj: Mapping[str, Any]) -> None:
         raise ChildError(exc.detail) from exc
 
 
-def recv_frame(sock: socket.socket) -> dict:
-    """One frame from the other end, which may be hostile: capped, and always a JSON object."""
-    (length,) = _FRAME_HEADER.unpack(_recv_exact(sock, _FRAME_HEADER.size))
-    if length > MAX_FRAME_BYTES:
-        raise ChildError(f"child frame of {length} bytes over the {MAX_FRAME_BYTES} cap")
+def recv_frame(sock: socket.socket, timeout_s: float | None = None) -> dict:
+    """One frame from the other end, which may be hostile: capped, and always a JSON object.
+
+    ``timeout_s`` bounds the whole frame with one deadline (ruling 6): a peer that trickles one byte
+    at a time cannot stretch it, as it could a per-recv socket timeout."""
+    deadline = None if timeout_s is None else time.monotonic() + timeout_s
     try:
-        obj = json.loads(_recv_exact(sock, length))
+        (length,) = _FRAME_HEADER.unpack(_recv_exact(sock, _FRAME_HEADER.size, deadline))
+        if length > MAX_FRAME_BYTES:
+            raise ChildError(f"child frame of {length} bytes over the {MAX_FRAME_BYTES} cap")
+        body = _recv_exact(sock, length, deadline)
+    finally:
+        if deadline is not None:
+            sock.settimeout(None)
+    try:
+        obj = json.loads(body)
     except (ValueError, RecursionError) as exc:
         raise ChildError(f"child frame is not JSON: {type(exc).__name__}") from exc
     if not isinstance(obj, dict):
@@ -237,10 +254,18 @@ def recv_frame(sock: socket.socket) -> dict:
     return obj
 
 
-def _recv_exact(sock: socket.socket, count: int) -> bytes:
+def _recv_exact(sock: socket.socket, count: int, deadline: float | None) -> bytes:
     chunks = []
     while count:
-        chunk = sock.recv(count)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ChildError("child reply timed out")
+            sock.settimeout(remaining)
+        try:
+            chunk = sock.recv(count)
+        except TimeoutError as exc:          # socket.timeout is TimeoutError since 3.10
+            raise ChildError("child reply timed out") from exc
         if not chunk:
             raise ChildError("child pipe closed")
         chunks.append(chunk)
@@ -254,7 +279,7 @@ def _raise_for_child_fault(reply: Mapping[str, Any], fallback: str) -> None:
         return
     detail = reply.get("detail")
     if ok is False and isinstance(detail, str):
-        raise ChildError(detail)
+        raise ChildError(detail[:MAX_CHILD_DETAIL_CHARS])
     raise ChildError(fallback)
 
 
@@ -302,8 +327,9 @@ class Spawner(Protocol):
 class ForkSpawner:
     """Fork one child per session. Production always uses this (ruling 12)."""
 
-    def __init__(self, open_timeout_s: float = 2.0):
+    def __init__(self, open_timeout_s: float = 2.0, bar_timeout_s: float = 2.0):
         self._open_timeout = open_timeout_s   # ruling 6: class load is bounded too
+        self._bar_timeout = bar_timeout_s     # backstop; the server's 2 s wall timeout also kills the child
 
     def spawn(self, spec: SpawnSpec) -> ChildHandle:
         parent_sock, child_sock = socket.socketpair()
@@ -311,15 +337,13 @@ class ForkSpawner:
         if pid == 0:
             _run_forked_child(spec, child_sock)   # never returns
         child_sock.close()
-        parent_sock.settimeout(self._open_timeout)   # a child that hangs in load must not block the server
-        try:
-            _raise_for_child_fault(recv_frame(parent_sock), "child load reply is out of contract")
-        except (ChildError, OSError) as exc:          # socket.timeout is an OSError
+        try:   # a child that hangs or trickles in load must not block the server
+            _raise_for_child_fault(recv_frame(parent_sock, self._open_timeout), "child load reply is out of contract")
+        except (ChildError, OSError) as exc:
             _kill_and_reap(pid)
             parent_sock.close()
             raise ChildError(getattr(exc, "detail", f"child load failed: {exc}")) from exc
-        parent_sock.settimeout(None)
-        return _ForkedChild(pid=pid, sock=parent_sock)
+        return _ForkedChild(pid=pid, sock=parent_sock, reply_timeout_s=self._bar_timeout)
 
 
 def _run_forked_child(spec: SpawnSpec, sock: socket.socket) -> None:
@@ -327,16 +351,30 @@ def _run_forked_child(spec: SpawnSpec, sock: socket.socket) -> None:
     code = _EXIT_CHILD_CRASHED
     try:
         close_fds_except({sock.fileno()})
-        _drop_privileges(spec)
-        _set_child_rlimits(spec)
-        _serve_session(spec, sock)
-        code = 0
-    except _PrivilegeDropFailed:
-        code = _EXIT_DROP_FAILED
+        try:
+            _drop_privileges(spec)
+        except Exception:  # noqa: BLE001 — any failure here leaves the child privileged
+            _send_fault_quietly(sock, "PRIVILEGE_DROP_FAILED")
+            code = _EXIT_DROP_FAILED
+            return
+        try:
+            _set_child_rlimits(spec)
+        except Exception:  # noqa: BLE001
+            _send_fault_quietly(sock, "CHILD_LIMITS_FAILED")
+            return
+        code = _serve_session(spec, sock)
     except BaseException:  # noqa: BLE001 — a crashed child must not unwind into the supervisor
         code = _EXIT_CHILD_CRASHED
     finally:
         os._exit(code)
+
+
+def _send_fault_quietly(sock: socket.socket, detail: str) -> None:
+    """Tell the parent why the child stops, when the pipe still works. Only a fixed code, no other detail."""
+    try:
+        send_frame(sock, {"ok": False, "detail": detail})
+    except (ChildError, OSError):
+        pass
 
 
 def close_fds_except(keep: set[int]) -> None:
@@ -356,6 +394,10 @@ def close_fds_except(keep: set[int]) -> None:
 
 
 class _PrivilegeDropFailed(Exception):
+    pass
+
+
+class _ProcStatusUnreadable(Exception):
     pass
 
 
@@ -394,10 +436,12 @@ def _status_field(name: str) -> str:
         for line in status:
             if line.startswith(f"{name}:"):
                 return line.split(":", 1)[1].strip()
-    raise _PrivilegeDropFailed(f"/proc/self/status has no {name}")
+    raise _ProcStatusUnreadable(f"/proc/self/status has no {name}")
 
 
-def _serve_session(spec: SpawnSpec, sock: socket.socket) -> None:
+def _serve_session(spec: SpawnSpec, sock: socket.socket) -> int:
+    """Load, then answer bars until CLOSE or the parent goes away. Returns the child's exit code:
+    0 for a normal end, non-zero after a load or bar fault."""
     try:
         runtime = ChildRuntime(source=spec.source, class_name=spec.class_name,
                                params=spec.params, lookback=spec.lookback, conids=spec.conids,
@@ -405,20 +449,20 @@ def _serve_session(spec: SpawnSpec, sock: socket.socket) -> None:
         runtime.load()
     except ChildError as exc:
         send_frame(sock, {"ok": False, "detail": exc.detail})
-        return
+        return _EXIT_CHILD_CRASHED
     send_frame(sock, {"ok": True})
     while True:
         try:
             request = recv_frame(sock)
         except ChildError:
-            return
+            return 0
         if request.get("type") == "CLOSE":
-            return
+            return 0
         try:
             payload = runtime.on_bar(*_bar_request(request))
         except ChildError as exc:
             send_frame(sock, {"ok": False, "detail": exc.detail})
-            return
+            return _EXIT_CHILD_CRASHED
         send_frame(sock, {"ok": True, "signal": payload})
 
 
@@ -444,12 +488,13 @@ def _kill_and_reap(pid: int) -> None:
 class _ForkedChild:
     pid: int
     sock: socket.socket
+    reply_timeout_s: float
 
     def send_bar(self, conid: int, t: datetime, ohlcv: Mapping[str, float]) -> dict:
         try:
             send_frame(self.sock, {"type": "BAR", "conid": conid,
                                    "t": t.astimezone(timezone.utc).isoformat(), "ohlcv": dict(ohlcv)})
-            return signal_from_reply(recv_frame(self.sock))
+            return signal_from_reply(recv_frame(self.sock, self.reply_timeout_s))
         except OSError as exc:   # the child died or was killed mid-bar
             raise ChildError(f"child pipe failed: {exc}") from exc
 

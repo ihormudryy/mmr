@@ -51,7 +51,8 @@ method owns its names and wire shape; the others use them exactly as written her
   `mmr_authored_strategies`, `mmr_sandbox_live`, `mmr_sandbox_research`, the baked `/etc/mmr-build-id`.
   - Constants in `trader/sandbox/protocol.py`: `LIVE_SOCKET = "/run/sandbox-live/sandbox.sock"`,
     `RESEARCH_SOCKET = "/run/sandbox-research/sandbox.sock"`, `STORE_DIR = "/store"`, error codes
-    `SANDBOX_ERROR`, `SANDBOX_BUSY`, `SANDBOX_DIGEST_MISMATCH`, `SANDBOX_BAD_REQUEST`, `PROTOCOL_VERSION = 1`,
+    `SANDBOX_ERROR`, `SANDBOX_BUSY`, `SANDBOX_UNAVAILABLE` (Plan 2 ruling 34), `SANDBOX_DIGEST_MISMATCH`,
+    `SANDBOX_BAD_REQUEST`, `PROTOCOL_VERSION = 1`,
     `MAX_SESSION_CONIDS = 20`, `PROBE_CONID = 1`, `BUILD_ID_RE`.
   - In `trader/sandbox/supervisor.py`: `Supervisor(*, spawners, pool_sizes, store_dir, image_digest, posture)`,
     `LIVE_POOL_SIZE = 3`, `RESEARCH_POOL_SIZE = 4`, `MAX_CONIDS_PER_SESSION = {"live": 20, "research": 1}`.
@@ -63,7 +64,7 @@ method owns its names and wire shape; the others use them exactly as written her
     conids: Sequence[int]) -> SandboxSession`, `open_probe(kind, name) -> SandboxSession`;
     `SandboxSession.bar(conid: int, t: datetime, open, high, low, close, volume) -> Decision | None`,
     `SandboxSession.conids`, `SandboxSession.close()`; errors `SandboxUnavailable(Exception)` (busy, unreachable,
-    timeout on connect), `SandboxFault(Exception)` (attribute `code`: `SANDBOX_ERROR` or
+    timeout on connect, `SANDBOX_UNAVAILABLE`), `SandboxFault(Exception)` (attribute `code`: `SANDBOX_ERROR` or
     `SANDBOX_DIGEST_MISMATCH`) and `SandboxProtocolError(Exception)` (`SANDBOX_BAD_REQUEST`).
   - `isolation_checks.py`: `run_isolation_checks(client: SandboxClient) -> IsolationResult`
     (`passed: bool`, `image_digest: str`, `checks: tuple[CheckResult, ...]`; `CheckResult(name, passed, detail)`),
@@ -170,7 +171,7 @@ Extra controller decisions (made while applying the above; the safer option each
 Security:
 
 - Plan 2 ruling 1 / D2 (spec 14): the image identity is a build id baked at `docker.sh -b`; a plain `docker build` leaves it `unset` and the sandbox refuses to start.
-- Plan 2 ruling 2 (spec 14): `CAP_CHOWN` at startup only, to give each slot its own 0700 directory, then dropped; fallback without it is no writable directory.
+- Plan 2 ruling 2 (spec 14; owner confirmed 2026-10-12): `CAP_CHOWN` at startup only, to give each slot its own 0700 directory, then dropped; fallback without it is no writable directory.
 - Plan 2 ruling 3 (spec 14): `RLIMIT_AS` = address space at fork + 256 MiB (an absolute 256 MB fails every pandas child).
 - Plan 2 ruling 4: `RLIMIT_CPU` 4 h per session as a backstop; the 2 s wall per bar is the real limit.
 - Plan 2 ruling 11 (spec 14): `OPEN_PROBE` is the only path that skips the static check, and only for files in the read-only image.
@@ -178,7 +179,7 @@ Security:
 - Plan 2 ruling 23: `noexec` on `/tmp` relies on the compose short tmpfs syntax; if a runtime ignores it, `noexec` rests on non-root, no-new-privileges and seccomp.
 - Plan 2 ruling 24: the fork-with-threads hazard in the asyncio supervisor is accepted as low risk.
 - Plan 2 ruling 26 / D1 (spec 14): one live child serves all conids of one deployment; a fault on any conid ends the whole session.
-- Plan 2 ruling 27 / D2 / C3 (review r1 #3): no `docker inspect`; the proof checks posture incl. read-only root and pids 64; nine hostile files incl. open-socket; a hostile check passes only if the escape OPENED, faulted at BAR with its expected marker, and a neighbouring benign session and PING survive.
+- Plan 2 ruling 27 / D2 / C3 (review r1 #3): no `docker inspect`; the proof checks posture incl. read-only root and pids 64; nine hostile files incl. open-socket; a hostile check passes only if the escape OPENED, faulted at BAR with its expected marker, and a neighbouring benign session and PING survive; the proof also runs the probes for the custom seccomp profile (ptrace), the child's slot uid and caps, its descriptors and the slot wipe in a real child (final review, 2026-10-12).
 - Plan 2 ruling 28 (review r1 #2): a slot is wiped by a helper running as the slot uid, so the serving supervisor keeps only SETUID, SETGID and KILL; a failed wipe quarantines the slot.
 - Plan 2 ruling 29 / owner ruling 2026-10-11: `OPENED` reports the session's build; `PONG` reports `live_open`; `prove-isolation` refuses (`LIVE_SESSIONS_OPEN`) while any live session is open.
 - Plan 2 ruling 30 (review r1 #8, r2 #2): the full-stack runner starts only `sandbox` and `fullstack-tests` (never ib-gateway), under `env -i` (no operator broker/provider variables), with a test-only image tag (never `mmr:latest`), project `mmr-sbxtest` and its own volumes, no published host port, a throwaway `HOME` with copied config and test-only keys, no `.env`. The render guard inspects every service's environment and image and refuses before `up` on any ib-gateway service, credential variable with a value, production image tag, published port, live-config bind or `.env`.
@@ -187,7 +188,8 @@ Security:
 - Plan 2 ruling 7: one session per connection; the child is killed when the caller's connection closes, so a crashed caller cannot leak a slot.
 - Plan 2 ruling 8: new code `SANDBOX_BAD_REQUEST` for caller mistakes (client: `SandboxProtocolError`); it is neither availability nor a strategy fault.
 - Plan 2 ruling 9: a missing store file or a class that differs from the file's class is `SANDBOX_DIGEST_MISMATCH`; a static rejection at `OPEN` is `SANDBOX_ERROR` with `AUTHORED_STATIC_REJECTED:<rule>`.
-- Plan 2 ruling 10: `PONG` and `SandboxInfo` carry `image_digest`, `boot_id`, `pid`, `pool`, `free` and `posture` (additive to the index).
+- Plan 2 ruling 10: `PONG` carries `image_digest`, `boot_id`, `pid`, `pool`, `free`, `size`, `live_open` and `posture`; `SandboxInfo` carries the same fields except `pid` (additive to the index).
+- Plan 2 ruling 34 (final review, controller ruling 2026-10-12, spec 8): a sandbox-side failure (fork or socketpair, the child's privilege drop, rlimits or setup, an internal error) is the new code `SANDBOX_UNAVAILABLE`, which the client raises as `SandboxUnavailable`; only a fault the strategy caused stays `SANDBOX_ERROR` or `SANDBOX_DIGEST_MISMATCH`.
 - Plan 2 ruling 12: the fake child is a `Supervisor` test argument only; the service always uses `ForkSpawner` and no option, env var or argument can change it; a test pins that no `trader/` module imports `tests`.
 - Plan 2 ruling 13: a failed tmpfs wipe quarantines the slot (never reused, logged at ERROR, `PONG.free` drops).
 - Plan 2 ruling 14: `init: true` and `ipc: none`; `entrypoint` replaces `docker-entrypoint.sh`.

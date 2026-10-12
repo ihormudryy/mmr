@@ -50,7 +50,9 @@ def test_a_frame_round_trips():
 
 
 def test_a_frame_over_the_cap_is_refused_on_read():
-    big = p.encode_frame({"v": 1, "pad": "x" * (p.MAX_FRAME_BYTES + 10)})
+    import struct
+
+    big = struct.pack(">I", p.MAX_FRAME_BYTES + 10) + b"x" * (p.MAX_FRAME_BYTES + 10)
 
     async def run():
         reader, writer = await _pipe()
@@ -126,7 +128,7 @@ def test_probe_request_parses_and_refuses_a_traversal_name():
     assert exc.value.code == p.SANDBOX_BAD_REQUEST
 
 
-def test_bar_request_requires_increasing_numbers():
+def test_bar_request_parses_and_refuses_a_bad_time():
     req = p.parse_request({"v": 1, "type": "BAR", "session": "s1", "conid": 101,
                            "t": "2024-01-02T14:30:00+00:00",
                            "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 100.0})
@@ -201,3 +203,167 @@ def test_a_non_utc_bar_time_is_converted_to_utc():
     got = p.parse_request(_bar_with_time("2024-01-02T16:30:00+02:00")).t
     assert got == datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc)
     assert got.utcoffset().total_seconds() == 0
+
+
+# --- fix round 1 -----------------------------------------------------------------------------
+
+_REGEX_GOOD = {
+    "DIGEST_RE": "sha256:" + "a" * 64,
+    "CLASS_RE": "MyStrat",
+    "PROBE_NAME_RE": "format_globals",
+    "BUILD_ID_RE": "build-1.2",
+    "SESSION_RE": "s1f",
+}
+
+
+@pytest.mark.parametrize("name", sorted(_REGEX_GOOD))
+def test_every_pattern_is_exact_no_trailing_newline_no_leading_space(name):
+    pattern = getattr(p, name)
+    good = _REGEX_GOOD[name]
+    assert pattern.fullmatch(good) and pattern.match(good)
+    for bad in (good + "\n", " " + good, good + " "):
+        assert not pattern.fullmatch(bad), bad
+        assert not pattern.match(bad), bad
+
+
+def test_a_trailing_newline_is_refused_in_each_request_field():
+    for frame in (_open_frame(digest="sha256:" + "a" * 64 + "\n"), _open_frame(**{"class": "C\n"}),
+                  {"v": 1, "type": "CLOSE", "session": "s1\n"}):
+        with pytest.raises(p.FrameError) as exc:
+            p.parse_request(frame)
+        assert exc.value.code == p.SANDBOX_BAD_REQUEST
+
+
+def _bar(**override):
+    frame = {"v": 1, "type": "BAR", "session": "s1", "conid": 101, "t": "2024-01-02T14:30:00+00:00",
+             "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 100.0}
+    frame.update(override)
+    return frame
+
+
+def _refused(frame):
+    with pytest.raises(p.FrameError) as exc:
+        p.parse_request(frame)
+    assert exc.value.code == p.SANDBOX_BAD_REQUEST
+
+
+def test_a_number_that_is_not_a_finite_float_is_refused():
+    _refused(_bar(close=10**400))
+    _refused(_bar(volume=-(10**400)))
+    _refused(_open_frame(params={"X": 10**400}))
+    _refused(_bar(close=True))
+    _refused(_open_frame(params={"X": True}))
+    _refused(_bar(close=float("inf")))
+
+
+def test_a_non_string_probe_kind_or_name_is_a_protocol_error():
+    for bad in ([], {}, None, 7):
+        _refused({"v": 1, "type": "OPEN_PROBE", "kind": bad, "name": "x", "conids": [p.PROBE_CONID]})
+        _refused({"v": 1, "type": "OPEN_PROBE", "kind": "probe", "name": bad, "conids": [p.PROBE_CONID]})
+
+
+_VALID_FRAMES = [
+    {"v": 1, "type": "PING"},
+    _open_frame(params={"X": 1.0}),
+    {"v": 1, "type": "OPEN_PROBE", "kind": "probe", "name": "x", "conids": [p.PROBE_CONID]},
+    _bar(),
+    {"v": 1, "type": "CLOSE", "session": "s1"},
+]
+
+
+def test_a_wrongly_typed_field_gives_only_the_protocol_error():
+    junk = ([], {}, None, 10**400, [[]], [{}], [None], [10**400], {"X": []}, {"X": None}, {"X": 10**400})
+    for frame in _VALID_FRAMES:
+        for key in frame:
+            for value in junk:
+                broken = dict(frame)
+                broken[key] = value
+                try:
+                    p.parse_request(broken)
+                except p.FrameError as exc:
+                    assert exc.code == p.SANDBOX_BAD_REQUEST
+                # any other exception type fails the test
+
+
+@pytest.mark.parametrize("t", ["0001-01-01T00:00:00+05:00", "9999-12-31T23:59:59-05:00",
+                               "1969-12-31T23:59:59+00:00", "2100-01-01T00:00:01+00:00"])
+def test_a_bar_time_outside_the_sane_range_is_refused(t):
+    _refused(_bar(t=t))
+
+
+def test_the_edges_of_the_bar_time_range_are_accepted():
+    p.parse_request(_bar(t="1970-01-01T00:00:00+00:00"))
+    p.parse_request(_bar(t="2099-12-31T23:59:59+00:00"))
+
+
+@pytest.mark.parametrize("version", [True, 1.0, "1", None, 2])
+def test_the_version_must_be_the_integer_one(version):
+    _refused({"v": version, "type": "PING"})
+
+
+@pytest.mark.parametrize("conids", [[2], [1, 2], [], [True]])
+def test_a_probe_session_holds_exactly_the_probe_conid(conids):
+    _refused({"v": 1, "type": "OPEN_PROBE", "kind": "probe", "name": "x", "conids": conids})
+
+
+def test_a_connection_closed_mid_frame_is_a_frame_error():
+    async def run(data):
+        reader = asyncio.StreamReader()
+        reader.feed_data(data)
+        reader.feed_eof()
+        with pytest.raises(p.FrameError):
+            await p.read_frame(reader)
+
+    asyncio.run(run(b""))
+    asyncio.run(run(b"\x00\x00"))
+    asyncio.run(run(b"\x00\x00\x00\x09abc"))
+
+
+def test_encode_frame_refuses_nan_and_an_oversize_frame():
+    with pytest.raises(p.FrameError):
+        p.encode_frame({"x": float("nan")})
+    with pytest.raises(p.FrameError):
+        p.encode_frame({"pad": "x" * p.MAX_FRAME_BYTES})
+    assert len(p.encode_frame({"pad": "x" * 1000})) > 1000
+
+
+def test_a_duplicate_json_key_is_refused_on_read():
+    import struct
+
+    async def run():
+        body = b'{"v":1,"type":"PING","type":"CLOSE"}'
+        reader = asyncio.StreamReader()
+        reader.feed_data(struct.pack(">I", len(body)) + body)
+        with pytest.raises(p.FrameError):
+            await p.read_frame(reader)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("bar_size", ["1 min", "5 secs", "1 day", "1 month"])
+def test_a_known_bar_size_is_accepted(bar_size):
+    assert p.parse_request(_open_frame(bar_size=bar_size)).bar_size == bar_size
+
+
+@pytest.mark.parametrize("bar_size", ["", "7 min", "1 min ", "weekly", "../x", 5, None, []])
+def test_an_unknown_bar_size_is_refused(bar_size):
+    _refused(_open_frame(bar_size=bar_size))
+
+
+def test_a_bar_with_a_negative_volume_or_high_below_low_is_refused():
+    _refused(_bar(volume=-1.0))
+    _refused(_bar(high=0.4, low=0.5))
+    p.parse_request(_bar(volume=0.0, high=0.5, low=0.5))
+
+
+def test_a_conid_above_the_ib_range_is_refused():
+    _refused(_bar(conid=p.MAX_CONID + 1))
+    _refused(_open_frame(conids=[p.MAX_CONID + 1]))
+    assert p.parse_request(_bar(conid=p.MAX_CONID)).conid == p.MAX_CONID
+
+
+@pytest.mark.parametrize("probability", [10**400, True, "0.5", [], None, float("inf")])
+def test_validate_signal_gives_only_the_sandbox_error_for_a_bad_probability(probability):
+    with pytest.raises(p.FrameError) as exc:
+        p.validate_signal({"action": "BUY", "probability": probability})
+    assert exc.value.code == p.SANDBOX_ERROR

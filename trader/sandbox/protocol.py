@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
+from trader.bar_size import BarSize
+
 PROTOCOL_VERSION = 1
 
 LIVE_SOCKET = "/run/sandbox-live/sandbox.sock"
@@ -27,13 +29,20 @@ MAX_FRAME_BYTES = 262144  # 256 KiB: a lookback of bars plus a 20 KB source, wit
 # Equals SP2c trader.automation.ai_deployments.MAX_CONIDS; a test pins the two together.
 MAX_SESSION_CONIDS = 20
 PROBE_CONID = 1           # the one conid of an OPEN_PROBE session (ruling 26)
+MAX_CONID = 2**31 - 1     # IB contract ids are signed 32-bit
 
-DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-CLASS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
-PROBE_NAME_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+# Bar times are UTC ISO-8601 (ruling 20); anything outside this window is a corrupt time.
+_MIN_BAR_TIME = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_MAX_BAR_TIME = datetime(2100, 1, 1, tzinfo=timezone.utc)
+_KNOWN_BAR_SIZES = frozenset(BarSize.bar_sizes())
+
+# \A...\Z, never ^...$: "$" also matches before a trailing newline. Use .fullmatch.
+DIGEST_RE = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
+CLASS_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
+PROBE_NAME_RE = re.compile(r"\A[a-z0-9_]{1,64}\Z")
 # The build id PONG reports (ruling 1). Plan 3's IMAGE_ID wire pattern is the same text (one spelling, D2).
-BUILD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$")
-SESSION_RE = re.compile(r"^s[0-9a-f]{1,32}$")
+BUILD_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}\Z")
+SESSION_RE = re.compile(r"\As[0-9a-f]{1,32}\Z")
 _PROBE_KINDS = frozenset({"probe", "escape"})
 
 
@@ -47,7 +56,12 @@ class FrameError(Exception):
 
 
 def encode_frame(obj: Mapping[str, Any]) -> bytes:
-    body = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+    try:
+        body = json.dumps(obj, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    except ValueError as exc:
+        raise FrameError(f"frame cannot be encoded: {exc}", code=SANDBOX_ERROR) from exc
+    if len(body) > MAX_FRAME_BYTES:
+        raise FrameError(f"frame of {len(body)} bytes over the {MAX_FRAME_BYTES} cap", code=SANDBOX_ERROR)
     return struct.pack(">I", len(body)) + body
 
 
@@ -55,14 +69,31 @@ def write_frame(writer: asyncio.StreamWriter, obj: Mapping[str, Any]) -> None:
     writer.write(encode_frame(obj))
 
 
+def _object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict:
+    out: dict = {}
+    for key, value in pairs:
+        if key in out:
+            raise FrameError(f"duplicate key {key!r}")
+        out[key] = value
+    return out
+
+
 async def read_frame(reader: asyncio.StreamReader) -> dict:
-    header = await reader.readexactly(4)
-    (length,) = struct.unpack(">I", header)
-    if length > MAX_FRAME_BYTES:
-        raise FrameError(f"frame of {length} bytes over the {MAX_FRAME_BYTES} cap")
-    body = await reader.readexactly(length)
+    """Read one frame. Every failure is a FrameError.
+
+    After an oversize-header FrameError the stream is out of step (the body was not read): the
+    caller must close the connection, not read another frame from it.
+    """
     try:
-        obj = json.loads(body)
+        header = await reader.readexactly(4)
+        (length,) = struct.unpack(">I", header)
+        if length > MAX_FRAME_BYTES:
+            raise FrameError(f"frame of {length} bytes over the {MAX_FRAME_BYTES} cap")
+        body = await reader.readexactly(length)
+    except asyncio.IncompleteReadError as exc:
+        raise FrameError(f"connection closed after {len(exc.partial)} of {exc.expected} frame bytes") from exc
+    try:
+        obj = json.loads(body, object_pairs_hook=_object_without_duplicate_keys)
     except (ValueError, RecursionError) as exc:  # bad UTF-8, bad JSON, or absurd nesting
         raise FrameError(f"frame is not JSON: {exc}") from exc
     if not isinstance(obj, dict):
@@ -71,23 +102,32 @@ async def read_frame(reader: asyncio.StreamReader) -> dict:
 
 
 def _require_version(obj: Mapping[str, Any]) -> None:
-    if obj.get("v") != PROTOCOL_VERSION:
-        raise FrameError(f"unsupported protocol version {obj.get('v')!r}")
+    version = obj.get("v")
+    if type(version) is not int or version != PROTOCOL_VERSION:
+        raise FrameError(f"unsupported protocol version {version!r}")
 
 
-def _number(obj: Mapping[str, Any], key: str) -> float:
-    value = obj.get(key)
+def _finite_float(value: Any, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise FrameError(f"{key} must be a number")
-    out = float(value)
-    if not math.isfinite(out):
-        raise FrameError(f"{key} is not finite")
-    return out
+        raise FrameError(f"{label} must be a number")
+    try:
+        number = float(value)
+    except OverflowError as exc:
+        raise FrameError(f"{label} is too large") from exc
+    if not math.isfinite(number):
+        raise FrameError(f"{label} is not finite")
+    return number
+
+
+def _text(value: Any, pattern: re.Pattern[str], what: str) -> str:
+    if not isinstance(value, str) or not pattern.fullmatch(value):
+        raise FrameError(what)
+    return value
 
 
 def _conid(value: Any) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise FrameError("conid must be a positive integer")
+    if type(value) is not int or not 0 < value <= MAX_CONID:
+        raise FrameError(f"conid must be an integer from 1 to {MAX_CONID}")
     return value
 
 
@@ -105,17 +145,40 @@ def _params(obj: Mapping[str, Any]) -> dict[str, float]:
     raw = obj.get("params", {})
     if not isinstance(raw, dict):
         raise FrameError("params must be an object")
-    out: dict[str, float] = {}
-    for name, value in raw.items():
-        if not isinstance(name, str) or not CLASS_RE.match(name):
-            raise FrameError(f"bad param name {name!r}")
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise FrameError(f"param {name} must be a number")
-        number = float(value)
-        if not math.isfinite(number):
-            raise FrameError(f"param {name} is not finite")
-        out[name] = number
-    return out
+    return {_text(name, CLASS_RE, f"bad param name {name!r}"): _finite_float(value, f"param {name}")
+            for name, value in raw.items()}
+
+
+def _session(obj: Mapping[str, Any]) -> str:
+    return _text(obj.get("session"), SESSION_RE, "bad session id")
+
+
+def _bar_time(obj: Mapping[str, Any]) -> datetime:
+    raw = obj.get("t")
+    if not isinstance(raw, str):
+        raise FrameError("t must be an ISO-8601 string")
+    try:
+        when = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise FrameError(f"t is not ISO-8601: {exc}") from exc
+    if when.utcoffset() is None:
+        raise FrameError("t must carry a UTC offset (ISO-8601 with Z or +HH:MM)")
+    try:
+        when_utc = when.astimezone(timezone.utc)
+    except OverflowError as exc:
+        raise FrameError("t is outside the supported time range") from exc
+    if not _MIN_BAR_TIME <= when_utc < _MAX_BAR_TIME:
+        raise FrameError("t is outside 1970-01-01..2100-01-01 UTC")
+    return when_utc
+
+
+def _ohlcv(obj: Mapping[str, Any]) -> dict[str, float]:
+    ohlcv = {col: _finite_float(obj.get(col), col) for col in ("open", "high", "low", "close", "volume")}
+    if ohlcv["volume"] < 0:
+        raise FrameError("volume must not be negative")
+    if ohlcv["high"] < ohlcv["low"]:
+        raise FrameError("high must not be below low")
+    return ohlcv
 
 
 @dataclass(frozen=True)
@@ -140,46 +203,27 @@ def parse_request(obj: Mapping[str, Any]) -> Request:
     if kind == "PING":
         return Request(type="PING")
     if kind == "OPEN":
-        digest = obj.get("digest")
-        class_name = obj.get("class")
         bar_size = obj.get("bar_size")
-        if not isinstance(digest, str) or not DIGEST_RE.match(digest):
-            raise FrameError("digest must be sha256:<64 hex>")
-        if not isinstance(class_name, str) or not CLASS_RE.match(class_name):
-            raise FrameError("class must be a Python identifier")
-        if not isinstance(bar_size, str) or not bar_size.strip():
-            raise FrameError("bar_size must be a non-empty string")
-        return Request(type="OPEN", digest=digest, class_name=class_name,
+        if not isinstance(bar_size, str) or bar_size not in _KNOWN_BAR_SIZES:
+            raise FrameError(f"bar_size must be one of {sorted(_KNOWN_BAR_SIZES)}")
+        return Request(type="OPEN",
+                       digest=_text(obj.get("digest"), DIGEST_RE, "digest must be sha256:<64 hex>"),
+                       class_name=_text(obj.get("class"), CLASS_RE, "class must be a Python identifier"),
                        params=_params(obj), bar_size=bar_size, conids=_conids(obj))
     if kind == "OPEN_PROBE":
         probe_kind = obj.get("kind")
-        name = obj.get("name")
-        if probe_kind not in _PROBE_KINDS:
+        if not isinstance(probe_kind, str) or probe_kind not in _PROBE_KINDS:
             raise FrameError(f"probe kind must be one of {sorted(_PROBE_KINDS)}")
-        if not isinstance(name, str) or not PROBE_NAME_RE.match(name):
-            raise FrameError("probe name must match [a-z0-9_]{1,64}")
-        return Request(type="OPEN_PROBE", kind=probe_kind, name=name, conids=_conids(obj))
+        name = _text(obj.get("name"), PROBE_NAME_RE, "probe name must match [a-z0-9_]{1,64}")
+        conids = _conids(obj)
+        if conids != (PROBE_CONID,):
+            raise FrameError(f"a probe session holds exactly conid {PROBE_CONID}")
+        return Request(type="OPEN_PROBE", kind=probe_kind, name=name, conids=conids)
     if kind == "BAR":
-        session = obj.get("session")
-        if not isinstance(session, str) or not SESSION_RE.match(session):
-            raise FrameError("bad session id")
-        conid = _conid(obj.get("conid"))
-        t_raw = obj.get("t")
-        if not isinstance(t_raw, str):
-            raise FrameError("t must be an ISO-8601 string")
-        try:
-            when = datetime.fromisoformat(t_raw)
-        except ValueError as exc:
-            raise FrameError(f"t is not ISO-8601: {exc}") from exc
-        if when.tzinfo is None:
-            raise FrameError("t must carry a UTC offset (ISO-8601 with Z or +HH:MM)")
-        ohlcv = {col: _number(obj, col) for col in ("open", "high", "low", "close", "volume")}
-        return Request(type="BAR", session=session, conid=conid, t=when.astimezone(timezone.utc), ohlcv=ohlcv)
+        return Request(type="BAR", session=_session(obj), conid=_conid(obj.get("conid")),
+                       t=_bar_time(obj), ohlcv=_ohlcv(obj))
     if kind == "CLOSE":
-        session = obj.get("session")
-        if not isinstance(session, str) or not SESSION_RE.match(session):
-            raise FrameError("bad session id")
-        return Request(type="CLOSE", session=session)
+        return Request(type="CLOSE", session=_session(obj))
     raise FrameError(f"unknown request type {kind!r}")
 
 
@@ -191,8 +235,9 @@ def validate_signal(obj: Mapping[str, Any]) -> None:
         return
     if action not in ("BUY", "SELL"):
         raise FrameError(f"action must be BUY, SELL or null, got {action!r}", code=SANDBOX_ERROR)
-    if isinstance(probability, bool) or not isinstance(probability, (int, float)):
-        raise FrameError("probability must be a number", code=SANDBOX_ERROR)
-    number = float(probability)
-    if not math.isfinite(number) or not 0.0 <= number <= 1.0:
+    try:
+        number = _finite_float(probability, "probability")
+    except FrameError as exc:
+        raise FrameError(exc.detail, code=SANDBOX_ERROR) from exc
+    if not 0.0 <= number <= 1.0:
         raise FrameError("probability must be within 0..1", code=SANDBOX_ERROR)

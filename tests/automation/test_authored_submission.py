@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import threading
+import warnings
 
 import pytest
 from pydantic import ValidationError
@@ -14,6 +15,7 @@ from tests.automation.authored_fixtures import (
 from tests.automation.backtest_judge_fixtures import NOW
 from trader.automation.authored_files import AuthoredFileStore
 from trader.automation.authored_strategies import AuthoredStrategyStore
+from trader.automation.authored_submission import class_constants
 
 
 def test_a_clean_file_is_stored_with_its_metadata(tmp_path):
@@ -155,6 +157,51 @@ def test_a_constant_the_class_binds_twice_is_not_a_tunable(tmp_path, rebinding):
     reply = w.store.submit(submit_request(VALID_SOURCE.replace("RANGE_BARS = 15", rebinding)))
     assert reply["code"] == "AUTHORED_BAD_TUNABLES"
     assert "RANGE_BARS is not a numeric class constant" in reply["detail"]
+
+
+@pytest.mark.parametrize("tunables, hint", [
+    ({"RANGE_BARS": {"low": 10**400, "high": 30, "default": 15}}, "not a finite, ordered range"),
+    ({"RANGE_BARS": {"low": 5, "high": 10**5000, "default": 15}}, "not a finite, ordered range"),
+    ({"RANGE_BARS": {"low": -1e16, "high": 30, "default": 15}}, "not a finite, ordered range"),
+    ({"RANGE_BARS": {"low": 5, "high": 30, "default": 10**400}}, "the default is not a finite number"),
+])
+def test_a_tunable_number_beyond_the_bound_is_refused_not_raised(tmp_path, tunables, hint):
+    w = authored_world(tmp_path)
+    reply = w.store.submit(submit_request(tunables=tunables))
+    assert (reply["status"], reply["code"]) == ("REFUSED", "AUTHORED_BAD_TUNABLES")
+    assert hint in reply["detail"]
+
+
+@pytest.mark.parametrize("value", ["10**400", "1" + "0" * 400, "1e999", "-1e16"],
+                         ids=["power", "long_literal", "infinite_literal", "beyond_the_bound"])
+def test_a_class_value_beyond_the_bound_is_refused_not_raised(tmp_path, value):
+    w = authored_world(tmp_path)
+    text = VALID_SOURCE.replace("RANGE_BARS = 15", f"RANGE_BARS = {value}")
+    reply = w.store.submit(submit_request(text, tunables={"RANGE_BARS": {"low": 5, "high": 30, "default": 15}}))
+    assert reply["code"] == "AUTHORED_BAD_TUNABLES", reply
+
+
+def test_tunables_with_nothing_to_vary_are_refused(tmp_path):
+    w = authored_world(tmp_path)
+    reply = w.store.submit(submit_request(tunables={"RANGE_BARS": {"low": 15, "high": 15, "default": 15}}))
+    assert reply["code"] == "AUTHORED_BAD_TUNABLES"
+    assert "nothing to vary" in reply["detail"]
+
+
+def test_one_fixed_tunable_beside_one_that_varies_is_stored(tmp_path):
+    w = authored_world(tmp_path)
+    tunables = {"RANGE_BARS": {"low": 15, "high": 15, "default": 15},
+                "MIN_PROBABILITY": {"low": 0.5, "high": 0.9, "default": 0.6}}
+    assert w.store.submit(submit_request(tunables=tunables))["status"] == "STORED"
+
+
+def test_constants_are_read_the_same_under_warnings_as_errors():
+    text = VALID_SOURCE.replace("    def on_bar", '    PATTERN = "\\d"\n\n    def on_bar')
+    assert '"\\d"' in text
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert class_constants(text, "RangeBreak") == {"LOOKBACK_BARS": 40, "RANGE_BARS": 15,
+                                                       "MIN_PROBABILITY": 0.6}
 
 
 def test_a_bool_bound_or_too_many_tunables_never_pass_the_wire():

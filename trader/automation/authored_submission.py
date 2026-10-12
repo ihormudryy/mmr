@@ -7,12 +7,11 @@ checker only; it never imports or runs it.
 from __future__ import annotations
 
 import ast
-import math
 from collections import Counter
 from dataclasses import dataclass
 from typing import Iterator, Mapping, Optional
 
-from trader.authored.static_check import AuthoredStaticRejected, require_clean
+from trader.authored.static_check import AuthoredStaticRejected, _parse_quietly, require_clean
 from trader.automation.authored_config import AuthoredStrategiesConfig
 from trader.automation.authored_refusals import (
     AUTHORED_BAD_BAR_SIZE, AUTHORED_BAD_TUNABLES, AUTHORED_STATIC_REJECTED, AuthoredRefused,
@@ -23,6 +22,8 @@ from trader.research.request_rules import TUNABLE_NAME
 
 NOT_TUNABLE = frozenset({"LOOKBACK_BARS"})     # fixed by the API (spec 7.1)
 MAX_STATIC_DETAIL_CHARS = 2000
+# Every tunable number (low, high, default, class value) stays within this; a larger int cannot become a float.
+MAX_TUNABLE_ABS = 1e15
 # Their bodies are scopes of their own: a name bound inside them is not a class attribute.
 _OWN_SCOPES = (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 
@@ -67,7 +68,14 @@ def _tunables(source: str, class_name: str, tunables: Mapping[str, TunableRange]
         if problem is not None:
             raise AuthoredRefused(AUTHORED_BAD_TUNABLES, problem)
         checked[name] = {"low": bounds.low, "high": bounds.high, "default": bounds.default}
+    if all(bounds["low"] == bounds["high"] for bounds in checked.values()):
+        raise AuthoredRefused(AUTHORED_BAD_TUNABLES, "nothing to vary: at least one tunable needs low < high")
     return checked
+
+
+def _bounded(value: float) -> bool:
+    """Finite and within MAX_TUNABLE_ABS; compares a huge int exactly instead of converting it."""
+    return abs(value) <= MAX_TUNABLE_ABS
 
 
 def _tunable_problem(name: str, low: float, high: float, default: float,
@@ -78,10 +86,16 @@ def _tunable_problem(name: str, low: float, high: float, default: float,
         return f"{name} is fixed by the API, not a tunable"
     if name not in constants:
         return f"{name} is not a numeric class constant of the strategy"
-    if not (math.isfinite(low) and math.isfinite(high)) or low > high:
+    if not (_bounded(low) and _bounded(high)):
+        return f"{name}: the range is not a finite, ordered range within ±{MAX_TUNABLE_ABS:g}"
+    if low > high:
         return f"{name}: [{low}, {high}] is not a finite, ordered range"
+    if not _bounded(constants[name]):
+        return f"{name}: the class value is not a finite number within ±{MAX_TUNABLE_ABS:g}"
     if not low <= constants[name] <= high:
         return f"{name}: the class value {constants[name]} is outside [{low}, {high}]"
+    if not _bounded(default):
+        return f"{name}: the default is not a finite number within ±{MAX_TUNABLE_ABS:g}"
     if default != constants[name]:
         return f"{name}: the default {default} is not the class value {constants[name]}"
     return None
@@ -93,7 +107,7 @@ def class_constants(source: str, class_name: str) -> dict[str, float]:
     A name the class body binds more than once (a reassignment, ``+=``, a tuple target, a method of
     that name) is left out: its first number need not be the class value.
     """
-    for node in ast.parse(source).body:
+    for node in _parse_quietly(source).body:
         if isinstance(node, ast.ClassDef) and node.name == class_name:
             bindings = Counter(_bound_names(node.body))
             pairs = (_constant(statement) for statement in node.body)
@@ -140,6 +154,6 @@ def _number(node: ast.expr) -> Optional[float]:
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
         sign = -1 if isinstance(node.op, ast.USub) else 1
         node = node.operand
-    if isinstance(node, ast.Constant) and type(node.value) in (int, float) and math.isfinite(node.value):
-        return sign * node.value
+    if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+        return sign * node.value                # unbounded here; a tunable's value is bounded when checked
     return None

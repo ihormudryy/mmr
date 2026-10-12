@@ -332,6 +332,8 @@ class AuthoredStrategyStore:
         raced = record_in_tx(conn, record.digest)
         if raced is not None:                     # the same file, submitted twice at once
             return "EXISTING", raced
+        # Count and insert are safe only because every write to this journal path holds the single
+        # DuckDBConnection instance's lock; DuckDB itself would not serialize two such transactions.
         counted = counted_in_tx(conn)
         if counted >= self._config.max_active:
             raise AuthoredRefused(AUTHORED_CAP_FULL, self._cap_detail(counted))

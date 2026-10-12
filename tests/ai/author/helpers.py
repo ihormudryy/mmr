@@ -1,4 +1,6 @@
 """Shared text for the author tests. ai.yaml with an author role is config_text plus three insertions."""
+import json
+
 from tests.ai.fakes import config_text, write_config
 from trader.ai.config import load_ai_config
 
@@ -48,3 +50,39 @@ def submit_reply(status="STORED", *, digest=None, class_name="OpeningRangeBreako
                 "key": f"authored:{digest}:{class_name}"}
     return {"status": status, "code": code, "detail": None if code is None else code.lower(), "retryable": retryable,
             "record": view}
+
+
+ORB_SOURCE = '''from trader.authored.api import AuthoredStrategy, Decision
+
+
+class OpeningRangeBreakout(AuthoredStrategy):
+    LOOKBACK_BARS = 40
+    RANGE_BARS = 2
+    ENTRY_MINUTE = 600
+    EXIT_MINUTE = 660
+
+    def on_bar(self, history, params):
+        local = history.index[-1].tz_convert("America/New_York")
+        minute = local.hour * 60 + local.minute
+        if minute == params["EXIT_MINUTE"]:
+            return Decision("SELL", 0.5)
+        if minute != params["ENTRY_MINUTE"]:
+            return None
+        session = history[history.index.tz_convert("America/New_York").date == local.date()]
+        opening = session.iloc[: int(params["RANGE_BARS"])]
+        if len(session) <= len(opening):
+            return None
+        if session["close"].iloc[-1] > opening["high"].max():
+            return Decision("BUY", 0.5)
+        return None
+'''
+ORB_TUNABLES = [{"name": "RANGE_BARS", "minimum": 1, "maximum": 4},
+                {"name": "ENTRY_MINUTE", "minimum": 585, "maximum": 630},
+                {"name": "EXIT_MINUTE", "minimum": 630, "maximum": 720}]
+BAD_SOURCE = ORB_SOURCE.replace("from trader.authored.api", "import os\nfrom trader.authored.api")
+ORB_NOTE = "Opening range breakout: buy the 10:00 bar when it closes above the first two bars' high."
+
+
+def answer_json(*, source=ORB_SOURCE, tunables=None, bar_size="15 mins", note=ORB_NOTE, **extra) -> str:
+    return json.dumps({"file_text": source, "tunables": ORB_TUNABLES if tunables is None else tunables,
+                       "bar_size": bar_size, "note": note, **extra})

@@ -9,7 +9,10 @@ FORBIDDEN = ("ib_async", "trader.trading", "trader.trader_service", "trader.data
              # SP3 Plan 5 (G14): no authored-strategy store and no sandbox in the ai service
              "trader.sandbox", "trader.automation.authored")
 # SP2c Plan 4: the research menu reads strategy files as text through the AST scanner, nothing else.
-ALLOWED = ("trader.strategy", "trader.strategy.inspect")
+# SP3 Plan 5 (G1/G2): the author runs the trader's pure submission check and reads its refusal codes; the
+# authored store, files, isolation, schema, config and wire modules stay forbidden.
+ALLOWED = ("trader.strategy", "trader.strategy.inspect",
+           "trader.automation.authored_submission", "trader.automation.authored_refusals")
 MODULES = ("trader.ai.ids", "trader.ai.runtime_schema", "trader.ai.rpc_clients", "trader.ai.leadership",
            "trader.ai.schedule", "trader.ai.engine", "trader.ai.submitter", "trader.ai.outbox",
            "trader.ai.signal_intake", "trader.ai.controller", "trader.ai_service",
@@ -20,7 +23,7 @@ MODULES = ("trader.ai.ids", "trader.ai.runtime_schema", "trader.ai.rpc_clients",
            "trader.ai.research_cycle", "trader.ai.research_menu", "trader.ai.research_roles",
            "trader.ai.research_wire", "trader.ai.backtest_judge",
            # SP3 Plan 5
-           "trader.ai.author_schema", "trader.ai.author_wire")
+           "trader.ai.author_schema", "trader.ai.author_wire", "trader.ai.author_roles")
 
 
 def test_the_runtime_stays_clear_of_the_trading_runtime():

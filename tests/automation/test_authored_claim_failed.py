@@ -11,7 +11,7 @@ import logging
 
 from tests.automation.authored_fixtures import report, source, stored, submit_request
 from tests.automation.backtest_judge_fixtures import count_judgments, finished, judgment
-from tests.automation.test_authored_sp2c_hooks import authored_body, claim, hooked
+from tests.automation.test_authored_sp2c_hooks import authored_body, claim, hooked, point
 from trader.automation.authored_strategies import (
     CLAIM_FAILED, CLAIM_FAILED_GRACE, EVALUATING, FAILED, REJECTED, STORED,
 )
@@ -21,7 +21,7 @@ from trader.research.evaluation_request import evaluation_request_id
 
 def body_for(digest, night: int):
     """A distinct claim per night: the same body would be the same request id and an EXISTING claim."""
-    return authored_body(digest, cohort=[{"RANGE_BARS": 10 + night}])
+    return authored_body(digest, cohort=[point(), point(RANGE_BARS=10 + night)])
 
 
 def claimed_then_failed(w, body) -> str:

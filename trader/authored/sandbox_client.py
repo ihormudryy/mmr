@@ -43,6 +43,14 @@ class SandboxFault(Exception):
         self.code = code
         self.detail = detail
 
+    def __reduce__(self):
+        # The default rebuilds an exception from its positional args only; a worker process must raise it whole.
+        return _sandbox_fault, (self.detail, self.code)
+
+
+def _sandbox_fault(detail: str, code: str) -> SandboxFault:
+    return SandboxFault(detail, code=code)
+
 
 class SandboxProtocolError(Exception):
     """The caller sent something out of contract (SANDBOX_BAD_REQUEST), or used a session that is over."""

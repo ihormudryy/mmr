@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import os
+import pickle
 import shutil
 import socket
 import struct
@@ -639,3 +640,10 @@ def test_a_live_open_that_is_not_a_count_is_unknown(fake, live_open):
                       "free": 1, "size": 3, "posture": {}, "live_open": live_open})
 
     assert SandboxClient(fake(pong).path).ping().live_open is None
+
+
+def test_a_sandbox_fault_survives_pickling_with_its_code():
+    # A research worker process raises it through the pool (Task 3 review).
+    restored = pickle.loads(pickle.dumps(SandboxFault("a", code="SANDBOX_ERROR")))
+    assert (type(restored), restored.code, restored.detail, str(restored)) == (
+        SandboxFault, "SANDBOX_ERROR", "a", "SANDBOX_ERROR: a")

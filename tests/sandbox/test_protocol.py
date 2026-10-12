@@ -1,4 +1,5 @@
 import asyncio
+import pickle
 
 import pytest
 
@@ -374,3 +375,8 @@ def test_decode_frame_body_returns_the_object_and_refuses_duplicates_and_non_obj
     for body in (b'{"a":1,"a":2}', b"[1]", b"\xff\xfe", b"nope"):
         with pytest.raises(p.FrameError):
             p.decode_frame_body(body)
+
+
+def test_a_frame_error_survives_pickling_with_its_code():
+    restored = pickle.loads(pickle.dumps(p.FrameError("too big", code=p.SANDBOX_ERROR)))
+    assert (restored.code, restored.detail, str(restored)) == (p.SANDBOX_ERROR, "too big", "too big")

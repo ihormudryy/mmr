@@ -937,6 +937,99 @@ def test_a_child_that_cannot_drop_privileges_is_a_setup_error_at_spawn():
     assert exc.value.detail == "PRIVILEGE_DROP_FAILED"
 
 
+# Authored code that escaped the language guards and forges a setup-failure frame while its module body loads.
+_FORGES_A_SETUP_FAULT = '''
+import pandas as pd
+from trader.authored.api import AuthoredStrategy
+
+os = pd.io.common.os
+body = b'{"ok":false,"detail":"PRIVILEGE_DROP_FAILED"}'
+fd_dir = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"
+for name in os.listdir(fd_dir):
+    fd = int(name)
+    if fd > 2:
+        try:
+            if os.fstat(fd).st_mode & 0o170000 == 0o140000:   # the socket to the parent
+                os.write(fd, len(body).to_bytes(4, "big") + body)
+        except:
+            pass
+
+
+class Forger(AuthoredStrategy):
+    LOOKBACK_BARS = 2
+
+    def on_bar(self, history, params):
+        return None
+'''
+
+
+def _unprivileged_setup(monkeypatch):
+    """The real fork path without root: the privilege drop and the rlimits are skipped in the child."""
+    monkeypatch.setattr(child_module, "_drop_privileges", lambda spec: None)
+    monkeypatch.setattr(child_module, "_set_child_rlimits", lambda spec: None)
+
+
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_a_setup_fault_forged_by_authored_code_is_a_strategy_fault(monkeypatch):
+    # Re-review of 09c9d2f9: a setup code counts only in place of the first frame, before any authored code runs.
+    _unprivileged_setup(monkeypatch)
+    spec = _spec(source=_FORGES_A_SETUP_FAULT, class_name="Forger", skip_static_check=True)
+    with pytest.raises(ChildError) as exc:
+        child_module.ForkSpawner(open_timeout_s=10).spawn(spec)
+    assert not isinstance(exc.value, child_module.ChildSetupError)
+    assert exc.value.detail == "PRIVILEGE_DROP_FAILED"
+
+
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_a_clean_setup_then_load_spawns_a_child(monkeypatch):
+    _unprivileged_setup(monkeypatch)
+    handle = child_module.ForkSpawner(open_timeout_s=10).spawn(_spec())
+    try:
+        assert handle.send_bar(C1, T0, BAR) == {"action": "BUY", "probability": 0.1}
+    finally:
+        handle.close()
+
+
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_a_real_rlimit_failure_before_setup_ok_is_a_setup_error(monkeypatch):
+    monkeypatch.setattr(child_module, "_drop_privileges", lambda spec: None)
+
+    def refuse(spec):
+        raise OSError("cannot")
+
+    monkeypatch.setattr(child_module, "_set_child_rlimits", refuse)
+    with pytest.raises(child_module.ChildSetupError) as exc:
+        child_module.ForkSpawner(open_timeout_s=10).spawn(_spec())
+    assert exc.value.detail == "CHILD_LIMITS_FAILED"
+
+
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_a_child_that_dies_silently_before_setup_ok_is_a_setup_error(monkeypatch):
+    monkeypatch.setattr(child_module, "_drop_privileges", lambda spec: os._exit(70))
+    with pytest.raises(child_module.ChildSetupError, match="setup"):
+        child_module.ForkSpawner(open_timeout_s=10).spawn(_spec())
+
+
+@pytest.mark.parametrize("first", [{"ok": False, "detail": "load failed: x"}, {"ok": True}, {"stage": "setup"}])
+def test_any_other_first_frame_is_a_setup_error(first):
+    parent, child = socket.socketpair()
+    with parent, child:
+        child_module.send_frame(child, first)
+        with pytest.raises(child_module.ChildSetupError, match="out of contract"):
+            child_module._await_setup(parent, 1)
+
+
+def test_the_setup_ok_frame_passes_and_a_setup_code_in_its_place_is_a_setup_error():
+    parent, child = socket.socketpair()
+    with parent, child:
+        child_module.send_frame(child, child_module.SETUP_OK)
+        child_module._await_setup(parent, 1)
+        child_module.send_frame(child, {"ok": False, "detail": "CHILD_SETUP_FAILED"})
+        with pytest.raises(child_module.ChildSetupError) as exc:
+            child_module._await_setup(parent, 1)
+    assert exc.value.detail == "CHILD_SETUP_FAILED"
+
+
 def test_a_load_fault_of_the_strategy_is_not_a_setup_error():
     assert not issubclass(ChildError, child_module.ChildSetupError)
     assert issubclass(child_module.ChildSetupError, ChildError)

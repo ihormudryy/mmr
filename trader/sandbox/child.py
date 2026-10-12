@@ -43,7 +43,9 @@ class ChildSetupError(ChildError):
     """The sandbox could not start a child (fork, socketpair, privilege drop, rlimits): not the strategy's fault."""
 
 
-# The fixed codes a child sends when its own setup fails, before any authored code loads (ruling 34).
+# The child's first frame is one of these, sent before any authored code loads (ruling 34): SETUP_OK, or a fixed
+# setup-failure code. Only that first frame can blame the sandbox; authored code could forge any later frame.
+SETUP_OK = {"ok": True, "stage": "setup"}
 CHILD_SETUP_FAULTS = frozenset({"CHILD_SETUP_FAILED", "PRIVILEGE_DROP_FAILED", "CHILD_LIMITS_FAILED"})
 
 
@@ -322,16 +324,31 @@ class ForkSpawner:
         if pid == 0:
             _run_forked_child(spec, child_sock)   # never returns
         child_sock.close()
-        try:   # a child that hangs or trickles in load must not block the server
+        try:   # a child that hangs or trickles in setup or load must not block the server
+            _await_setup(parent_sock, self._open_timeout)
             _raise_for_child_fault(recv_frame(parent_sock, self._open_timeout), "child load reply is out of contract")
         except (ChildError, OSError) as exc:
             _kill_and_reap(pid)
             parent_sock.close()
-            detail = getattr(exc, "detail", f"child load failed: {exc}")
-            if detail in CHILD_SETUP_FAULTS:
-                raise ChildSetupError(detail) from exc
-            raise ChildError(detail) from exc
+            if isinstance(exc, ChildSetupError):
+                raise
+            # After SETUP_OK every fault is the strategy's, even one that names a setup code: it may be forged.
+            raise ChildError(getattr(exc, "detail", f"child load failed: {exc}")) from exc
         return _ForkedChild(pid=pid, pipe=_ChildPipe(sock=parent_sock, reply_timeout_s=self._bar_timeout))
+
+
+def _await_setup(sock: socket.socket, timeout_s: float) -> None:
+    """Read the child's first frame. No authored code has run yet, so any failure here is the sandbox's."""
+    try:
+        reply = recv_frame(sock, timeout_s)
+    except (ChildError, OSError) as exc:
+        raise ChildSetupError(f"child setup failed: {getattr(exc, 'detail', exc)}") from exc
+    if reply == SETUP_OK:
+        return
+    detail = reply.get("detail")
+    if reply.get("ok") is False and detail in CHILD_SETUP_FAULTS:
+        raise ChildSetupError(detail)
+    raise ChildSetupError("child setup reply is out of contract")
 
 
 def _socketpair() -> tuple[socket.socket, socket.socket]:
@@ -372,6 +389,7 @@ def _run_forked_child(spec: SpawnSpec, sock: socket.socket) -> None:
         except Exception:  # noqa: BLE001
             _send_fault_quietly(sock, "CHILD_LIMITS_FAILED")
             return
+        send_frame(sock, SETUP_OK)   # the last frame the sandbox alone writes: authored code loads after it
         code = _serve_session(spec, sock)
     except BaseException:  # noqa: BLE001 — a crashed child must not unwind into the supervisor
         code = _EXIT_CHILD_CRASHED

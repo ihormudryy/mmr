@@ -3,6 +3,9 @@
 The supervisor starts as uid 0 with CHOWN, SETUID, SETGID and KILL. It creates ``/tmp/s<uid>`` for each slot,
 owned by the slot uid and group sbxchild, mode 0700 (that needs CAP_CHOWN), then drops CAP_CHOWN before it
 serves anything. The serving effective set is exactly SETUID|SETGID|KILL (CapEff ``00000000000000e0``).
+
+capset changes only the calling thread, so the drop must run before any library starts a thread (pandas imports
+pyarrow, which does). This module therefore imports nothing heavy: the service calls it before pandas loads.
 """
 from __future__ import annotations
 
@@ -13,7 +16,8 @@ import sys
 from dataclasses import dataclass
 from typing import Iterable, Protocol
 
-from trader.sandbox.child import SBXCHILD_GID
+SBXCHILD_GID = 20000                      # group sbxchild
+SLOT_UIDS = range(20001, 20008)           # seven slots: live 3 + research 4 (ruling 26)
 
 CAP_CHOWN = 0
 CAP_KILL = 5
@@ -71,6 +75,16 @@ def _prepare_slot_dir(path: str, uid: int, gid: int) -> None:
     found = (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode))
     if found != (uid, gid, SLOT_DIR_MODE):
         raise SlotDirError(f"{path} has owner, group and mode {found}, expected {(uid, gid, SLOT_DIR_MODE)}")
+
+
+def prepare_slots_then_drop_chown(uids: Iterable[int] = SLOT_UIDS) -> None:
+    """Ruling 2: CAP_CHOWN only gives each slot its own directory, and is gone before anything is served."""
+    try:
+        prepare_slot_dirs(uids)
+        drop_capability(CAP_CHOWN)
+        require_serving_caps()
+    except (OSError, RuntimeError) as exc:
+        raise SystemExit(f"sandbox refuses to start: {exc}") from exc
 
 
 # ── reading the capability sets ─────────────────────────────────────────────
@@ -172,7 +186,8 @@ def drop_capability(bit: int, *, syscalls: CapSyscalls | None = None) -> None:
 
     Without it in the permitted set it cannot come back. The bounding set keeps it (dropping that needs
     CAP_SETPCAP); with no-new-privileges an exec cannot regain it either. capset changes only the calling
-    thread, so it is refused while any other thread runs."""
+    thread, so it is refused while any other thread runs. A thread started later copies its creator's sets, so
+    every later thread and every fork from one has the dropped set."""
     if type(bit) is not int or not 0 <= bit < 32 * _CAP_WORDS:
         raise ValueError(f"not a capability bit: {bit!r}")
     syscalls = syscalls if syscalls is not None else _LibcCapSyscalls()

@@ -23,11 +23,10 @@ import pandas as pd
 from trader.authored.allowed_api import ALLOWED_BUILTINS, ALLOWED_FROM_IMPORT_NAMES, ALLOWED_IMPORTS
 from trader.authored.api import ACTIONS, MAX_LOOKBACK_BARS, MIN_LOOKBACK_BARS, AuthoredStrategy, Decision
 from trader.authored.static_check import AuthoredStaticRejected, require_clean
+from trader.sandbox.caps import SBXCHILD_GID, SLOT_UIDS
 from trader.sandbox.protocol import MAX_FRAME_BYTES, FrameError, encode_frame, validate_signal
 
 OHLCV_COLUMNS = ("open", "high", "low", "close", "volume")
-SBXCHILD_GID = 20000                      # group sbxchild
-SLOT_UIDS = range(20001, 20008)           # seven slots: live 3 + research 4 (ruling 26)
 _EXIT_DROP_FAILED = 71                    # EX_OSERR: the privilege drop did not take
 _EXIT_CHILD_CRASHED = 70                  # EX_SOFTWARE: any other failure in the child
 MAX_CHILD_DETAIL_CHARS = 300              # a child's fault text is untrusted: bounded before it reaches a log

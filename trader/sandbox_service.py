@@ -1,21 +1,27 @@
 """The sandbox service entry. Always ForkSpawner (ruling 12): no option, env var or argument swaps it."""
 import os
+import sys
 
 # Single-thread the math libraries before anything imports numpy (ruling 5): trader.sandbox.child
 # imports pandas. Plain assignment, so a value from the environment can never win.
 for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ[_var] = "1"
 
+# Ruling 2: drop CAP_CHOWN before pandas loads, because pyarrow starts threads at import and capset changes only
+# the calling thread. Only when started to serve: a --health run must not touch the slot dirs.
+if __name__ == "__main__" and sys.argv[1:] == []:
+    from trader.sandbox import caps as _startup_caps
+    _startup_caps.prepare_slots_then_drop_chown()
+
 import asyncio  # noqa: E402
 import contextlib  # noqa: E402
 import logging  # noqa: E402
 import signal  # noqa: E402
 import socket  # noqa: E402
-import sys  # noqa: E402
 
 from trader.sandbox import caps  # noqa: E402
 from trader.sandbox import protocol as proto  # noqa: E402
-from trader.sandbox.child import SLOT_UIDS, ChildError, ForkSpawner, recv_frame  # noqa: E402
+from trader.sandbox.child import ChildError, ForkSpawner, recv_frame  # noqa: E402
 from trader.sandbox.posture import read_posture  # noqa: E402  (Task 6)
 from trader.sandbox.server import TRADER_GID, serve  # noqa: E402
 from trader.sandbox.supervisor import LIVE_POOL_SIZE, RESEARCH_POOL_SIZE, Supervisor  # noqa: E402
@@ -72,13 +78,11 @@ def _join_trader_group() -> None:
         raise SystemExit(f"sandbox refuses to start: cannot join group trader ({TRADER_GID}): {exc}") from exc
 
 
-def _prepare_slots_then_drop_chown() -> None:
-    """Ruling 2: CAP_CHOWN only gives each slot its own directory, and is gone before anything is served."""
+def _require_serving_caps() -> None:
+    """The gate before serving, whatever path led here: the effective set must be exactly SETUID|SETGID|KILL."""
     try:
-        caps.prepare_slot_dirs(SLOT_UIDS)
-        caps.drop_capability(caps.CAP_CHOWN)
         caps.require_serving_caps()
-    except (OSError, RuntimeError) as exc:
+    except caps.CapabilityError as exc:
         raise SystemExit(f"sandbox refuses to start: {exc}") from exc
 
 
@@ -98,7 +102,7 @@ def _stop_on_signals():
 
 async def _amain() -> None:
     _join_trader_group()
-    _prepare_slots_then_drop_chown()
+    _require_serving_caps()           # CAP_CHOWN was dropped when the module started (ruling 2)
     supervisor = build_supervisor()   # reads the posture once, so only after the drop: PONG shows the serving caps
     with _stop_on_signals() as stop:
         server = await serve(supervisor, {"live": proto.LIVE_SOCKET, "research": proto.RESEARCH_SOCKET})

@@ -155,6 +155,33 @@ def test_the_real_drop_refuses_off_linux(monkeypatch):
         caps.drop_capability(caps.CAP_CHOWN)
 
 
+@pytest.mark.parametrize("failing_step", ["prepare_slot_dirs", "drop_capability", "require_serving_caps"])
+def test_a_failed_slot_setup_or_drop_refuses_to_start(monkeypatch, failing_step):
+    calls = []
+    for name in ("prepare_slot_dirs", "drop_capability", "require_serving_caps"):
+        monkeypatch.setattr(caps, name, lambda *args, name=name: calls.append(name))
+
+    def fail(*args):
+        calls.append(failing_step)
+        raise (OSError(1, "Operation not permitted") if failing_step == "prepare_slot_dirs"
+               else caps.CapabilityError("capability 0 is still effective"))
+
+    monkeypatch.setattr(caps, failing_step, fail)
+    with pytest.raises(SystemExit, match="sandbox refuses to start"):
+        caps.prepare_slots_then_drop_chown()
+    order = ["prepare_slot_dirs", "drop_capability", "require_serving_caps"]
+    assert calls == order[:order.index(failing_step) + 1]
+
+
+def test_startup_prepares_all_seven_slots_then_drops_chown_then_checks(monkeypatch):
+    calls = []
+    monkeypatch.setattr(caps, "prepare_slot_dirs", lambda uids: calls.append(("prepare", tuple(uids))))
+    monkeypatch.setattr(caps, "drop_capability", lambda bit: calls.append(("drop", bit)))
+    monkeypatch.setattr(caps, "require_serving_caps", lambda: calls.append("require"))
+    caps.prepare_slots_then_drop_chown()
+    assert calls == [("prepare", tuple(range(20001, 20008))), ("drop", caps.CAP_CHOWN), "require"]
+
+
 # ── slot directories ────────────────────────────────────────────────────────
 def test_prepare_makes_each_slot_dir_owned_by_its_uid_and_group_mode_0700(tmp_path):
     # Not root here: "chown" to this process's own uid and gid, which needs no capability.

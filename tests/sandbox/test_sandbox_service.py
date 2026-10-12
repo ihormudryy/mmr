@@ -203,21 +203,20 @@ class _FakeServer:
 
 @pytest.fixture
 def startup(service, monkeypatch):
-    """_amain with every privileged step replaced by a recorder (a test must never drop its own capabilities)."""
+    """_amain with every privileged step replaced by a recorder (a test must never change its own capabilities)."""
     import signal
 
     from trader.sandbox import caps
 
     calls = []
     monkeypatch.setattr(service, "_join_trader_group", lambda: calls.append("join"))
-    monkeypatch.setattr(caps, "prepare_slot_dirs", lambda uids: calls.append(("prepare", tuple(uids))))
-    monkeypatch.setattr(caps, "drop_capability", lambda bit: calls.append(("drop", bit)))
     monkeypatch.setattr(caps, "require_serving_caps", lambda: calls.append("require"))
     monkeypatch.setattr(service, "read_build_id", lambda: "build-x")
     monkeypatch.setattr(service, "read_posture", lambda: calls.append("posture") or {"uid": 0})
 
     async def fake_serve(supervisor, sockets):
         calls.append(("serve", tuple(sorted(sockets))))
+        assert signal.getsignal(signal.SIGTERM) is not signal.SIG_DFL, "no SIGTERM handler before serving"
         os.kill(os.getpid(), signal.SIGTERM)   # as docker stop sends it, once the sockets listen
         return _FakeServer(calls)
 
@@ -234,15 +233,11 @@ def _run_with_timeout(service):
     asyncio.run(bounded())
 
 
-def test_chown_is_dropped_before_the_posture_is_read_and_sigterm_closes_the_server(service, startup):    # ruling 2
-    # The posture is read once: read before the drop, every PONG would show CHOWN and every proof would fail.
+def test_the_serving_caps_are_checked_before_the_posture_is_read_and_sigterm_closes_the_server(service, startup):
+    # The posture is read once: read with CHOWN still there, every PONG would show it and every proof would fail.
     # SIGTERM (docker stop) must close the server: stop listening, end every session, kill its child.
-    from trader.sandbox import caps
-    from trader.sandbox.child import SLOT_UIDS
-
     _run_with_timeout(service)
-    assert startup == ["join", ("prepare", tuple(SLOT_UIDS)), ("drop", caps.CAP_CHOWN), "require", "posture",
-                       ("serve", ("live", "research")), "close"]
+    assert startup == ["join", "require", "posture", ("serve", ("live", "research")), "close"]
 
 
 def test_sigint_also_closes_the_server(service, startup, monkeypatch):
@@ -258,18 +253,59 @@ def test_sigint_also_closes_the_server(service, startup, monkeypatch):
     assert startup[-2:] == ["serve", "close"]
 
 
-@pytest.mark.parametrize("failing_step", ["prepare_slot_dirs", "drop_capability", "require_serving_caps"])
-def test_a_failed_slot_setup_or_drop_never_serves(service, startup, monkeypatch, failing_step):
+def test_a_supervisor_that_still_holds_chown_never_serves(service, startup, monkeypatch):
     from trader.sandbox import caps
 
-    def fail(*args):
-        raise (OSError(1, "Operation not permitted") if failing_step == "prepare_slot_dirs"
-               else caps.CapabilityError("capability 0 is still effective"))
+    def chown_still_there():
+        raise caps.CapabilityError("effective capabilities are 00000000000000e1")
 
-    monkeypatch.setattr(caps, failing_step, fail)
+    monkeypatch.setattr(caps, "require_serving_caps", chown_still_there)
     with pytest.raises(SystemExit, match="refuses to start"):
         _run_with_timeout(service)
-    assert "posture" not in startup and not any(isinstance(c, tuple) and c[0] == "serve" for c in startup)
+    assert startup == ["join"]
+
+
+_STARTUP_SPY = textwrap.dedent('''
+    import json, runpy, sys
+    from trader.sandbox import caps
+
+    seen = []
+    caps.prepare_slot_dirs = lambda uids: seen.append(["prepare", list(uids)])
+    caps.drop_capability = lambda bit: seen.append(
+        ["drop", bit, sorted(m for m in ("pandas", "pyarrow", "numpy") if m in sys.modules)])
+    caps.require_serving_caps = lambda: seen.append(["require"])
+    sys.argv = ["trader.sandbox_service"] + sys.argv[1:]
+    try:
+        runpy.run_module("trader.sandbox_service", run_name="__main__", alter_sys=True)
+    except SystemExit:
+        pass   # not root: joining group trader, or the health probe, ends the run
+    print(json.dumps(seen))
+''')
+
+
+def _startup_record(*args: str) -> list:
+    out = subprocess.run([sys.executable, "-c", _STARTUP_SPY, *args], cwd=REPO, capture_output=True, text=True,
+                         timeout=60, check=True).stdout
+    return json.loads(out.strip().splitlines()[-1])
+
+
+def test_the_service_drops_chown_before_pandas_or_pyarrow_load():    # ruling 2: capset is per thread
+    from trader.sandbox import caps
+    from trader.sandbox.child import SLOT_UIDS
+
+    assert _startup_record() == [["prepare", list(SLOT_UIDS)], ["drop", caps.CAP_CHOWN, []], ["require"]]
+
+
+def test_a_health_run_never_touches_the_slot_dirs_or_capabilities():
+    assert _startup_record("--health") == []
+
+
+def test_the_capability_module_loads_no_library_that_starts_threads():
+    probe = ("import sys, trader.sandbox.caps\n"
+             "print(sorted(m for m in ('pandas', 'pyarrow', 'numpy') if m in sys.modules))")
+    out = subprocess.run([sys.executable, "-c", probe], cwd=REPO, capture_output=True, text=True, timeout=60,
+                         check=True).stdout
+    assert out.strip() == "[]"
 
 
 def test_nothing_that_runs_while_serving_needs_chown():    # carry-forward: CHOWN is gone once serving

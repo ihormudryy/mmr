@@ -219,7 +219,7 @@ Money and risk:
 - Plan 4 ruling 12: Jev's `strategy_trials` for an authored key = authored files judged so far + this file's trials.
 - Plan 5 ruling 8: a registration refused `AUTHORED_ISOLATION_UNPROVEN` waits for the next research evening.
 - Plan 5 ruling 14 (owner confirmed 2026-10-11): author spend has its own `ai_costs` role `author` (trader migration 132 rebuilds the table, rows and seals copied unchanged).
-- Plan 4 ruling 19 (review r1 #6, r2 #4): the proof is never cached; `is_proven` reads the authoritative trader proof for the build on every call, before every new session and on every bar, fail-closed. A proof withdrawn for a running build stops the next OPEN and bar with zero stale bars.
+- Plan 4 ruling 19 (review r1 #6, r2 #4): a passing proof is never cached; `is_proven` reads the authoritative trader proof for the build on every call, before every new session and on every bar, fail-closed, with a 2 s timeout on its own query client. Built 2026-10-12: after a read that got no answer (trader down, timeout, remote error) the gate stays shut for 20 s without asking, because the read runs on the strategy service's event loop; a definite answer is never held.
 - Plan 4 ruling 10 (review r1 #7): an authored end the trader refuses for good parks the request (claim open, `AUTHORED_REPORT_REFUSED`, resent hourly and at restart); refusal is never delivery.
 
 Deploy and runbook:
@@ -252,6 +252,14 @@ All other rulings:
   - A retirement whose withdrawal fails for a reason other than an SP2c refusal replies `REFUSED AUTHORED_WITHDRAWAL_FAILED` with `retryable: true` and the record already `RETIRED`; `refresh()` withdraws again; Plan 4's resend loop caps its resends.
   - `tests/fullstack/test_prove_isolation_in_research.py` is written but not run: Plan 2's runner starts no `research` service. Plan 5's acceptance runs it.
 - Plan 4, all other rulings: see the plan's Rulings section (R1-R6 in its "Cross-plan requirements" are settled).
+- Plan 4, made during the build (2026-10-12):
+  - A bar Plan 2's protocol refuses (high < low, negative volume, time outside 1970-2100, non-finite) is skipped; a live bar dated after today (New York) is skipped and never moves the session day.
+  - A research or live session on a build other than the STARTED build, and a fault at OPEN after the sandbox moved to another build, count as `SANDBOX_UNAVAILABLE`, never as the strategy's fault.
+  - The trader's claim also refuses (`STRATEGY_NOT_ALLOWED`) a cohort whose points do not name exactly the stored tunables or whose point 0 is not the stored defaults; Plan 5's author must build cohorts that way.
+  - A parked authored request (a refused STARTED, a wire error) closes its SP2c claim FAILED, resent each tick, so Plan 3's 24 h grace returns the record to `STORED`.
+  - The strategy service resends a retryable retire refusal or a remote error at most 20 times per digest, then logs one ERROR; an unreachable trader and `AUTHORED_STORE_UNAVAILABLE` are resent without counting. Pending retirements live in memory (ruling 18).
+  - A crashing authored instance is re-enabled after 60 s, doubling to at most 30 min; a decided bar resets it.
+  - The end report uses `update_claim`'s loud-code rule: a non-loud remote code (`AUTHORED_STORE_UNAVAILABLE`, `PERMISSION_DENIED`, `AUTHENTICATION_ERROR`) stops the research service; a restart resends.
 - Plan 5, all other rulings: see the plan's Rulings section.
 
 ## Tests

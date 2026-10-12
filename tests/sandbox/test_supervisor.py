@@ -585,3 +585,52 @@ def test_the_wipe_helper_never_follows_a_symlink_out_of_the_slot(tmp_path, monke
         monkeypatch.setattr(os, name, lambda *args: None, raising=False)
     assert wipe_slot_as_owner(Slot(uid=20003, directory=str(directory))) is True
     assert list(directory.iterdir()) == [] and (outside / "keep.txt").exists()
+
+
+# ── review fixes: defence in depth ──────────────────────────────────────────
+
+def test_a_probe_on_the_live_pool_is_a_bad_request(tmp_path):     # ruling 32
+    sup = _supervisor(tmp_path)
+    reply = sup.handle("live", 1, p.parse_request(
+        {"v": 1, "type": "OPEN_PROBE", "kind": "probe", "name": "benign_orb", "conids": [p.PROBE_CONID]}))
+    assert reply["code"] == p.SANDBOX_BAD_REQUEST and reply["detail"] == "probes are research-only"
+    assert sup.pong("live")["free"] == 3 and sup.pong("live")["live_open"] == 0
+
+
+def test_the_wipe_helper_closes_inherited_fds_before_it_drops_to_the_slot_uid(tmp_path, monkeypatch):
+    from trader.sandbox import supervisor as sv
+
+    directory = tmp_path / "s20001"
+    directory.mkdir()
+    order = tmp_path / "order"
+
+    def record(name, real=None):
+        def step(*args):
+            with open(order, "a") as out:
+                out.write(f"{name}:{args!r}\n")
+            if real is not None:
+                real(*args)
+        return step
+    monkeypatch.setattr(sv, "close_fds_except", record("close_fds", sv.close_fds_except))
+    for name in ("setgroups", "setresgid", "setresuid"):
+        monkeypatch.setattr(os, name, record(name), raising=False)
+    assert sv.wipe_slot_as_owner(sv.Slot(uid=20001, directory=str(directory))) is True
+    steps = [line.split(":")[0] for line in order.read_text().splitlines()]
+    assert steps == ["close_fds", "setgroups", "setresgid", "setresuid"]
+    assert "close_fds:(set(),)" in order.read_text()          # keeps only stdout and stderr
+
+
+def test_a_wipe_helper_that_never_exits_is_killed_and_the_slot_is_dirty(tmp_path, monkeypatch):
+    import time
+
+    from trader.sandbox import supervisor as sv
+
+    directory = tmp_path / "s20002"
+    directory.mkdir()
+    for name in ("setgroups", "setresgid", "setresuid"):
+        monkeypatch.setattr(os, name, lambda *args: None, raising=False)
+    monkeypatch.setattr(sv, "_empty", lambda path: time.sleep(60))     # a helper stuck forever
+    started = time.monotonic()
+    assert sv.wipe_slot_as_owner(sv.Slot(uid=20002, directory=str(directory)), timeout_s=0.3) is False
+    assert time.monotonic() - started < 5
+

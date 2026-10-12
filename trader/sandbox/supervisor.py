@@ -12,6 +12,7 @@ import resource
 import secrets
 import stat
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping, Optional
@@ -20,7 +21,8 @@ from trader.authored.keys import source_digest
 from trader.authored.static_check import (MAX_SOURCE_BYTES, AuthoredStaticRejected, _parse_quietly,
                                           require_clean)
 from trader.sandbox import protocol as proto
-from trader.sandbox.child import SBXCHILD_GID, SLOT_UIDS, ChildError, ChildHandle, SpawnSpec, Spawner
+from trader.sandbox.child import (SBXCHILD_GID, SLOT_UIDS, ChildError, ChildHandle, SpawnSpec, Spawner,
+                                  _kill_and_reap, close_fds_except)
 
 log = logging.getLogger("mmr.sandbox")
 
@@ -160,6 +162,8 @@ class Supervisor:
 
     # ── open: a probe (ruling 11) ───────────────────────────────────────────
     def _open_probe(self, pool_name: str, conn_id: int, request: proto.Request) -> dict:
+        if pool_name != "research":   # ruling 32: hostile probes never share the live pool
+            return _error(proto.SANDBOX_BAD_REQUEST, "probes are research-only")
         try:
             self._check_open(pool_name, conn_id, request.conids)
             source = _read_probe_source(request.kind, request.name)
@@ -382,9 +386,11 @@ def _only_class(source: str) -> str:
 
 
 _WIPE_CPU_SECONDS = 5
+_WIPE_TIMEOUT_S = 5.0
+_WIPE_POLL_S = 0.01
 
 
-def wipe_slot_as_owner(slot: Slot) -> bool:
+def wipe_slot_as_owner(slot: Slot, *, timeout_s: float = _WIPE_TIMEOUT_S) -> bool:
     """Empty a slot directory as its own uid (ruling 28, review r1 #2).
 
     The serving supervisor has only SETUID, SETGID and KILL: no CAP_CHOWN or CAP_DAC_*, so it cannot read a
@@ -397,6 +403,8 @@ def wipe_slot_as_owner(slot: Slot) -> bool:
         code = 1
         try:
             resource.setrlimit(resource.RLIMIT_CPU, (_WIPE_CPU_SECONDS, _WIPE_CPU_SECONDS))
+            # As the slot uid it must hold no listening socket and no other session's pipe.
+            close_fds_except(set())
             os.setgroups([])
             os.setresgid(SBXCHILD_GID, SBXCHILD_GID, SBXCHILD_GID)
             os.setresuid(slot.uid, slot.uid, slot.uid)
@@ -406,8 +414,25 @@ def wipe_slot_as_owner(slot: Slot) -> bool:
             code = 1
         finally:
             os._exit(code)
-    _, status = os.waitpid(pid, 0)
-    return os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    return _helper_succeeded(pid, timeout_s)
+
+
+def _helper_succeeded(pid: int, timeout_s: float) -> bool:
+    """Wait for the wipe helper at most ``timeout_s``. A helper that has not exited by then is killed and the
+    slot counts as dirty: the supervisor never blocks forever on a wipe."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            done, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return False
+        if done == pid:
+            return os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+        if time.monotonic() >= deadline:
+            log.error("wipe helper %s did not finish in %ss: killed", pid, timeout_s)
+            _kill_and_reap(pid)
+            return False
+        time.sleep(_WIPE_POLL_S)
 
 
 def _empty(directory: str) -> None:

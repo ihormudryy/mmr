@@ -74,6 +74,9 @@ TRANSITIONS: Mapping[AuthoredState, frozenset[AuthoredState]] = MappingProxyType
     DEPLOYED: frozenset({RETIRED, EXPIRED}),
 })
 UNAVAILABLE_ATTEMPTS = 3
+# How long a FAILED claim waits for Jev's judgment before refresh returns its record: one nightly research
+# cycle, far longer than the AI cycle's judgment step.
+CLAIM_FAILED_GRACE = dt.timedelta(hours=24)
 
 # Reasons a record carries (spec 7.3; rulings 9 and 11).
 SANDBOX_ERROR = "SANDBOX_ERROR"
@@ -308,13 +311,14 @@ def _retry_or_fail(conn: Any, record: AuthoredRecord, *, cause: str, now: dt.dat
                       detail=detail, attempts=attempts, evaluation_request_id=None)
 
 
-def _claim_failed_unjudged_in_tx(conn: Any, record: AuthoredRecord) -> bool:
-    """An EVALUATING record whose claim research closed FAILED and that no judgment moved. A FAILED claim that
-    is judged later is the judgment's to move; once this returns the record, that judgment is refused."""
+def _claim_failed_unjudged_in_tx(conn: Any, record: AuthoredRecord, now: dt.datetime) -> bool:
+    """An EVALUATING record whose claim research closed FAILED at least CLAIM_FAILED_GRACE ago and that no
+    judgment moved. A FAILED claim normally still gets Jev's judgment, which moves the record itself; one that
+    arrives after the grace is refused, because the record is no longer EVALUATING."""
     if record.state != EVALUATING or record.evaluation_request_id is None:
         return False
     claim = claim_row_in_tx(conn, record.evaluation_request_id)
-    if claim is None or claim.state != "FAILED":
+    if claim is None or claim.state != "FAILED" or now - claim.updated_at < CLAIM_FAILED_GRACE:
         return False
     judged = conn.execute("SELECT 1 FROM backtest_judgments WHERE request_id = ?",
                           [record.evaluation_request_id]).fetchone()
@@ -738,7 +742,8 @@ class AuthoredStrategyStore:
         """Ruling 11: a SHADOW or DEPLOYED record leaves the count when its window ends. Other stores are read
         first, outside the transaction; each record moves only if it did not move meanwhile. A line the strategy
         retired is withdrawn again while it still has a live version (its first withdrawal may have been lost).
-        An EVALUATING record whose claim failed without a judgment goes back to STORED, or to FAILED."""
+        An EVALUATING record whose claim failed and got no judgment within CLAIM_FAILED_GRACE goes back to STORED,
+        or to FAILED."""
         now = utc(self._now())
         records = self._db.transaction(records_in_tx)
         for record in records:
@@ -762,7 +767,7 @@ class AuthoredStrategyStore:
         next refresh tries again. The claim and judgment are read again inside the write transaction."""
         try:
             stranded = self._db.transaction(
-                lambda conn: [record for record in records if _claim_failed_unjudged_in_tx(conn, record)])
+                lambda conn: [record for record in records if _claim_failed_unjudged_in_tx(conn, record, now)])
             if stranded:
                 self._write(lambda conn: self._return_failed_claims_in_tx(conn, stranded, now))
         except Exception:
@@ -774,7 +779,7 @@ class AuthoredStrategyStore:
         for record in stranded:
             current = record_in_tx(conn, record.digest)
             if current is None or current.state_changed_at != record.state_changed_at \
-                    or not _claim_failed_unjudged_in_tx(conn, current):
+                    or not _claim_failed_unjudged_in_tx(conn, current, now):
                 continue
             _retry_or_fail(conn, current, cause=CLAIM_FAILED, now=now, request_id=current.evaluation_request_id,
                            detail="the evaluation claim closed FAILED without a judgment")

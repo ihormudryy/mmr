@@ -287,6 +287,34 @@ def test_a_malformed_build_id_fails_the_run(build_id):
     assert result.passed is False and check_of(result, "build_id").passed is False
 
 
+@pytest.mark.parametrize("boot_id", ["", None, 7])
+def test_a_baseline_without_a_boot_id_fails_the_run(boot_id):
+    # Without a boot id, a supervisor restarted by an escape could not be told apart.
+    class NoBootId(_FakeClient):
+        def ping(self):
+            info = _FakeInfo()
+            info.boot_id = boot_id
+            return info
+
+    result = ic.run_isolation_checks(NoBootId())
+    assert result.passed is False and check_of(result, "boot_id").passed is False
+
+
+def test_open_socket_counts_only_as_network_unreachable():
+    assert ic.EXPECTED_FAULT_MARKERS["escape_open_socket"] == ("Network is unreachable",)
+
+    class OtherOSError(_FakeClient):
+        def open_probe(self, kind, name):
+            if kind == "probe":
+                return _FakeSession()
+            if name == "escape_open_socket":
+                return _FakeSession("on_bar raised OSError: [Errno 9] Bad file descriptor")
+            return _FakeSession(_bar_fault(name))
+
+    result = ic.run_isolation_checks(OtherOSError())
+    assert result.passed is False and check_of(result, "escape_open_socket").passed is False
+
+
 # ── live sessions: no probe ever runs beside a live child (rulings 21, 29) ──
 
 @pytest.mark.parametrize("live_open", [None, 1])

@@ -301,10 +301,10 @@ def _gate_reserve(sup, monkeypatch):
     entered, release = threading.Event(), threading.Event()
     reserve = sup._reserve
 
-    def gated(*args):
+    def gated(*args, **kwargs):
         entered.set()
         release.wait(WAIT_S)
-        return reserve(*args)
+        return reserve(*args, **kwargs)
 
     monkeypatch.setattr(sup, "_reserve", gated)
     return entered, release

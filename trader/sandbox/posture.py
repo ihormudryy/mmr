@@ -25,17 +25,14 @@ _SIOCGIFADDR = 0x8915   # Linux ioctl: a device's primary IPv4 address
 _IFNAMSIZ = 16          # a device name is at most 15 bytes plus NUL
 
 
-def _proc_status() -> dict[str, str]:
-    out: dict[str, str] = {}
+def _proc_status(path: str = "/proc/self/status") -> dict[str, str]:
+    """The ``Key: value`` lines of a status file; {} when it cannot be read or decoded."""
     try:
-        with open("/proc/self/status") as status:
-            for line in status:
-                if ":" in line:
-                    key, value = line.split(":", 1)
-                    out[key.strip()] = value.strip()
-    except OSError:
-        pass
-    return out
+        with open(path, encoding="utf-8") as status:
+            lines = status.readlines()
+    except (OSError, ValueError):   # ValueError: bytes that are not UTF-8
+        return {}
+    return {key.strip(): value.strip() for key, value in (line.split(":", 1) for line in lines if ":" in line)}
 
 
 def _int_or_none(text: str | None, base: int = 10) -> int | None:
@@ -66,7 +63,7 @@ def forbidden_env_names() -> list[str]:
 def interfaces(net_dir: str = "/sys/class/net") -> list[str]:
     try:
         return sorted(os.listdir(net_dir))
-    except OSError:
+    except (OSError, ValueError):
         return [UNREADABLE]
 
 
@@ -91,9 +88,9 @@ def has_ipv4_address(name: str) -> bool | None:
 def ipv6_devices(if_inet6_path: str = "/proc/net/if_inet6") -> set[str] | None:
     """Every device that holds an IPv6 address; None when the table cannot be read."""
     try:
-        with open(if_inet6_path) as table:
+        with open(if_inet6_path, encoding="utf-8") as table:
             return {fields[-1] for fields in (line.split() for line in table) if len(fields) == 6}
-    except OSError:
+    except (OSError, ValueError):
         return None
 
 
@@ -112,17 +109,17 @@ def interface_states(names: list[str], *, net_dir: str = "/sys/class/net",
 
 def _read_text(path: str) -> str | None:
     try:
-        with open(path) as stream:
+        with open(path, encoding="utf-8") as stream:
             return stream.read().strip()
-    except OSError:
+    except (OSError, ValueError):
         return None
 
 
 def home_mounts(mounts_path: str = "/proc/mounts") -> list[str]:
     try:
-        with open(mounts_path) as mounts:
+        with open(mounts_path, encoding="utf-8") as mounts:
             targets = [line.split(" ")[1] for line in mounts if len(line.split(" ")) > 1]
-    except OSError:
+    except (OSError, ValueError):
         return [UNREADABLE]
     return sorted(target for target in targets if target.startswith(_REPORTED_MOUNT_ROOTS))
 
@@ -132,10 +129,10 @@ def root_read_only(mounts_path: str = "/proc/mounts") -> bool:
 
     Every mount on ``/`` must be ``ro``: a missing line, an unreadable file or any ``rw`` layer is False."""
     try:
-        with open(mounts_path) as mounts:
+        with open(mounts_path, encoding="utf-8") as mounts:
             root_options = [fields[3].split(",") for fields in (line.split(" ") for line in mounts)
                             if len(fields) > 3 and fields[1] == "/"]
-    except OSError:
+    except (OSError, ValueError):
         return False
     return bool(root_options) and all("ro" in options for options in root_options)
 
@@ -144,9 +141,9 @@ def pids_max(paths: tuple[str, ...] = ("/sys/fs/cgroup/pids.max", "/sys/fs/cgrou
     """The container's pids limit (compose ``pids_limit``), cgroup v2 first; "" when unreadable."""
     for path in paths:
         try:
-            with open(path) as limit:
+            with open(path, encoding="utf-8") as limit:
                 return limit.read().strip()
-        except OSError:
+        except (OSError, ValueError):
             continue
     return ""
 

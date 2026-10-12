@@ -124,3 +124,28 @@ def test_the_ipv4_reader_reports_unknown_for_a_device_it_cannot_ask():
 def test_read_posture_reports_interface_state():
     out = posture.read_posture()
     assert isinstance(out["interface_state"], dict)
+
+
+# ── bytes that are not UTF-8 are unknown, never a crash (Task 6 review) ────
+
+_NOT_UTF8 = b"\xff\xfe overlay / overlay ro 0 0\n"
+
+
+def test_non_utf8_proc_files_read_as_unknown(tmp_path):
+    bad = tmp_path / "bad"
+    bad.write_bytes(_NOT_UTF8)
+    assert posture._proc_status(str(bad)) == {}
+    assert posture.home_mounts(str(bad)) == [posture.UNREADABLE]
+    assert posture.root_read_only(str(bad)) is False
+    assert posture.pids_max((str(bad),)) == ""
+    assert posture.ipv6_devices(str(bad)) is None
+
+
+def test_non_utf8_interface_files_read_as_unknown(tmp_path):
+    net = tmp_path / "net"
+    (net / "tunl0").mkdir(parents=True)
+    (net / "tunl0" / "operstate").write_bytes(b"\xffdown")
+    (net / "tunl0" / "flags").write_bytes(b"\xff0x80")
+    states = posture.interface_states(["tunl0"], net_dir=str(net), if_inet6_path=str(net / "tunl0" / "flags"),
+                                      ipv4_reader=lambda name: False)
+    assert states["tunl0"] == {"operstate": None, "flags": None, "ipv4": False, "ipv6": None}

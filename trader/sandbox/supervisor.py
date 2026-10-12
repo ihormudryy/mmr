@@ -189,7 +189,7 @@ class Supervisor:
             return any(session.conn_id == conn_id for session in self._sessions.values())
 
     def _spawn(self, pool_name, conn_id, source, class_name, params, conids, *, skip_static_check) -> dict:
-        reserved = self._reserve(pool_name, conn_id, conids)
+        reserved = self._reserve(pool_name, conn_id, conids, is_probe=skip_static_check)
         if isinstance(reserved, dict):
             return reserved
         # Fork and load OUTSIDE the lock (a hanging load must not block other pools).
@@ -216,12 +216,16 @@ class Supervisor:
         return {"type": "OPENED", "v": proto.PROTOCOL_VERSION, "session": reserved.session_id,
                 "image_digest": self._image_digest}
 
-    def _reserve(self, pool_name: str, conn_id: int, conids: tuple[int, ...]) -> _Session | dict:
+    def _reserve(self, pool_name: str, conn_id: int, conids: tuple[int, ...], *,
+                 is_probe: bool) -> _Session | dict:
         """Take a slot and enter the session (without a child yet) in one step, so a drop during the
         spawn is seen and one connection never holds two sessions (ruling 7)."""
         with self._lock:
             if any(session.conn_id == conn_id for session in self._sessions.values()):
                 return _error(proto.SANDBOX_BAD_REQUEST, "this connection already holds a session")
+            # Ruling 29: a probe never starts beside a live child, open or still opening (it is in the table).
+            if is_probe and any(session.pool == "live" for session in self._sessions.values()):
+                return _error(proto.SANDBOX_BUSY, "live sessions open")
             pool = self._pools[pool_name]
             if not pool.free_slots:
                 return _error(proto.SANDBOX_BUSY, "no free slot")

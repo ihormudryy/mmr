@@ -634,3 +634,40 @@ def test_a_wipe_helper_that_never_exits_is_killed_and_the_slot_is_dirty(tmp_path
     assert sv.wipe_slot_as_owner(sv.Slot(uid=20002, directory=str(directory)), timeout_s=0.3) is False
     assert time.monotonic() - started < 5
 
+
+
+# ── no probe beside a live child (ruling 29, Task 6 review) ────────────────
+
+def test_a_probe_is_busy_while_a_live_session_is_open(tmp_path):
+    sup = _supervisor(tmp_path)
+    live = _open(sup, tmp_path, conn=1)["session"]
+    reply = _probe(sup, "probe", "benign_orb", conn=2)
+    assert reply["code"] == p.SANDBOX_BUSY and reply["detail"] == "live sessions open"
+    assert sup.pong("research")["free"] == 4
+    assert sup.handle("live", 1, p.parse_request({"v": 1, "type": "CLOSE", "session": live}))["type"] == "CLOSED"
+    assert _probe(sup, "probe", "benign_orb", conn=2)["type"] == "OPENED"
+
+
+def test_a_probe_is_busy_while_a_live_session_is_still_opening(tmp_path):
+    import threading
+
+    entered, release = threading.Event(), threading.Event()
+
+    class SlowLive(InProcessSpawner):
+        def spawn(self, spec):
+            entered.set()
+            assert release.wait(5)
+            return super().spawn(spec)
+
+    sup = _supervisor(tmp_path, spawners={"live": SlowLive(), "research": InProcessSpawner()})
+    replies = []
+    worker = threading.Thread(target=lambda: replies.append(_open(sup, tmp_path, conn=1)))
+    worker.start()
+    try:
+        assert entered.wait(5)
+        reply = _probe(sup, "probe", "benign_orb", conn=2)
+        assert reply["code"] == p.SANDBOX_BUSY and reply["detail"] == "live sessions open"
+    finally:
+        release.set()
+        worker.join(5)
+    assert replies[0]["type"] == "OPENED"

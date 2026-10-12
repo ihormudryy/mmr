@@ -44,7 +44,7 @@ EXPECTED_FAULT_MARKERS: dict[str, tuple[str, ...]] = {
     "escape_pd_io_common_oskill": ("PermissionError",),
     "escape_kill_other_child": ("PermissionError",),
     "escape_sys_modules_lookup": ("PermissionError",),
-    "escape_open_socket": ("OSError", "Network is unreachable"),
+    "escape_open_socket": ("Network is unreachable",),   # network_mode none; any other OSError proves nothing
 }
 LOAD_FAULT_PREFIXES = ("load failed", "constructor failed", "AUTHORED_STATIC_REJECTED", "import of",
                        "child load failed", "session not loaded")
@@ -73,7 +73,7 @@ class IsolationResult:
 def run_isolation_checks(client: SandboxClient) -> IsolationResult:
     """Posture first; then, only while no live session is open, the benign and the hostile sessions."""
     info = client.ping()
-    checks = [_build_id_check(info.image_digest), *_posture_checks(info.posture)]
+    checks = [_build_id_check(info.image_digest), _boot_id_check(info.boot_id), *_posture_checks(info.posture)]
     live_gate = _live_sessions_check(info.live_open)
     checks.append(live_gate)
     if live_gate.passed:   # rulings 21, 29: no probe ever runs beside a live strategy's child
@@ -88,6 +88,11 @@ def run_isolation_checks(client: SandboxClient) -> IsolationResult:
 def _build_id_check(image_digest: Any) -> CheckResult:
     well_formed = isinstance(image_digest, str) and BUILD_ID_RE.fullmatch(image_digest) is not None
     return CheckResult("build_id", well_formed, f"image_digest={_short(image_digest)}")
+
+
+def _boot_id_check(boot_id: Any) -> CheckResult:
+    """Each escape compares the boot id after it with this one; an empty id would hide a restart."""
+    return CheckResult("boot_id", isinstance(boot_id, str) and boot_id != "", f"boot_id={_short(boot_id)}")
 
 
 def _posture_checks(posture: Mapping[str, Any]) -> list[CheckResult]:

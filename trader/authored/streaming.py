@@ -38,6 +38,8 @@ def bar_fields(stamp: Any, values: Sequence[Any]) -> Optional[dict]:
 
     The protocol's own parser decides (finite numbers, high >= low, volume >= 0, a time from 1970 to 2100), so a
     bar sent here is never refused by the client (Plan 4 pre-flight F1)."""
+    if any(isinstance(value, (bool, str)) for value in values):   # the client sends numbers only
+        return None
     try:
         numbers = [float(value) for value in values]
         moment = utc_time(stamp)

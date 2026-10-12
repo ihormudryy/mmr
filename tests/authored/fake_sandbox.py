@@ -25,8 +25,9 @@ from trader.authored.api import MAX_LOOKBACK_BARS, MIN_LOOKBACK_BARS
 from trader.authored.keys import source_digest
 from trader.authored.sandbox_client import SandboxFault, SandboxInfo, SandboxProtocolError, SandboxUnavailable
 from trader.authored.static_check import require_clean
-from trader.sandbox.protocol import (MAX_SESSION_CONIDS, PROTOCOL_VERSION, SANDBOX_BUSY, SANDBOX_DIGEST_MISMATCH,
-                                     SANDBOX_ERROR, FrameError, parse_request)
+from trader.sandbox.protocol import (PROTOCOL_VERSION, SANDBOX_BUSY, SANDBOX_DIGEST_MISMATCH, SANDBOX_ERROR,
+                                     FrameError, parse_request)
+from trader.sandbox.supervisor import LIVE_POOL_SIZE, MAX_CONIDS_PER_SESSION, RESEARCH_POOL_SIZE
 
 CALLERS_DIR = Path(__file__).parent / "callers"
 ORB_FIXTURE = Path(__file__).parent / "fixtures" / "orb_authored.py"     # Plan 1's ORB port (decision D8)
@@ -130,8 +131,14 @@ class FakeSession:
 
 
 class FakeSandbox:
-    def __init__(self, *, pool: int = 4, image_digest: str = IMAGE_DIGEST, max_conids: int = MAX_SESSION_CONIDS):
-        self.pool, self.image_digest, self.max_conids = pool, image_digest, max_conids
+    def __init__(self, *, research: bool = True, pool: Optional[int] = None, image_digest: str = IMAGE_DIGEST,
+                 max_conids: Optional[int] = None):
+        """``research`` picks the real pool this fake stands for: its size and its conids per session. ``pool``
+        and ``max_conids`` override them for a test that needs another size."""
+        kind = "research" if research else "live"
+        self.pool = pool if pool is not None else (RESEARCH_POOL_SIZE if research else LIVE_POOL_SIZE)
+        self.max_conids = max_conids if max_conids is not None else MAX_CONIDS_PER_SESSION[kind]
+        self.image_digest = image_digest
         self.sources: dict[str, str] = {}
         self.sessions: list[FakeSession] = []           # every session ever opened, in order
         self.open_sessions: list[FakeSession] = []
@@ -158,17 +165,18 @@ class FakeSandbox:
                       "params": dict(params), "bar_size": bar_size, "conids": list(conids)})
         conids = tuple(int(conid) for conid in conids)
         if len(conids) > self.max_conids:
-            raise SandboxProtocolError(f"conids must be 1-{self.max_conids} distinct conids")
+            raise SandboxProtocolError(f"a session takes at most {self.max_conids} conids")
         refused = self.refuse_opens_after is not None and len(self.sessions) >= self.refuse_opens_after
         if self.unavailable or refused:
             raise SandboxUnavailable("fake: socket unreachable")
-        if len(self.open_sessions) >= self.pool:
-            raise SandboxUnavailable(SANDBOX_BUSY)
+        # The supervisor reads, hashes and checks the file before it reserves a slot (supervisor._open_store).
         source = self.sources.get(digest)
         if source is None or digest in self.tampered:
             raise fault(SANDBOX_DIGEST_MISMATCH)
         if require_clean(source) != class_name:
-            raise fault(SANDBOX_ERROR)
+            raise fault(SANDBOX_DIGEST_MISMATCH)
+        if len(self.open_sessions) >= self.pool:
+            raise SandboxUnavailable(SANDBOX_BUSY)
         namespace: dict = {}
         exec(compile(source, f"<authored {digest}>", "exec"), namespace)   # fixture sources, test process only
         session = FakeSession(self, namespace[class_name], params, digest, conids)

@@ -10,7 +10,8 @@ from trader.authored.sandbox_client import SandboxFault, SandboxProtocolError, S
 from trader.authored.static_check import require_clean
 from trader.authored.streaming import AUTHORED_SIGNAL_RISK, BarStream, bar_fields, decision_signal
 from trader.objects import Action
-from trader.sandbox.protocol import SANDBOX_DIGEST_MISMATCH, SANDBOX_ERROR
+from trader.sandbox.protocol import MAX_SESSION_CONIDS, SANDBOX_DIGEST_MISMATCH, SANDBOX_ERROR
+from trader.sandbox.supervisor import LIVE_POOL_SIZE, RESEARCH_POOL_SIZE
 
 UTC = dt.timezone.utc
 CONID, OTHER = 265598, 76792991
@@ -35,7 +36,7 @@ def test_bar_fields_are_floats_at_a_utc_time():
 
 
 @pytest.mark.parametrize("values", [(1, 2, 0.5, math.nan, 100), (1, 2, 0.5, 1.5, None), (1, 2, 0.5, 1.5, math.inf),
-                                    (1, 2, 0.5, 1.5)])
+                                    (1, 2, 0.5, 1.5), (1, 2, 0.5, "1.5", 100)])
 def test_a_bar_with_a_missing_value_is_not_sent(values):
     assert bar_fields(NOON, values) is None
 
@@ -81,7 +82,7 @@ def test_the_history_is_the_bars_sent_capped_at_lookback():
 
 
 def test_two_conids_of_one_session_keep_their_own_history_and_clock():
-    sandbox = FakeSandbox()
+    sandbox = FakeSandbox(research=False)
     session = session_of(sandbox, "counts_bars", "CountsBars", conids=(CONID, OTHER))
     first, second = BarStream(session, CONID), BarStream(session, OTHER)
     assert first.send_frame(bars(30))[-1].probability == 30 / 10000
@@ -222,3 +223,30 @@ def test_a_strategy_that_returns_a_bad_decision_faults_the_session():
     with pytest.raises(SandboxFault):
         stream.send_frame(bars(3))                       # probability 2.0 is out of range
     assert sandbox.open_sessions == [] and fault(SANDBOX_ERROR).code == SANDBOX_ERROR
+
+
+def test_a_class_that_is_not_in_the_stored_file_is_a_digest_mismatch():
+    sandbox = FakeSandbox()
+    digest = sandbox.add(caller_source("counts_bars"))
+    with pytest.raises(SandboxFault) as raised:
+        sandbox.open_session(digest, "WrongName", {}, "1 min", (CONID,))
+    assert raised.value.code == SANDBOX_DIGEST_MISMATCH
+
+
+def test_the_file_is_checked_before_a_slot_is_reserved():
+    sandbox = FakeSandbox(pool=1)
+    session_of(sandbox, "counts_bars", "CountsBars")                 # the pool is full
+    digest = sandbox.add(caller_source("faults_above_limit"))
+    sandbox.tampered.add(digest)
+    with pytest.raises(SandboxFault) as raised:
+        sandbox.open_session(digest, "FaultsAboveLimit", {}, "1 min", (CONID,))
+    assert raised.value.code == SANDBOX_DIGEST_MISMATCH
+
+
+def test_a_research_session_takes_one_conid_and_a_live_session_up_to_the_limit():
+    research, live = FakeSandbox(), FakeSandbox(research=False)
+    with pytest.raises(SandboxProtocolError):
+        session_of(research, "counts_bars", "CountsBars", conids=(CONID, OTHER))
+    assert research.sessions == []
+    assert session_of(live, "counts_bars", "CountsBars", conids=tuple(range(1, MAX_SESSION_CONIDS + 1))).conids
+    assert (research.pool, live.pool) == (RESEARCH_POOL_SIZE, LIVE_POOL_SIZE)

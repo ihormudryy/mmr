@@ -901,6 +901,8 @@ def _resolve_contract(trader: Any, conid: int):
 
 
 ALPACA_QUOTE_TIMEOUT_SECS = 3.0
+# The pending proposals the risk projection shows an impact for (H2): more than any card rail shows.
+_IMPACT_PROPOSAL_LIMIT = 50
 
 
 def _build_quote_authority(
@@ -1472,10 +1474,14 @@ def build_command_stack(
         snapshot = broker_snapshot.capture(trader.ib_account)
         from trader.trading.portfolio_risk import enrich_risk_projection
 
+        pending = [proposal for proposal in repository.list("PENDING", _IMPACT_PROPOSAL_LIMIT)
+                   if proposal.account_id == trader.ib_account]
         return enrich_risk_projection(
             snapshot,
             duckdb_path=trader.duckdb_path,
             history_duckdb_path=getattr(trader, 'history_duckdb_path', '') or '',
+            pending_proposals=pending,
+            instrument_currency=lambda conid: getattr(_resolve_security(trader, conid), "currency", None),
         )
 
     risk_producer = RiskProducer(

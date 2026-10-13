@@ -13,7 +13,7 @@ import json
 import math
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 
 BROKER_STATE_MIGRATION_VERSION = 10
@@ -264,6 +264,13 @@ class BrokerRiskSnapshotError(RuntimeError):
         super().__init__(f"{code}: {message}")
 
 
+def _net_liquidation_currency(balances: Mapping[str, str]) -> Optional[str]:
+    """The one currency of the ``NetLiquidation:<currency>`` balances, leaving out IB's ``BASE`` pseudo-row."""
+    currencies = {key.split(":", 1)[1] for key in balances
+                  if key.startswith("NetLiquidation:") and key != "NetLiquidation:BASE"}
+    return currencies.pop() if len(currencies) == 1 else None
+
+
 @dataclass(frozen=True)
 class BrokerRiskSnapshot:
     """Immutable account/position/order evidence from one DuckDB snapshot.
@@ -286,6 +293,8 @@ class BrokerRiskSnapshot:
     # When the promoted generation's enumeration began: broker activity
     # recorded before this time is reflected in the snapshot.
     generation_started_at: Optional[dt.datetime] = None
+    # The currency IB reported net liquidation in, or None when no single one is known (H2 reads it).
+    base_currency: Optional[str] = None
 
     def reducible_quantity(self, conid: int) -> float:
         return sum(row.quantity for row in self.positions if row.conid == conid)
@@ -862,6 +871,7 @@ class BrokerStateStore:
             positions=positions,
             working_orders=working_orders,
             generation_started_at=started_at,
+            base_currency=_net_liquidation_currency(account.balances),
         )
 
 

@@ -485,12 +485,19 @@ function renderProposals() {
   const pendingBtn = document.querySelector('[data-proposal-filter="pending"]');
   if (pendingBtn) pendingBtn.textContent = `Pending ${(v.proposals.active || []).length}`;
   const rows = proposalFilterRows();
+  // H2: the impact comes from the trader's risk projection; a degraded journal shows none rather than a stale one.
+  const journal = v.health && v.health.sources && v.health.sources.journal;
+  const riskTrusted = Boolean(journal) && journal.state === 'ok';
   const cards = rows.map(p => {
     const age = ageOf(p.created_at);
     const status = String(p.status || '').toUpperCase();
     const side = String(p.action || p.side || '').toUpperCase();
     const sideCls = side === 'BUY' ? 'buy' : side === 'SELL' ? 'sell' : '';
     const thesis = p.thesis || p.reasoning || '';
+    const impact = (riskTrusted && status === 'PENDING')
+      ? ccProposalImpactText(ccProposalImpact(v.risk, p), p.symbol || '') : null;
+    const impactLine = impact
+      ? `<div class="tt-prop-impact${impact.unavailable ? ' dim' : ''}">${esc(impact.text)}</div>` : '';
     // Inline Approve/Reject reuse the exact drawer command path
     // (ccApproveProposal runs the live preflight ceremony when required);
     // Details falls through to the card click -> detail drawer.
@@ -516,6 +523,7 @@ function renderProposals() {
         <span>conf <b>${esc(p.confidence ?? '—')}</b></span>
         <span>status <b>${esc(status)}</b></span>
         <span>source ${esc(p.source || '—')}</span></div>
+      ${impactLine}
       ${thesis ? `<div class="prop-thesis">${esc(thesis)}</div>` : ''}
       ${actions}
     </div>`;

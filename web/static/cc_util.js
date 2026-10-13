@@ -136,6 +136,55 @@
     };
   }
 
+  // H2: why the trader computed no impact for a proposal (trader/trading/proposal_impact.py).
+  const CC_IMPACT_REASONS = {
+    NOT_A_STOCK: 'not a stock',
+    NO_CONID: 'no conId',
+    SYMBOL_MISMATCH: 'held symbol differs',
+    INSTRUMENT_CURRENCY_UNKNOWN: 'instrument currency unknown',
+    INSTRUMENT_NOT_USD: 'not a USD instrument',
+    MIXED_CURRENCY: 'a non-USD position in its group',
+    ACCOUNT_CURRENCY_UNKNOWN: 'account currency unknown',
+    ACCOUNT_NOT_USD: 'account is not in USD',
+    NO_NET_LIQUIDATION: 'no net liquidation',
+    NO_PRICE: 'no price',
+    UNKNOWN_SIDE: 'unknown side',
+  };
+
+  // The trader's impact row for one proposal, from its account's risk projection, or null.
+  function ccProposalImpact(riskByKey, proposal) {
+    if (!riskByKey || !proposal) return null;
+    const projection = riskByKey[`projection:${proposal.account_id}`];
+    if (!projection) return null;
+    const id = String(proposal.entity_id ?? proposal.id);
+    return (projection.impacts || []).find((row) => String(row.proposal_id) === id) || null;
+  }
+
+  function ccCompactMoney(value) {
+    const abs = Math.abs(value);
+    if (abs >= 1e6) return `${(abs / 1e6).toFixed(1)}M`;
+    if (abs >= 1e3) return `${(abs / 1e3).toFixed(1)}k`;
+    return abs.toFixed(0);
+  }
+
+  // "Δ exposure AAPL 10.6% → 12.9% · tech 48.0% → 51.0% of 60.0% · gross +$17.7k", or why there is none.
+  function ccProposalImpactText(impact, symbol) {
+    if (!impact) return null;
+    if (impact.unavailable) {
+      const reason = CC_IMPACT_REASONS[impact.unavailable] || String(impact.unavailable);
+      return { unavailable: true, text: `Δ exposure unavailable: ${reason}` };
+    }
+    const pct = (value) => `${Number(value).toFixed(1)}%`;
+    const parts = [`${symbol} ${pct(impact.symbol_before_pct)} → ${pct(impact.symbol_after_pct)}`];
+    for (const group of impact.groups || []) {
+      const budget = group.budget_pct == null ? '' : ` of ${pct(group.budget_pct)}`;
+      parts.push(`${group.name} ${pct(group.before_pct)} → ${pct(group.after_pct)}${budget}`);
+    }
+    const delta = Number(impact.gross_delta);
+    parts.push(`gross ${delta < 0 ? '−' : '+'}$${ccCompactMoney(delta)}`);
+    return { unavailable: false, text: `Δ exposure ${parts.join(' · ')}` };
+  }
+
   function ccRiskWarningText(warning) {
     if (warning == null) return '';
     if (typeof warning === 'string') return warning;
@@ -178,6 +227,8 @@
     ccAccountModeValue,
     ccRiskBarState,
     ccRiskWarningText,
+    ccProposalImpact,
+    ccProposalImpactText,
     ccStrategyName,
   };
 }));

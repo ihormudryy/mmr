@@ -258,7 +258,7 @@ e2b2fd1 (VwapReclaim on_prices). These are the residual robustness items.
   (`_maybe_start_risk_projection` in `trader/trader_service.py`); an unchanged
   projection is not journaled again.
 
-### H2 — Proposal exposure-impact line  (M, low risk)
+### H2 — Proposal exposure-impact line  ✅ DONE
 
 - **Symptom:** the Modernist redesign's `TradingTab` component shows a
   **Δ exposure** line on each proposal card — e.g. "AAPL 10.6% → 12.9% · tech
@@ -284,6 +284,21 @@ e2b2fd1 (VwapReclaim on_prices). These are the residual robustness items.
   the project's precision rule forbids. Compute it authoritatively server-side
   or omit it. Pairs well with **H1** (both surface the same portfolio-risk
   math). Design source: `TradingTab.dc.html`, proposal card `Δ exposure` line.
+- **Done (2026-10-13):** the trader's risk projection (refreshed every 15 s,
+  #169) carries `impacts`, one row per PENDING proposal of the account
+  (`trader/trading/proposal_impact.py`): the symbol's weight before → after
+  (position matched by conId), each position group holding the symbol before →
+  after with its budget, and the gross change in dollars. A BUY adds the fill
+  value, a SELL subtracts it, and a SELL past the long counts as a short.
+  The card shows it as `.tt-prop-impact`.
+  - **Owner ruling (USD only):** an impact is computed only when the account's
+    net liquidation is in USD (`BrokerRiskSnapshot.base_currency`), the
+    instrument is known to be USD (a held position or its universe definition)
+    and every position it counts is USD. Otherwise the row names the reason
+    (for example `INSTRUMENT_NOT_USD`) and the card says the impact is
+    unavailable. Options, a missing conId or a missing price get no impact.
+  - Sectors are not used: the only grouping is the operator's position groups.
+    No "market-neutral" label is inferred.
 
 ---
 

@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "run_sandbox_fullstack.sh"
 SBXTEST_OVERRIDE = ROOT / "docker-compose.sbxtest.override.yml"
 sys.path.insert(0, str(ROOT / "scripts"))
-from check_sbxtest_config import LIVE_PORTS, PRODUCTION_IMAGE, problems  # noqa: E402
+from check_sbxtest_config import LIVE_PORTS, PRODUCTION_IMAGE, _is_credential, problems  # noqa: E402
 
 HOME = "/Users/operator"
 IMAGE = "mmr-sbxtest:abc123-test"
@@ -27,8 +27,41 @@ SAFE = {"name": "mmr-sbxtest",
         "volumes": {"mmr_sandbox_live": {"name": "mmr-sbxtest_mmr_sandbox_live"}}}
 
 
+# Ruling G12: research runs sandbox's image (no build of its own) with only the research socket.
+RESEARCH = {"image": IMAGE, "network_mode": "none", "environment": {"TZ": "UTC"},
+            "volumes": [{"type": "volume", "source": "mmr_sandbox_research", "target": "/run/sandbox-research"}]}
+
+
+def _with_research() -> dict:
+    config = json.loads(json.dumps(SAFE))
+    config["services"]["research"] = json.loads(json.dumps(RESEARCH))
+    return config
+
+
 def test_a_safe_config_passes():
     assert problems(SAFE, operator_home=HOME, repo_root="/repo") == []
+
+
+def test_the_plain_test_research_service_is_allowed():
+    assert problems(_with_research(), operator_home=HOME, repo_root="/repo") == []
+
+
+@pytest.mark.parametrize("change, fragment", [
+    (lambda r: r.update(environment={"TWS_PASSWORD": "secret"}), "research carries credential/mode"),
+    (lambda r: r.update(environment={"TRADING_MODE": "paper"}), "research carries credential/mode"),
+    (lambda r: r.update(ports=[{"published": "42106", "target": 42106}]), "research publishes host port"),
+    (lambda r: r["volumes"].append({"type": "bind", "source": f"{HOME}/.config/mmr/keys/rpc/research.key"}),
+     "research binds"),
+    (lambda r: r["volumes"].append({"type": "bind", "source": f"{HOME}/.config/mmr/trader.yaml"}), "research binds"),
+    (lambda r: r.update(image=PRODUCTION_IMAGE), "research uses the production image"),
+    (lambda r: r.update(image=PRODUCTION_IMAGE, build={"context": "."}), "research uses the production image"),
+    (lambda r: r.update(env_file=[{"path": "/repo/.env"}]), "research reads env file"),
+    (lambda r: r.update(network_mode="host"), "research uses the host network"),
+])
+def test_a_research_service_that_could_touch_a_live_stack_is_refused(change, fragment):
+    config = _with_research()
+    change(config["services"]["research"])
+    assert any(fragment in line for line in problems(config, operator_home=HOME, repo_root="/repo"))
 
 
 @pytest.mark.parametrize("change, fragment", [
@@ -116,7 +149,8 @@ def test_the_override_pins_the_two_services_to_test_tags_and_strips_live_ports()
     assert services["sandbox"]["image"] == "${MMR_SBXTEST_IMAGE}"
     assert services["fullstack-tests"]["image"] == "${MMR_SBXTEST_IMAGE}-test"
     command = services["fullstack-tests"]["command"]
-    assert "tests/fullstack/test_sandbox_service.py" in command and "--timeout=600" in command
+    # The runner picks the file with --test; without one it is the sandbox test.
+    assert "${MMR_SBXTEST_TEST:-tests/fullstack/test_sandbox_service.py}" in command and "--timeout=600" in command
     assert "-rA" in command                                       # every outcome is listed, failures included
     environment = services["fullstack-tests"]["environment"]
     assert "TRADING_MODE" not in environment
@@ -124,12 +158,14 @@ def test_the_override_pins_the_two_services_to_test_tags_and_strips_live_ports()
     assert environment["MMR_FAKE_BROKER"] == "1" and environment["MMR_SBXTEST_STRICT"] == "1"
     for name in ("ib-gateway", "trader", "dashboard"):
         assert services[name]["ports"] == []
+    assert services["research"]["image"] == "${MMR_SBXTEST_IMAGE}"     # sandbox's own test-only image
 
 
 PASSED_SUMMARY = "============================== 34 passed in 13.48s =============================="
 
 
-def run_with_fake_docker(tmp_path, *, run_status: int = 0, run_output: str = PASSED_SUMMARY, **env):
+def run_with_fake_docker(tmp_path, *, run_status: int = 0, run_output: str = PASSED_SUMMARY,
+                         args: tuple[str, ...] = (), **env):
     bin_dir, log = tmp_path / "bin", tmp_path / "docker.log"
     bin_dir.mkdir()
     rendered = json.dumps(SAFE)
@@ -143,7 +179,7 @@ def run_with_fake_docker(tmp_path, *, run_status: int = 0, run_output: str = PAS
     (bin_dir / "docker").chmod(0o755)
     (bin_dir / "uv").write_text(f'#!/bin/bash\n{{ echo "ENV:"; env; echo "ARGV: uv HOME=$HOME $*"; }} >> {log}\n')
     (bin_dir / "uv").chmod(0o755)
-    result = subprocess.run(["bash", str(SCRIPT)], capture_output=True, text=True, timeout=60,
+    result = subprocess.run(["bash", str(SCRIPT), *args], capture_output=True, text=True, timeout=60,
                             env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "HOME": HOME, **env})
     return result, (log.read_text().splitlines() if log.exists() else [])
 
@@ -152,7 +188,7 @@ def _argv(lines):
     return [line[len("ARGV: "):] for line in lines if line.startswith("ARGV: ")]
 
 
-def test_the_runner_uses_a_throwaway_home_the_test_project_and_only_the_two_services(tmp_path):
+def test_the_runner_uses_a_throwaway_home_the_test_project_and_only_its_three_services(tmp_path):
     result, lines = run_with_fake_docker(tmp_path)
     assert result.returncode == 0, result.stderr
     argv = _argv(lines)
@@ -161,11 +197,13 @@ def test_the_runner_uses_a_throwaway_home_the_test_project_and_only_the_two_serv
     assert all(not call.startswith(f"uv HOME={HOME} ") for call in argv)         # never the operator's home
     keys = next(call for call in argv if "keys init" in call)                    # test-only keys
     assert "--keys-dir" in keys and f"{HOME}/" not in keys
+    config = next(call for call in compose if " config " in f" {call} ")
+    assert config.rstrip().endswith("config --format json sandbox research fullstack-tests")   # all are checked
     build = next(call for call in compose if " build " in f" {call} ")
-    assert build.rstrip().endswith("build sandbox fullstack-tests")              # only the two services
+    assert build.rstrip().endswith("build sandbox fullstack-tests")              # research reuses sandbox's image
     up = next(call for call in compose if " up " in f" {call} ")
     # Detached: no compose watcher, so the restart test's sandbox exit cannot abort the run (phase 2, run 1).
-    assert " -d " in f" {up} " and "--wait" in up and up.rstrip().endswith(" sandbox")
+    assert " -d " in f" {up} " and "--wait" in up and up.rstrip().endswith(" sandbox research")
     run = next(call for call in compose if " run " in f" {call} ")
     assert "--rm" in run and "--no-deps" in run and run.rstrip().endswith(" fullstack-tests")
     assert "--service-ports" not in run                                          # still no published port
@@ -198,6 +236,36 @@ def test_a_run_that_skipped_or_ran_nothing_is_a_failure_even_when_pytest_exits_0
 def test_a_long_run_summary_with_its_clock_time_still_passes(tmp_path):
     result, _ = run_with_fake_docker(tmp_path, run_output="=========== 34 passed in 75.32s (0:01:15) ===========")
     assert result.returncode == 0, result.stderr
+
+
+def _test_files_passed(lines) -> set[str]:
+    return {line.split("=", 1)[1] for line in lines if line.startswith("MMR_SBXTEST_TEST=")}
+
+
+def test_without_test_the_runner_runs_the_sandbox_test(tmp_path):
+    result, lines = run_with_fake_docker(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert _test_files_passed(lines) == {"tests/fullstack/test_sandbox_service.py"}
+
+
+def test_test_picks_the_container_test_file(tmp_path):
+    chosen = "tests/fullstack/test_prove_isolation_in_research.py"
+    result, lines = run_with_fake_docker(tmp_path, args=("--test", chosen))
+    assert result.returncode == 0, result.stderr
+    assert _test_files_passed(lines) == {chosen}                 # every compose call renders the same command
+
+
+@pytest.mark.parametrize("args", [
+    ("--test", "tests/test_sandbox_fullstack_runner.py"),        # not a container test
+    ("--test", "tests/fullstack/../test_x.py"),
+    ("--test", "/etc/passwd"),
+    ("--test", "tests/fullstack/test_missing_file.py"),          # well formed, but absent
+    ("--test",),
+    ("--other",),
+])
+def test_a_bad_test_argument_is_refused_before_any_docker_call(tmp_path, args):
+    result, calls = run_with_fake_docker(tmp_path, args=args)
+    assert result.returncode == 2 and calls == []
 
 
 def test_cleanup_removes_only_the_runs_own_test_images(tmp_path):
@@ -276,11 +344,11 @@ def test_both_scripts_are_executable():
 def _render(tmp_path):
     empty_env = tmp_path / "compose.env"
     empty_env.write_text("")
-    # Exactly what the runner renders: the two services, a test-only image, and a clean environment.
+    # Exactly what the runner renders: the three services, a test-only image, and a clean environment.
     return subprocess.run(
         ["docker", "compose", "-p", "mmr-sbxtest", "--env-file", str(empty_env), "-f", "docker-compose.yml",
          "-f", "docker-compose.test.override.yml", "-f", "docker-compose.sbxtest.override.yml",
-         "--profile", "test", "config", "--format", "json", "sandbox", "fullstack-tests"],
+         "--profile", "test", "config", "--format", "json", "sandbox", "research", "fullstack-tests"],
         cwd=ROOT, capture_output=True, text=True, timeout=120,
         env={"PATH": os.environ["PATH"], "HOME": str(tmp_path / "home"), "MMR_BUILD_ID": "abc123-test",
              "MMR_SBXTEST_IMAGE": "mmr-sbxtest:abc123-test",
@@ -288,17 +356,18 @@ def _render(tmp_path):
 
 
 @pytest.mark.skipif(shutil.which("docker") is None, reason="docker is not installed")
-def test_the_real_rendered_config_of_the_two_services_passes_the_checker(tmp_path):
+def test_the_real_rendered_config_of_the_three_services_passes_the_checker(tmp_path):
     rendered = _render(tmp_path)
     if rendered.returncode != 0:
         pytest.skip(f"docker compose config is not available here: {rendered.stderr[-200:]}")
     config = json.loads(rendered.stdout)
     assert config["name"] == "mmr-sbxtest"
-    assert set(config["services"]) == {"sandbox", "fullstack-tests"}      # ib-gateway et al. are not rendered
+    assert set(config["services"]) == {"sandbox", "research", "fullstack-tests"}   # ib-gateway et al. are not
     assert problems(config, operator_home=str(Path.home()), repo_root=str(ROOT)) == []
     images = [s.get("image") for s in config["services"].values()]
     assert images and all(str(img).startswith("mmr-sbxtest:") for img in images)   # never mmr:latest
-    assert len(set(images)) == len(images)                                          # one tag per built service
+    built = [s["image"] for s in config["services"].values() if s.get("build")]
+    assert len(set(built)) == len(built) == 2                                       # one tag per built service
     assert [p for s in config["services"].values() for p in s.get("ports", []) or []] == []
 
 
@@ -315,6 +384,23 @@ def test_the_test_runner_waits_for_a_healthy_sandbox_and_shares_its_volumes(tmp_
     assert mounts["/run/sandbox-live"] == "mmr_sandbox_live"
     assert mounts["/run/sandbox-research"] == "mmr_sandbox_research"
     assert mounts["/var/run/docker.sock"] == "/var/run/docker.sock"            # the base mount is kept
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="docker is not installed")
+def test_the_rendered_research_runs_sandboxs_image_with_only_the_research_socket(tmp_path):
+    rendered = _render(tmp_path)
+    if rendered.returncode != 0:
+        pytest.skip(f"docker compose config is not available here: {rendered.stderr[-200:]}")
+    services = json.loads(rendered.stdout)["services"]
+    research = services["research"]
+    assert research["image"] == services["sandbox"]["image"] and "build" not in research
+    assert [(v["type"], v["source"], v["target"]) for v in research["volumes"]] == [
+        ("volume", "mmr_sandbox_research", "/run/sandbox-research")]               # no key, config, DB or logs
+    assert research["network_mode"] == "none" and "networks" not in research
+    assert research["command"] == ["sleep", "infinity"] and not research.get("depends_on")
+    assert not research.get("ports") and not research.get("env_file")
+    assert not any(_is_credential(name) for name in research.get("environment", {}))
+    assert research["user"] == "trader" and research["read_only"] is True
 
 
 def test_only_the_sbxtest_override_gives_the_test_runner_the_sandbox_volumes():

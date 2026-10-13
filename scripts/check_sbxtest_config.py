@@ -18,8 +18,9 @@ from trader.sandbox.posture import FORBIDDEN_ENV_NAMES, FORBIDDEN_ENV_PREFIXES  
 LIVE_PORTS = frozenset({7496, 7497, 5901, 7424, 8081, *range(42001, 42010), *range(42101, 42110)})
 PROJECT_PREFIX = "mmr-sbxtest"
 PRODUCTION_IMAGE = "mmr:latest"
-# The only services the sandbox test starts (review r2 #2). Plan 3 Task 10 adds research here.
-ALLOWED_SERVICES = frozenset({"sandbox", "fullstack-tests"})
+# The only services the container tests start (review r2 #2); research runs the isolation proof's in-container step
+# (SP3 Plan 5 ruling G12).
+ALLOWED_SERVICES = frozenset({"sandbox", "research", "fullstack-tests"})
 # Any of these on a rendered service's environment, with a non-empty value, means live broker/provider access.
 CREDENTIAL_PREFIXES = (*FORBIDDEN_ENV_PREFIXES, "TWS")
 CREDENTIAL_NAMES = frozenset({*FORBIDDEN_ENV_NAMES, "TRADING_MODE"})

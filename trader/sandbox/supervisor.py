@@ -109,7 +109,7 @@ class Supervisor:
         if request.type == "PING":
             return self.pong(pool_name)
         if request.type == "OPEN":
-            return self._open_store(pool_name, conn_id, request)
+            return self._with_build(self._open_store(pool_name, conn_id, request))
         if request.type == "OPEN_PROBE":
             return self._open_probe(pool_name, conn_id, request)
         if request.type == "BAR":
@@ -117,6 +117,13 @@ class Supervisor:
         if request.type == "CLOSE":
             return self._close(conn_id, request)
         return _error(proto.SANDBOX_BAD_REQUEST, f"unknown type {request.type!r}")
+
+    def _with_build(self, reply: dict) -> dict:
+        """An ERROR answered to OPEN names this build, as OPENED does: no session reported one, and a caller
+        blames the file only for a fault of the build it checked (PR #161 review)."""
+        if reply.get("type") != "ERROR":
+            return reply
+        return {**reply, "image_digest": self._image_digest}
 
     def pong(self, pool_name: str) -> dict:
         """Lock-free, so health always answers (ruling 25)."""

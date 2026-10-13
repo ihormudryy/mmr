@@ -246,13 +246,16 @@ def test_a_fault_on_ping_is_unavailable_and_reports_nothing(world, sandbox, erro
     assert trader.authored_reports == [] and sandbox.sessions == []
 
 
-def faulting_open(sandbox, *, rebuilt_to=None, gone=False):
-    """OPEN answers SANDBOX_ERROR (the module did not load); the sandbox may have restarted meanwhile."""
+def faulting_open(sandbox, *, rebuilt_to=None, restored_to=None, names_build=True):
+    """OPEN answers SANDBOX_ERROR (the module did not load), naming the build that answered; the sandbox may
+    have restarted before it (``rebuilt_to``) and again after it (``restored_to``)."""
     def open_session(*args, **kwargs):
         if rebuilt_to is not None:
             sandbox.image_digest = rebuilt_to
-        sandbox.unavailable = gone
-        raise fault(SANDBOX_ERROR)
+        refused = sandbox.open_fault(SANDBOX_ERROR) if names_build else fault(SANDBOX_ERROR)
+        if restored_to is not None:
+            sandbox.image_digest = restored_to
+        raise refused
     sandbox.open_session = open_session
 
 
@@ -268,10 +271,17 @@ def test_an_open_fault_on_the_started_build_rejects_the_file(world, sandbox):
     assert ended(world, world.build(time_of_day_key(sandbox))) == AuthoredEnd("SANDBOX_ERROR", SANDBOX_ERROR)
 
 
-def test_an_open_fault_with_the_sandbox_gone_is_unavailable(world, sandbox):
-    faulting_open(sandbox, gone=True)
+def test_an_open_fault_that_names_no_build_is_unavailable(world, sandbox):
+    faulting_open(sandbox, names_build=False)
     end = ended(world, world.build(time_of_day_key(sandbox)))
     assert end == AuthoredEnd("SANDBOX_UNAVAILABLE", "SandboxUnavailable")
+
+
+def test_an_open_fault_from_build_b_with_a_restored_before_any_ping_is_unavailable(world, sandbox):  # PR #161
+    faulting_open(sandbox, rebuilt_to=REBUILT_IMAGE, restored_to=sandbox.image_digest)   # STARTED A, B, then A
+    spec = world.build(time_of_day_key(sandbox))
+    assert ended(world, spec) == AuthoredEnd("SANDBOX_UNAVAILABLE", "SandboxUnavailable")
+    assert nothing_spent(world, spec)
 
 
 def test_a_bar_fault_is_the_strategy_even_if_the_sandbox_restarts_after_it(world, sandbox):
@@ -288,6 +298,7 @@ def test_a_bar_fault_is_the_strategy_even_if_the_sandbox_restarts_after_it(world
 def test_an_open_fault_in_the_folds_on_a_rebuilt_sandbox_is_unavailable(world, sandbox):
     def run_cohort(spec, **_):
         sandbox.image_digest = REBUILT_IMAGE
-        raise EvaluationError("backtest failed") from SandboxOpenFault("did not load", code=SANDBOX_ERROR)
+        raise EvaluationError("backtest failed") from SandboxOpenFault("did not load", code=SANDBOX_ERROR,
+                                                                       image_digest=REBUILT_IMAGE)
     spec = world.build(time_of_day_key(sandbox))
     assert ended(world, spec, run_cohort=run_cohort) == AuthoredEnd("SANDBOX_UNAVAILABLE", "SandboxUnavailable")

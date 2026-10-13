@@ -471,7 +471,7 @@ def test_an_open_fault_on_a_rebuilt_sandbox_is_an_outage_not_a_retirement(caplog
 
     def restart_then_refuse(*args, **kwargs):
         sandbox.image_digest = REBUILT                       # restarted on build B, never proven
-        raise fault(SANDBOX_ERROR)                           # B's checker refuses the stored file at OPEN
+        raise sandbox.open_fault(SANDBOX_ERROR)              # B's checker refuses the stored file at OPEN
     sandbox.open_session = restart_then_refuse
     with caplog.at_level(logging.ERROR):
         assert strategy.on_prices(bars(5)) is None
@@ -479,14 +479,13 @@ def test_an_open_fault_on_a_rebuilt_sandbox_is_an_outage_not_a_retirement(caplog
     assert strategy.state == StrategyState.RUNNING and strategy.authored_binding_intact()
 
 
-def test_an_open_fault_whose_second_ping_fails_is_an_outage_not_a_retirement(caplog):
+def test_an_open_fault_that_names_no_build_is_an_outage_not_a_retirement(caplog):
     sandbox, faults = live_sandbox(), []
     strategy = live(sandbox, faults)
 
-    def refuse_then_vanish(*args, **kwargs):
-        sandbox.unavailable = True
-        raise fault(SANDBOX_DIGEST_MISMATCH)
-    sandbox.open_session = refuse_then_vanish
+    def refuse_without_a_build(*args, **kwargs):
+        raise fault(SANDBOX_DIGEST_MISMATCH)                 # an older sandbox: its ERROR names no build
+    sandbox.open_session = refuse_without_a_build
     with caplog.at_level(logging.ERROR):
         assert strategy.on_prices(bars(5)) is None
     assert faults == [] and SANDBOX_UNAVAILABLE_ALARM in caplog.text and strategy.state == StrategyState.RUNNING
@@ -497,12 +496,28 @@ def test_an_open_fault_on_the_same_build_still_retires(caplog):
     strategy = live(sandbox, faults)
 
     def refuse(*args, **kwargs):
-        raise fault(SANDBOX_ERROR)
+        raise sandbox.open_fault(SANDBOX_ERROR)
     sandbox.open_session = refuse
     with caplog.at_level(logging.ERROR):
         assert strategy.on_prices(bars(5)) is None
     assert faults == [(strategy.digest, SANDBOX_ERROR)] and SANDBOX_FAULT_ALARM in caplog.text
     assert strategy.state == StrategyState.DISABLED
+
+
+def test_an_open_fault_from_build_b_between_two_pings_of_a_is_an_outage(caplog):              # PR #161 review
+    sandbox, faults = live_sandbox(), []
+    strategy = live(sandbox, faults, proven={sandbox.image_digest})
+    build_a = sandbox.image_digest
+
+    def b_answers_then_a_is_back(*args, **kwargs):
+        sandbox.image_digest = REBUILT
+        refused = sandbox.open_fault(SANDBOX_ERROR)           # B refuses the OPEN
+        sandbox.image_digest = build_a                        # A restored before any later PING
+        raise refused
+    sandbox.open_session = b_answers_then_a_is_back
+    with caplog.at_level(logging.ERROR):
+        assert strategy.on_prices(bars(5)) is None
+    assert faults == [] and SANDBOX_UNAVAILABLE_ALARM in caplog.text and strategy.state == StrategyState.RUNNING
 
 
 def test_a_fault_answered_to_ping_is_an_outage_not_a_retirement(caplog):

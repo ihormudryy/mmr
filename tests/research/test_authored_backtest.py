@@ -139,6 +139,7 @@ def test_an_authored_environment_pickles_for_the_process_pool(market, sandbox):
 
 
 def test_a_fault_answered_to_open_is_an_open_fault_and_survives_pickling():
-    error = SandboxOpenFault("did not load", code="SANDBOX_ERROR")
+    error = SandboxOpenFault("did not load", code="SANDBOX_ERROR", image_digest="build-a")
     copy = pickle.loads(pickle.dumps(error))
-    assert isinstance(copy, SandboxOpenFault) and (copy.code, copy.detail) == ("SANDBOX_ERROR", "did not load")
+    assert isinstance(copy, SandboxOpenFault)
+    assert (copy.code, copy.detail, copy.image_digest) == ("SANDBOX_ERROR", "did not load", "build-a")

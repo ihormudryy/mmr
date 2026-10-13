@@ -81,17 +81,15 @@ class AuthoredEvaluator:
     def _ping(self) -> SandboxInfo:
         return authored_backtest.connect_sandbox(self._paths.sandbox_socket).ping()
 
-    def _end_for(self, cause: Exception, paths: EvaluationPaths) -> AuthoredEnd:
-        """Ruling F7b: a fault answered to OPEN came before any session reported its build. A sandbox restarted
-        onto a build STARTED did not report must not reject the file, so the build is read again first."""
+    @staticmethod
+    def _end_for(cause: Exception, paths: EvaluationPaths) -> AuthoredEnd:
+        """Ruling F7b (PR #161 review): a fault answered to OPEN came before any session reported its build, so
+        it rejects the file only when the fault names the build STARTED reported. A later PING proves nothing:
+        the sandbox may have restarted between the OPEN and the PING. No build, or another, is unavailable."""
         end = end_for(cause)
         if end.event != SANDBOX_ERROR_EVENT or not isinstance(cause, SandboxOpenFault):
             return end
-        try:
-            build = self._ping().image_digest
-        except PING_ERRORS as exc:
-            return AuthoredEnd(SANDBOX_UNAVAILABLE_EVENT, type(exc).__name__)
-        if build != paths.sandbox_image_digest:
+        if cause.image_digest is None or cause.image_digest != paths.sandbox_image_digest:
             return AuthoredEnd(SANDBOX_UNAVAILABLE_EVENT, SandboxUnavailable.__name__)
         return end
 

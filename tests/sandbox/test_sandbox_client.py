@@ -251,6 +251,7 @@ def test_a_digest_mismatch_is_a_fault_with_its_code(stack):
     with pytest.raises(SandboxFault) as exc:
         SandboxClient(stack.live).open_session("sha256:" + "a" * 64, "Counter", {}, "1 min", [C1])
     assert exc.value.code == p.SANDBOX_DIGEST_MISMATCH
+    assert exc.value.image_digest == SandboxClient(stack.live).ping().image_digest   # the build that answered
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")

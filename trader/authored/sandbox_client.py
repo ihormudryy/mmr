@@ -36,20 +36,22 @@ class SandboxUnavailable(Exception):
 
 
 class SandboxFault(Exception):
-    """The strategy failed in the sandbox. ``code`` is SANDBOX_ERROR or SANDBOX_DIGEST_MISMATCH."""
+    """The strategy failed in the sandbox. ``code`` is SANDBOX_ERROR or SANDBOX_DIGEST_MISMATCH. ``image_digest``
+    is the build that answered a fault to OPEN, or None (a fault in a session: the session's OPENED named it)."""
 
-    def __init__(self, detail: str, *, code: str):
+    def __init__(self, detail: str, *, code: str, image_digest: Optional[str] = None):
         super().__init__(f"{code}: {detail}")
         self.code = code
         self.detail = detail
+        self.image_digest = image_digest
 
     def __reduce__(self):
         # The default rebuilds an exception from its positional args only; a worker process must raise it whole.
-        return _sandbox_fault, (self.detail, self.code)
+        return _sandbox_fault, (self.detail, self.code, self.image_digest)
 
 
-def _sandbox_fault(detail: str, code: str) -> SandboxFault:
-    return SandboxFault(detail, code=code)
+def _sandbox_fault(detail: str, code: str, image_digest: Optional[str] = None) -> SandboxFault:
+    return SandboxFault(detail, code=code, image_digest=image_digest)
 
 
 class SandboxProtocolError(Exception):
@@ -286,7 +288,8 @@ def _raise_for(reply: Mapping[str, Any]) -> None:
         raise SandboxProtocolError(detail)
     if code not in (proto.SANDBOX_ERROR, proto.SANDBOX_DIGEST_MISMATCH):
         raise SandboxUnavailable(f"unknown error code {code!r}: {detail}")
-    raise SandboxFault(detail, code=code)
+    image_digest = reply.get("image_digest")
+    raise SandboxFault(detail, code=code, image_digest=image_digest if isinstance(image_digest, str) else None)
 
 
 def _exchange(sock: socket.socket, request: Mapping[str, Any], timeout_s: float) -> dict:

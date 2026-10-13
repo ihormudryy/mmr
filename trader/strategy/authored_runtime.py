@@ -304,20 +304,16 @@ class AuthoredLiveStrategy(Strategy):
         except SandboxFault as fault:
             raise SandboxUnavailable(f"PING answered {fault.code}") from fault
 
-    def _require_same_build(self, build: str, fault: SandboxFault) -> None:
-        """Final review I1 (research ruling F7b): a fault answered to OPEN came before any session reported its
-        build. A sandbox restarted onto another build must not retire the file, so the build is read again and a
-        change, or no answer, is an outage."""
+    @staticmethod
+    def _require_same_build(build: str, fault: SandboxFault) -> None:
+        """Final review I1 (research ruling F7b, PR #161 review): a fault answered to OPEN came before any session
+        reported its build. It retires the file only when it names the build PING reported and the proof gate
+        passed; no build named, or another (a sandbox restarted in between), is an outage."""
         if fault.code not in STRATEGY_FAULT_CODES:
             return
-        try:
-            build_now = self._ping_build()
-        except _RETRYABLE_ERRORS as exc:
-            raise SandboxUnavailable(f"OPEN answered {fault.code} and the build cannot be read again: "
-                                     f"{type(exc).__name__}: {exc}") from fault
-        if build_now != build:
-            raise SandboxUnavailable(f"OPEN answered {fault.code} while the sandbox moved from build {build} "
-                                     f"to {build_now}") from fault
+        if fault.image_digest != build:
+            raise SandboxUnavailable(f"OPEN answered {fault.code} from build {fault.image_digest}, not the "
+                                     f"checked build {build}") from fault
 
     def _require_proven(self, build: Any) -> None:
         """A gate that raises counts as unproven: fail closed."""

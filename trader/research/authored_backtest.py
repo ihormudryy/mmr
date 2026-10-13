@@ -27,14 +27,14 @@ class AuthoredReplayError(RuntimeError):
 
 class SandboxOpenFault(SandboxFault):
     """A fault answered to OPEN: the stored file did not load. No session reported its build, so the evaluator
-    checks the build again before it blames the file (ruling F7b)."""
+    blames the file only when the fault names the build STARTED reported (ruling F7b, PR #161 review)."""
 
     def __reduce__(self):
-        return _sandbox_open_fault, (self.detail, self.code)
+        return _sandbox_open_fault, (self.detail, self.code, self.image_digest)
 
 
-def _sandbox_open_fault(detail: str, code: str) -> SandboxOpenFault:
-    return SandboxOpenFault(detail, code=code)
+def _sandbox_open_fault(detail: str, code: str, image_digest: Optional[str] = None) -> SandboxOpenFault:
+    return SandboxOpenFault(detail, code=code, image_digest=image_digest)
 
 
 # The backtester's precompute does not name its conid. A research session holds exactly one conid and the
@@ -83,7 +83,7 @@ class AuthoredProxyStrategy(Strategy):
             return self._client.open_session(self._digest, self._class_name, self._params, self._bar_size,
                                              [RESEARCH_SESSION_CONID])
         except SandboxFault as fault:
-            raise SandboxOpenFault(fault.detail, code=fault.code) from fault
+            raise SandboxOpenFault(fault.detail, code=fault.code, image_digest=fault.image_digest) from fault
 
     def _require_expected_build(self, session: Any) -> None:
         """The trader proves the build of research's STARTED report; a sandbox restarted onto another build

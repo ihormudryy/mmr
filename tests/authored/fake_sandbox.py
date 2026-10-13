@@ -159,6 +159,10 @@ class FakeSandbox:
                            free=self.pool - len(self.open_sessions), size=self.pool, posture={},
                            live_open=len(self.open_sessions))
 
+    def open_fault(self, code: str) -> SandboxFault:
+        """A fault answered to OPEN names the build that answered, as the supervisor's does."""
+        return SandboxFault(f"fake sandbox: {code}", code=code, image_digest=self.image_digest)
+
     def open_session(self, digest: str, class_name: str, params: Mapping[str, float], bar_size: str,
                      conids) -> FakeSession:
         _check_frame({"v": PROTOCOL_VERSION, "type": "OPEN", "digest": digest, "class": class_name,
@@ -171,10 +175,8 @@ class FakeSandbox:
             raise SandboxUnavailable("fake: socket unreachable")
         # The supervisor reads, hashes and checks the file before it reserves a slot (supervisor._open_store).
         source = self.sources.get(digest)
-        if source is None or digest in self.tampered:
-            raise fault(SANDBOX_DIGEST_MISMATCH)
-        if require_clean(source) != class_name:
-            raise fault(SANDBOX_DIGEST_MISMATCH)
+        if source is None or digest in self.tampered or require_clean(source) != class_name:
+            raise self.open_fault(SANDBOX_DIGEST_MISMATCH)
         if len(self.open_sessions) >= self.pool:
             raise SandboxUnavailable(SANDBOX_BUSY)
         namespace: dict = {}

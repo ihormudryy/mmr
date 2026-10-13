@@ -76,7 +76,7 @@ class EvaluationService:
     def __init__(self, *, store: Any, trader: Any, build_spec: Callable[[EvaluationRequestBody], Any],
                  evaluate: Callable[[Any], Any], signer: Any, artifacts_root: Path, warmup_sessions: int,
                  order_notional: float, queue_max: int, now: Callable[[], dt.datetime], renewals: Any = None,
-                 holdout_opened: Callable[[str], bool] = lambda strategy_key: False):
+                 holdout_opened: Callable[[str, dt.datetime], bool] = lambda strategy_key, since: False):
         self._store, self._trader, self._build_spec, self._evaluate = store, trader, build_spec, evaluate
         self._holdout_opened = holdout_opened                   # holdout_opened_in(registry) in the service
         self._renewals = renewals                               # kind RENEWAL (SP2c Plan 5); None: refused
@@ -325,7 +325,9 @@ class EvaluationService:
         without a case, and Plan 3 returns the record to STORED or FAILED (PR #161 review)."""
         if row["state"] != "RUNNING" or not is_authored_key(row["strategy_key"]):
             return
-        if self._store.case(request_id=row["request_id"]) is not None or not self._holdout_opened(row["strategy_key"]):
+        if self._store.case(request_id=row["request_id"]) is not None:
+            return
+        if not self._holdout_opened(row["strategy_key"], row["created_at"]):
             return
         raise CaseRefused(AUTHORED_OUTCOME_UNKNOWN, "a restart found this authored evaluation running after its "
                                                     "holdout opened, with no recorded end; no case is signed")
@@ -438,6 +440,10 @@ class EvaluationService:
         return claim is not None and claim["state"] == state
 
 
-def holdout_opened_in(registry: Any) -> Callable[[str], bool]:
-    """Whether a holdout of the key's strategy was ever opened (SP2c: an opened window counts as revealed)."""
-    return lambda strategy_key: bool(registry.opened_holdout_windows(*split_evaluation_key(strategy_key)))
+def holdout_opened_in(registry: Any) -> Callable[[str, dt.datetime], bool]:
+    """Whether a holdout of the key's strategy was opened at or after ``since``, the request's creation: an
+    older window belongs to an earlier request, so it cannot hold this request's unrecorded end (#165)."""
+    def opened_since(strategy_key: str, since: dt.datetime) -> bool:
+        windows = registry.opened_holdout_windows(*split_evaluation_key(strategy_key))
+        return any(window["opened_at"] >= since for window in windows)
+    return opened_since

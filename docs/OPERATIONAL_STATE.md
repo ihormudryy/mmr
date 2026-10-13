@@ -472,8 +472,10 @@ tables are in `mmr_research.duckdb`; there is no `mmr` command for these yet):
   "evaluation ... parked ... needs the operator". It reads as `FAILED` without
   a case, and the worker goes on. The trader's claim stays open and still counts
   for the day.
-- An authored evaluation that a restart finds `RUNNING` after its holdout
-  opened, with no recorded end, is `PARKED` with `AUTHORED_OUTCOME_UNKNOWN`:
+- An authored evaluation that a restart finds `RUNNING` after a holdout of its
+  strategy opened (at or after the request was created; an older window
+  belongs to an earlier request), with no recorded end, is `PARKED` with
+  `AUTHORED_OUTCOME_UNKNOWN`:
   the crash may have lost a strategy fault, and the spent holdout cannot run
   again, so no case is signed. Its claim closes `FAILED`; after the 24 h grace
   the trader returns the record to `STORED` (or `FAILED` after 3 attempts). A

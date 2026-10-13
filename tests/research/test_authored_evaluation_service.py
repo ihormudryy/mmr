@@ -1,4 +1,5 @@
 """Plan 4 rulings 6, 10 and 11: an authored end reaches the trader, then the claim closes FAILED without a case."""
+import datetime as dt
 import logging
 
 import pytest
@@ -14,8 +15,10 @@ from trader.research.authored_evaluation import AuthoredEvaluator
 from trader.research.authored_outcome import AUTHORED_END_CODE, AuthoredEnd, AuthoredEvaluationEnded
 from trader.research.evaluation_service import (AUTHORED_OUTCOME_UNKNOWN, EvaluationService, ServiceStateError,
                                                holdout_opened_in)
+from trader.research.experiment_registry import ExperimentFamily
 from trader.research.service_store import CLAIM_CLOSE_OWED, CLAIM_CLOSE_REFUSED, CLAIM_CLOSED, ResearchStore
 from trader.research.signing import AttestationSigner
+from trader.research.strategy_key import split_evaluation_key
 from trader.research.trader_port import TraderUnavailable
 
 SIGNER = AttestationSigner.generate()
@@ -296,4 +299,30 @@ def test_a_crash_before_the_holdout_opened_runs_the_evaluation_again(world):
     restarted = service(world, trader, raising(AuthoredEvaluationEnded(ERROR_END)), store=store)
     restarted.recover()
     restarted.run_next()
+    assert [report["event"] for report in trader.authored_reports] == ["SANDBOX_ERROR"]
+
+
+def open_an_earlier_holdout(world, opened_at):
+    strategy_path, class_name = split_evaluation_key(KEY)
+    family_id = world.registry.create_family(ExperimentFamily(
+        strategy_path=strategy_path, class_name=class_name, repository_commit="authored", source_tree_digest="s",
+        dependency_lock_digest="d", container_digest="unpinned", dataset_manifest_digest="m", search_space={},
+        cost_model={}, validation_protocol={}),
+        created_at=opened_at, validation_folds=[{"kind": "holdout", "start": "2024-01-02", "end": "2024-01-09"}])
+    trial_id = world.registry.start_trial(family_id, trial_key="t", parameters={}, started_at=opened_at)
+    world.registry.finish_trial(trial_id, status="SUCCEEDED", finished_at=opened_at, metrics={"daily_sharpe": 0.1})
+    artifact = world.registry.seal_artifact(family_id, selected_trial_id=trial_id, selected_parameters={},
+                                            sealed_at=opened_at)
+    world.registry.open_holdout(artifact, opened_at=opened_at, passed=False, detail="an earlier request")
+
+
+def test_a_crash_before_its_own_holdout_runs_again_despite_an_earlier_window(world):  # #165
+    open_an_earlier_holdout(world, NOW - dt.timedelta(days=1))
+    trader, store = FakeTrader(), ResearchStore(world.db)
+    request_id = submit(service(world, trader, never, store=store))
+    store.set_state(request_id, "RUNNING", now=NOW)                  # crashed before its own holdout opened
+    restarted = service(world, trader, raising(AuthoredEvaluationEnded(ERROR_END)), store=store)
+    restarted.recover()
+    restarted.run_next()
+    assert store.get(request_id)["parked_reason"] is None
     assert [report["event"] for report in trader.authored_reports] == ["SANDBOX_ERROR"]

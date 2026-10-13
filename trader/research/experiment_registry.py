@@ -557,19 +557,19 @@ class ExperimentRegistry:
     def _opened_windows_tx(self, conn, strategy_path: str, class_name: str) -> list[dict]:
         target = normalize_strategy_path(strategy_path)
         rows = conn.execute(
-            "SELECT f.family_id, f.strategy_path, h.artifact_id, v.spec "
+            "SELECT f.family_id, f.strategy_path, h.artifact_id, h.opened_at, v.spec "
             "FROM experiment_families f "
             "JOIN strategy_artifacts a ON a.family_id = f.family_id "
             "JOIN holdout_access_log h ON h.artifact_id = a.artifact_id "
             "JOIN validation_folds v ON v.family_id = f.family_id "
             "WHERE f.class_name = ? AND v.kind = 'holdout'", [class_name]).fetchall()
         windows = []
-        for family_id, path, artifact_id, spec_json in rows:
+        for family_id, path, artifact_id, opened_at, spec_json in rows:
             if normalize_strategy_path(path) != target:
                 continue
             window = self._parse_holdout_window(spec_json)
             if window is not None:
-                windows.append({"artifact_id": artifact_id, "family_id": family_id,
+                windows.append({"artifact_id": artifact_id, "family_id": family_id, "opened_at": _as_utc(opened_at),
                                 "start": window[0], "end": window[1]})
         return windows
 

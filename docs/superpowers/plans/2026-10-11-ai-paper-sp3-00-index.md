@@ -265,7 +265,7 @@ All other rulings:
   - The proof gate reads the trader before every BAR, warm-up bars included. Measured: about 4.3 ms per read on the trader side against 0.54 ms per streamed bar, so a 2000-bar warm-up goes from about 1 s to about 10 s per conid, about 3.5 min for a 20-conid deployment at each session open, and up to about 120k reads at the open for three deployments. *Cost if wrong: first-minute decisions of later conids go STALE at the open, and the trader journal lock is busier then.* Follow-up #164.
   - A strategy fault notes the retirement under the instance lock before the fault is visible, then disables under the signal hold, like an operator disable: a dispatch in flight finishes first, none starts after.
   - An `ERROR` answered to `OPEN` names the build that answered (`image_digest`). Research and the live proxy blame the file only when that build is the one STARTED or the proof gate checked; no build, or another, is `SANDBOX_UNAVAILABLE`. The second PING is gone.
-  - A restart that finds an authored request `RUNNING` with no case, no end marker and a holdout already opened parks it `AUTHORED_OUTCOME_UNKNOWN`: no case is signed and the claim closes FAILED.
+  - A restart that finds an authored request `RUNNING` with no case, no end marker and a holdout opened since the request was created (#165) parks it `AUTHORED_OUTCOME_UNKNOWN`: no case is signed and the claim closes FAILED.
 - Plan 5, all other rulings: see the plan's Rulings section.
 - Plan 5, made during the build (2026-10-12/13):
   - G1: the local check reads the defaults with the trader's `class_constants`; a bare annotation before a constant is refused; `TUNABLE_REBOUND` is a violation and an `AUTHOR_RULES` line; `authored_submission.py` joins `JUDGMENT_SOURCES`.

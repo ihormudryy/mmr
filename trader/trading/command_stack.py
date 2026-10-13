@@ -1924,6 +1924,7 @@ def build_command_stack(
     trader.automation_circuit_breaker = circuit_breaker
     trader.semantic_readiness = semantic_readiness
     trader.liquidation_service = liquidation_service
+    trader.risk_producer = risk_producer                         # the dashboard risk view (#169)
     trader.liquidation_worker = liquidation_worker
     trader.exit_owner_registry = exit_owner_registry
     trader.session_risk = session_risk

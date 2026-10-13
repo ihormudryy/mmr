@@ -253,6 +253,10 @@ e2b2fd1 (VwapReclaim on_prices). These are the residual robustness items.
   `{id, label, value_pct, cap_pct}` (concentration vs 15% cap, group budgets,
   HHI vs 0.15) and string `warnings`; `renderRisk` draws `.tt-bar` fills
   (amber ≥ 2/3 of cap, red ≥ cap). Warnings stay the fail-loud surface.
+- **Follow-up (#169):** nothing published the projection in production (no
+  caller of `mark_projection_dirty`). The trader now recomputes it every 15 s
+  (`_maybe_start_risk_projection` in `trader/trader_service.py`); an unchanged
+  projection is not journaled again.
 
 ### H2 — Proposal exposure-impact line  (M, low risk)
 

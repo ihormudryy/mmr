@@ -568,3 +568,39 @@ def test_no_orphan_reservation_sweep_without_a_saga(worker):
         assert asyncio.all_tasks(loop) == set()
     finally:
         _close_loop(loop)
+
+
+def test_the_risk_projection_refresh_starts_with_an_immediate_tick():         # #169
+    loop = asyncio.new_event_loop()
+    try:
+        calls = []
+        producer = SimpleNamespace(flush_projection=lambda: calls.append(1))
+        trader_service._maybe_start_risk_projection(SimpleNamespace(risk_producer=producer), loop)
+        (refresh,) = asyncio.all_tasks(loop)
+        loop.run_until_complete(asyncio.sleep(0.15))
+        refresh.cancel()
+
+        assert calls == [1]
+    finally:
+        _close_loop(loop)
+
+
+def test_no_risk_projection_refresh_without_a_producer():
+    loop = asyncio.new_event_loop()
+    try:
+        trader_service._maybe_start_risk_projection(SimpleNamespace(), loop)
+
+        assert asyncio.all_tasks(loop) == set()
+    finally:
+        _close_loop(loop)
+
+
+def test_no_risk_projection_refresh_while_stopping():
+    loop = asyncio.new_event_loop()
+    try:
+        producer = SimpleNamespace(flush_projection=lambda: None)
+        trader_service._maybe_start_risk_projection(SimpleNamespace(risk_producer=producer), loop, lambda: True)
+
+        assert asyncio.all_tasks(loop) == set()
+    finally:
+        _close_loop(loop)

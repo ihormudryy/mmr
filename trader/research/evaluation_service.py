@@ -20,6 +20,7 @@ from trader.research.evaluation_case import CaseRefused, load_verified_case, wri
 from trader.research.evaluation_request import EvaluationRequestBody, evaluation_request_id
 from trader.research.judgment_attest import is_loud_trader_code
 from trader.research.service_store import CLAIM_CLOSE_REFUSED, CLAIM_CLOSED, OPEN_STATES
+from trader.research.strategy_key import split_evaluation_key
 from trader.research.trader_port import TraderUnavailable
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,8 @@ PARK_DETAIL_MAX = 200
 # Review r1 #7: an authored end the trader refused for good is parked, resent hourly (and at a restart), and the
 # claim stays open; refusal is never delivery.
 PARKED_RESEND_SECONDS = 3600
+# PR #161 review: a restart found an authored evaluation RUNNING with its holdout opened and no recorded end.
+AUTHORED_OUTCOME_UNKNOWN = "AUTHORED_OUTCOME_UNKNOWN"
 CASE_ERROR_MESSAGE_MAX = 120
 _UNSAFE_ERROR_TEXT = re.compile(
     r"[/\\]"                                                                  # a file path
@@ -72,8 +75,10 @@ def _submit_reply(status: str, request_id: Optional[str] = None, state: Optional
 class EvaluationService:
     def __init__(self, *, store: Any, trader: Any, build_spec: Callable[[EvaluationRequestBody], Any],
                  evaluate: Callable[[Any], Any], signer: Any, artifacts_root: Path, warmup_sessions: int,
-                 order_notional: float, queue_max: int, now: Callable[[], dt.datetime], renewals: Any = None):
+                 order_notional: float, queue_max: int, now: Callable[[], dt.datetime], renewals: Any = None,
+                 holdout_opened: Callable[[str], bool] = lambda strategy_key: False):
         self._store, self._trader, self._build_spec, self._evaluate = store, trader, build_spec, evaluate
+        self._holdout_opened = holdout_opened                   # holdout_opened_in(registry) in the service
         self._renewals = renewals                               # kind RENEWAL (SP2c Plan 5); None: refused
         self._signer, self._cases_dir = signer, Path(artifacts_root) / "cases"
         self._warmup_sessions, self._order_notional = warmup_sessions, order_notional
@@ -291,6 +296,7 @@ class EvaluationService:
         if AuthoredEnd.from_row(row) is not None:             # decided before a crash: never run again
             self._end_without_case(request_id)
             return
+        self._refuse_lost_authored_outcome(row)
         self._store.set_state(request_id, "RUNNING", now=self._now())
         signed = self._store.case(request_id=request_id)
         if signed is None:
@@ -311,6 +317,18 @@ class EvaluationService:
         self._store.hold_report(request_id, final, now=self._now(), case_digest=digest,
                                 summary=evaluation_summary(case, order_notional=self._order_notional))
         self._report_end(request_id, final)
+
+    def _refuse_lost_authored_outcome(self, row: dict) -> None:
+        """An authored run cut by a crash after its holdout opened may have ended in a strategy fault whose end
+        was never recorded. A rerun cannot tell: the holdout is spent, so it would sign an ordinary FAILED case
+        and the fault would never reach the trader. The request is parked instead, its claim closes FAILED
+        without a case, and Plan 3 returns the record to STORED or FAILED (PR #161 review)."""
+        if row["state"] != "RUNNING" or not is_authored_key(row["strategy_key"]):
+            return
+        if self._store.case(request_id=row["request_id"]) is not None or not self._holdout_opened(row["strategy_key"]):
+            return
+        raise CaseRefused(AUTHORED_OUTCOME_UNKNOWN, "a restart found this authored evaluation running after its "
+                                                    "holdout opened, with no recorded end; no case is signed")
 
     def _end_without_case(self, request_id: str) -> None:
         """Plan 4 ruling 11: get_evaluation reads FAILED with no case, so no model ever judges it."""
@@ -418,3 +436,8 @@ class EvaluationService:
         except TraderUnavailable:
             return False
         return claim is not None and claim["state"] == state
+
+
+def holdout_opened_in(registry: Any) -> Callable[[str], bool]:
+    """Whether a holdout of the key's strategy was ever opened (SP2c: an opened window counts as revealed)."""
+    return lambda strategy_key: bool(registry.opened_holdout_windows(*split_evaluation_key(strategy_key)))

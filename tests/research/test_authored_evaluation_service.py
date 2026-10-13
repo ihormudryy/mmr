@@ -3,7 +3,7 @@ import logging
 
 import pytest
 
-from tests.authored.fake_sandbox import FakeSandbox
+from tests.authored.fake_sandbox import FakeSandbox, fault
 from tests.research.authored_fixtures import (CATALOGUE_KEY, NOW, POINT, install_fake_sandbox,
                                              research_world, time_of_day_key)
 from tests.research.evaluation_fixtures import CONIDS
@@ -12,7 +12,8 @@ from trader.authored.keys import parse_authored_key
 from trader.messaging.typed_rpc import TypedRpcRemoteError
 from trader.research.authored_evaluation import AuthoredEvaluator
 from trader.research.authored_outcome import AUTHORED_END_CODE, AuthoredEnd, AuthoredEvaluationEnded
-from trader.research.evaluation_service import EvaluationService, ServiceStateError
+from trader.research.evaluation_service import (AUTHORED_OUTCOME_UNKNOWN, EvaluationService, ServiceStateError,
+                                               holdout_opened_in)
 from trader.research.service_store import CLAIM_CLOSE_OWED, CLAIM_CLOSE_REFUSED, CLAIM_CLOSED, ResearchStore
 from trader.research.signing import AttestationSigner
 from trader.research.trader_port import TraderUnavailable
@@ -42,7 +43,8 @@ def never(spec):
 def service(world, trader, evaluate, store=None):
     return EvaluationService(store=store or ResearchStore(world.db), trader=trader, build_spec=world.build_body,
                              evaluate=evaluate, signer=SIGNER, artifacts_root=world.root / "artifacts",
-                             warmup_sessions=5, order_notional=1900.0, queue_max=2, now=lambda: NOW)
+                             warmup_sessions=5, order_notional=1900.0, queue_max=2, now=lambda: NOW,
+                             holdout_opened=holdout_opened_in(world.registry))
 
 
 def submit(svc):
@@ -254,3 +256,44 @@ def test_an_end_applied_with_its_reply_lost_closes_the_claim_once(world):
     svc.run_next()
     assert len(trader.authored_reports) == 1 and trader.claims[request_id]["state"] == "FAILED"
     assert trader.updates.count((request_id, "FAILED")) == 1 and not trader.reported_after_close
+
+
+class Crash(BaseException):
+    """The research process dies here."""
+
+
+def test_a_crash_before_the_fault_is_recorded_after_the_holdout_opened_signs_no_case(world, monkeypatch):  # PR #161
+    from tests.research.test_authored_evaluation import opens_a_holdout_then
+    assert time_of_day_key(install_fake_sandbox(monkeypatch)) == KEY        # the stored file
+    trader, store = FakeTrader(), ResearchStore(world.db)
+    evaluator = AuthoredEvaluator(research_db=world.db, paths=world.paths, now=lambda: NOW, trader=trader,
+                                  run_cohort=opens_a_holdout_then(fault("SANDBOX_ERROR")))
+    first = service(world, trader, evaluator.evaluate, store=store)
+    request_id = submit(first)
+    real_set_state = store.set_state
+
+    def crash_at_the_end_marker(request_id, state, **fields):
+        if fields.get("code") == AUTHORED_END_CODE:
+            raise Crash()
+        real_set_state(request_id, state, **fields)
+    store.set_state = crash_at_the_end_marker
+    with pytest.raises(Crash):
+        first.run_next()
+    del store.set_state
+    restarted = service(world, trader, never, store=store)
+    restarted.recover()
+    restarted.run_next()
+    assert no_case_signed(world)
+    assert store.get(request_id)["state"] == "PARKED" and AUTHORED_OUTCOME_UNKNOWN in store.get(request_id)["parked_reason"]
+    assert trader.claims[request_id]["state"] == "FAILED"
+    assert [report["event"] for report in trader.authored_reports] == ["STARTED"]
+
+
+def test_a_crash_before_the_holdout_opened_runs_the_evaluation_again(world):
+    trader, store = FakeTrader(), ResearchStore(world.db)
+    request_id = submit(service(world, trader, never, store=store))
+    store.set_state(request_id, "RUNNING", now=NOW)                  # crashed before any holdout opened
+    restarted = service(world, trader, raising(AuthoredEvaluationEnded(ERROR_END)), store=store)
+    restarted.recover()
+    restarted.run_next()
+    assert [report["event"] for report in trader.authored_reports] == ["SANDBOX_ERROR"]

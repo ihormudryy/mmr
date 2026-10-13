@@ -472,6 +472,13 @@ tables are in `mmr_research.duckdb`; there is no `mmr` command for these yet):
   "evaluation ... parked ... needs the operator". It reads as `FAILED` without
   a case, and the worker goes on. The trader's claim stays open and still counts
   for the day.
+- An authored evaluation that a restart finds `RUNNING` after its holdout
+  opened, with no recorded end, is `PARKED` with `AUTHORED_OUTCOME_UNKNOWN`:
+  the crash may have lost a strategy fault, and the spent holdout cannot run
+  again, so no case is signed. Its claim closes `FAILED`; after the 24 h grace
+  the trader returns the record to `STORED` (or `FAILED` after 3 attempts). A
+  later evaluation of the same file is refused `HOLDOUT_NOT_AVAILABLE` and gets
+  an ordinary FAILED case.
 - A shadow case that can never be replayed is skipped; the log says
   "shadow replay parked case". A shadow row the trader refused for good is in
   `shadow_failures` with its code. The log says "refused for good" at ERROR.

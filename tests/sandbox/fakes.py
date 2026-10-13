@@ -21,6 +21,7 @@ class _InProcessChild:
                                      params=spec.params, lookback=spec.lookback, conids=spec.conids,
                                      skip_static_check=False)
         self._runtime.load()
+        self.lookback = self._runtime.lookback
 
     def send_bar(self, conid: int, t: datetime, ohlcv: Mapping[str, float]) -> dict:
         return self._runtime.on_bar(conid, t, ohlcv)

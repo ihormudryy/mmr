@@ -147,9 +147,7 @@ def test_bad_tunables_are_refused_with_the_reason(tmp_path, tunables, hint):
 
 @pytest.mark.parametrize("rebinding", [
     "RANGE_BARS = 15\n    RANGE_BARS = 20",
-    "RANGE_BARS = 15\n    RANGE_BARS += 5",
     "RANGE_BARS = 15\n    RANGE_BARS, WIDTH = 20, 3",
-    "RANGE_BARS = 15\n    if LOOKBACK_BARS > 10:\n        RANGE_BARS = 20",
 ])
 def test_a_constant_the_class_binds_twice_is_not_a_tunable(tmp_path, rebinding):
     """The class value would not be the first number, so the default could not be checked against it."""
@@ -157,6 +155,18 @@ def test_a_constant_the_class_binds_twice_is_not_a_tunable(tmp_path, rebinding):
     reply = w.store.submit(submit_request(VALID_SOURCE.replace("RANGE_BARS = 15", rebinding)))
     assert reply["code"] == "AUTHORED_BAD_TUNABLES"
     assert "RANGE_BARS is not a numeric class constant" in reply["detail"]
+
+
+@pytest.mark.parametrize("rebinding", [
+    "RANGE_BARS = 15\n    RANGE_BARS += 5",
+    "RANGE_BARS = 15\n    if LOOKBACK_BARS > 10:\n        RANGE_BARS = 20",
+])
+def test_a_class_body_that_rebinds_by_statement_is_refused_by_the_static_check(tmp_path, rebinding):   # #164
+    w = authored_world(tmp_path)
+    reply = w.store.submit(submit_request(VALID_SOURCE.replace("RANGE_BARS = 15", rebinding)))
+    assert (reply["status"], reply["code"]) == ("REFUSED", "AUTHORED_STATIC_REJECTED")
+    assert "class_statement" in reply["detail"]
+    assert stored_files(w) == []
 
 
 @pytest.mark.parametrize("tunables, hint", [

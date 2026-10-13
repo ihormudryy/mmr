@@ -178,11 +178,14 @@ def test_bars_skipped_between_calls_are_sent_and_only_the_newest_counts():
     assert len(sandbox.sessions[0].stamps) == 23
 
 
-def test_the_warm_up_is_capped_at_the_largest_lookback():
+def test_the_warm_up_sends_the_lookback_opened_reports():                       # #164
     sandbox, faults = live_sandbox(), []
     strategy = live(sandbox, faults)
-    strategy.on_prices(bars(2100))
-    assert len(sandbox.sessions[0].stamps) == 2000
+    signal = strategy.on_prices(bars(2100))
+    assert len(sandbox.sessions[0].stamps) == sandbox.sessions[0].lookback == 50   # CountsBars.LOOKBACK_BARS
+    assert signal.probability == 50 / 10000                  # the full lookback decided the last bar
+    strategy.on_prices(bars(2101))
+    assert len(sandbox.sessions[0].stamps) == 51             # later bars stream one at a time
 
 
 def test_a_reconnect_gives_the_same_signal_as_no_drop(caplog):

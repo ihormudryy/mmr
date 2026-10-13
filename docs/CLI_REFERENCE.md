@@ -301,7 +301,8 @@ build it reported last, has a passing newest proof, the trader refuses an author
 
 The strategy service loads an active authored deployment without reading its file: the code runs only in the live
 sandbox. It loads only when the deployment's `strategy_digest` is the stored file's digest and the build its `PING`
-reports has a passing newest proof. It reads the proof from the trader again before every new session, before every
+reports has a passing newest proof. A new session is warmed with the class's `LOOKBACK_BARS` bars (from `OPENED`).
+It reads the proof from the trader again before every new session, before every
 bar it sends, warm-up bars included (for the build the session's `OPENED` reported), and when a signal is dispatched
 (for the build that decided that signal); a passing proof is never cached. A fault answered to `OPEN` retires the file
 only when its `ERROR` names the build that passed the check; no build, or another, is an outage. Alarm codes in the

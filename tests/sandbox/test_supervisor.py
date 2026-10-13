@@ -63,6 +63,7 @@ def test_open_then_bars_then_close(tmp_path):
     assert opened["type"] == "OPENED"
     session = opened["session"]
     assert opened["image_digest"] == "mmr-build-id"                  # ruling 29: the session's own build
+    assert opened["lookback"] == 5                                   # the class's LOOKBACK_BARS (#164)
     reply = _bar(sup, session, T0)
     assert reply["type"] == "SIGNAL" and reply["action"] is None and reply["conid"] == C1
     reply = _bar(sup, session, T0 + timedelta(minutes=1))
@@ -368,6 +369,7 @@ def test_a_probe_loads_with_the_static_check_skipped(tmp_path):
 class _ScriptedChild:
     """A child whose send_bar runs a test-supplied function."""
     pid = -1
+    lookback = 50
 
     def __init__(self, on_bar):
         self._on_bar = on_bar

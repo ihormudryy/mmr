@@ -82,6 +82,7 @@ class FakeSession:
         self.image_digest = sandbox.image_digest          # the build OPENED reported (Plan 2 ruling 29)
         self._params = dict(params)
         self._lookback = max(MIN_LOOKBACK_BARS, min(MAX_LOOKBACK_BARS, int(strategy_class.LOOKBACK_BARS)))
+        self.lookback = self._lookback                    # OPENED reports it: what warms a session (#164)
         self._books = {conid: _ConidBook(strategy_class()) for conid in conids}
         self.stamps: list[pd.Timestamp] = []            # every bar sent, any conid, in send order
         self.first_close: Optional[float] = None

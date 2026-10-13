@@ -172,7 +172,7 @@ def test_a_module_level_assignment_without_a_literal_value_is_refused(assignment
 
 
 @pytest.mark.parametrize("assignment", [
-    "X = 1", "X = -2.5", "X = (1, 'a')", "X = {'a': [1, 2]}", "X: float = 0.5", "X = None",
+    "X = 1", "X = -2.5", "X = (1, 'a')", "X: float = 0.5", "X = None",
 ])
 def test_a_module_level_literal_assignment_passes(assignment):
     source = CLEAN.replace("\n\nclass Good", f"\n{assignment}\n\n\nclass Good", 1)
@@ -546,7 +546,7 @@ PROBE2_CASES = {
     "lambda_no_default": ("f = lambda v: v + 1", None),
     "nested_def": ("def inner(v):\n    return v\ny = inner(1)", None),
     "nested_class": ("class Inner:\n    pass", None),
-    "self_attr_store": ("self.state = 1", None),
+    "self_attr_store": ("self.state = 1", "keeps_state"),          # #164: no state between bars
     "self_strategy_runtime": ("y = self.strategy_runtime", None),
     "self_ctx": ("y = self.ctx", None),
     "params_get": ("y = params.get('X')", None),
@@ -559,7 +559,7 @@ PROBE2_CASES = {
     "df_values": ("y = history.values", None),
     "df_attrs": ("y = history.attrs", None),
     "df_set_flags": ("y = history.set_flags()", None),
-    "series_name_assign": ("history.name = 'x'", None),
+    "series_name_assign": ("history.name = 'x'", "keeps_state"),  # any attribute store; rename() instead
     "math_prod": ("y = math.prod([1, 2])", "module_attribute_not_allowed"),
     "statistics_mean": ("y = statistics.mean([1, 2])", None),
     "yield_from": ("yield 1", "banned_statement"),
@@ -663,3 +663,58 @@ def test_a_nested_class_with_bases_or_keywords_is_refused(nested):
 
 def test_a_plain_nested_class_passes():
     assert check_source(_probe("class Inner:\n    pass")) == []
+
+
+# #164: the live warm-up sends only LOOKBACK_BARS bars, so a file may keep no state between bars.
+STATEFUL = {
+    "instance attribute": "        self.count = 1\n",
+    "augmented attribute": "        self.count += 1\n",
+    "attribute in a for target": "        for self.i in range(2):\n            pass\n",
+    "attribute in a comprehension target": "        y = [0 for self.i in range(2)]\n",
+    "attribute deleted": "        del self.count\n",
+    "attribute in an unpacking": "        a, self.b = 1, 2\n",
+}
+
+
+@pytest.mark.parametrize("body", STATEFUL.values(), ids=list(STATEFUL))
+def test_an_attribute_store_anywhere_keeps_state(body):
+    assert "keeps_state" in _rules(PROBE2_HEAD + body + "        return None\n")
+
+
+@pytest.mark.parametrize("assignment", ["X = []", "X = {}", "X = {1}", "X = set()", "X = ((1, [2]),)"])
+def test_a_mutable_module_value_keeps_state(assignment):
+    source = CLEAN.replace("\n\nclass Good", f"\n{assignment}\n\n\nclass Good", 1)
+    assert {v.rule for v in check_source(source)} == {"keeps_state"}
+
+
+@pytest.mark.parametrize("line", ["SEEN = []", "SEEN = dict()", "SEEN = np.zeros(3)",
+                                  "SEEN = [i for i in range(3)]", "SEEN = (1, [2])"])
+def test_a_mutable_class_value_keeps_state(line):
+    source = CLEAN.replace("    LOOKBACK_BARS", f"    {line}\n    LOOKBACK_BARS", 1)
+    assert "keeps_state" in {v.rule for v in check_source(source)}
+
+
+@pytest.mark.parametrize("line", ["WINDOW = 5", "SPAN = WINDOW * 10", "LEVELS = (1, 2.5)", "LIMIT = -np.inf",
+                                  "X: float"])
+def test_a_class_constant_expression_passes(line):
+    source = CLEAN.replace("    LOOKBACK_BARS", f"    WINDOW = 4\n    {line}\n    LOOKBACK_BARS", 1)
+    assert check_source(source) == []
+
+
+@pytest.mark.parametrize("statement", ["for i in range(2):\n        pass", "x = 1\n    x += 1", "if True:\n        pass"])
+def test_a_class_body_holds_only_constants_and_methods(statement):
+    source = CLEAN.replace("    LOOKBACK_BARS", f"    {statement}\n    LOOKBACK_BARS", 1)
+    assert "class_statement" in {v.rule for v in check_source(source)}
+
+
+@pytest.mark.parametrize("signature", ["def helper(self, memo={}):", "def helper(self, memo=[]):",
+                                       "def helper(self, *, memo=set()):"])
+def test_a_mutable_default_keeps_state(signature):
+    source = CLEAN.replace("    def on_bar", f"    {signature}\n        return memo\n\n    def on_bar", 1)
+    assert "keeps_state" in {v.rule for v in check_source(source)}
+
+
+def test_an_immutable_default_passes():
+    source = CLEAN.replace("    def on_bar", "    def helper(self, span=3, levels=(1, 2)):\n        return span\n\n"
+                                             "    def on_bar", 1)
+    assert check_source(source) == []

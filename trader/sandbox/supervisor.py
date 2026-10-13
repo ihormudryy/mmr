@@ -221,8 +221,9 @@ class Supervisor:
             self._finish_with(handle, reserved)
             return _error(proto.SANDBOX_UNAVAILABLE, "connection dropped during open")
         # The build id travels with OPENED, so a caller knows which image this very session runs on (ruling 29).
+        # The lookback tells the caller how many bars warm a session (#164).
         return {"type": "OPENED", "v": proto.PROTOCOL_VERSION, "session": reserved.session_id,
-                "image_digest": self._image_digest}
+                "image_digest": self._image_digest, "lookback": handle.lookback}
 
     def _reserve(self, pool_name: str, conn_id: int, conids: tuple[int, ...], *,
                  is_probe: bool) -> _Session | dict:

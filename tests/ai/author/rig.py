@@ -44,12 +44,13 @@ class AuthorRig:
         self.supervisor = ScriptedClient({"get_scoreboard"})
         self.supervisor.script("get_scoreboard", SCOREBOARD)
         self.watch = Watch()
+        self.leader = Leader(1)
         self.loop = self.new_loop()
 
     def new_loop(self):
         """A fresh AuthorLoop on the same store and clients: what a restarted controller builds."""
         return AuthorLoop(config=self.config, store=self.store, clock=self.clock,
-                          slots=SessionSlots(author_after_close_minutes=60), leadership=Leader(1),
+                          slots=SessionSlots(author_after_close_minutes=60), leadership=self.leader,
                           watch=self.watch, author=self.author, supervisor=self.supervisor, gateway=self.gated,
                           recorder=ReplayRecorder(self.store))
 

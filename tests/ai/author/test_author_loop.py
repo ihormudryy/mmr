@@ -398,3 +398,57 @@ async def test_the_model_answer_is_never_logged_above_debug(rig, caplog):       
         await rig.loop.run_due_slot()
     assert attempt(rig)[0][:2] == ("FAILED", "CHECK_FAILED_TWICE")
     assert not [r for r in caplog.records if r.levelno > logging.DEBUG and marker in r.getMessage()]
+
+
+# -- fix round 1 --------------------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_malformed_scoreboard_skips_the_night_inside_the_loop(rig):
+    happy(rig)
+    rig.supervisor.queues["get_scoreboard"] = [{"label": "PAPER", "splits": ["x"]}]
+    await rig.loop.run_due_slot()
+    assert rig.rows("SELECT state, reason FROM author_attempts") == [("SKIPPED", "WIRE_ERROR")]
+    assert rig.model.requests == []
+
+
+@pytest.mark.asyncio
+async def test_an_unexpected_error_in_the_facts_fails_the_night_once(rig, monkeypatch, caplog):
+    def broken(**_facts):
+        raise RuntimeError("facts builder bug")
+    monkeypatch.setattr("trader.ai.author_loop.build_author_facts", broken)
+    happy(rig)
+    with caplog.at_level(logging.ERROR, logger="trader.ai.author_loop"):
+        await rig.loop.run_due_slot()
+        await rig.loop.run_due_slot()
+    assert rig.rows("SELECT state, reason FROM author_attempts") == [("FAILED", "ENGINE_ERROR")]
+    assert rig.model.requests == [] and any(record.exc_info for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_non_leader_sends_nothing(rig):
+    happy(rig)
+    rig.author.queues["submit_authored_strategy"] = [RpcOutcomeUnknown("REPLY_TIMEOUT"), STORED]
+    await rig.loop.run_due_slot()
+    reads = len(rig.author.sent("get_authored_strategies"))
+    rig.leader.epoch = None
+    rig.clock.advance(61)
+    await rig.loop.run_due_slot()
+    assert attempt(rig)[0][0] == "SUBMITTING" and len(rig.author.sent("submit_authored_strategy")) == 1
+    assert len(rig.author.sent("get_authored_strategies")) == reads
+    rig.leader.epoch = 2
+    rig.clock.advance(61)
+    await rig.loop.run_due_slot()
+    first, again = rig.author.sent("submit_authored_strategy")
+    assert first == again and attempt(rig)[0][:2] == ("STORED", "STORED")
+
+
+@pytest.mark.asyncio
+async def test_replay_reproduces_a_failed_night(rig):
+    happy(rig, answer_json(source=BAD_SOURCE), 500)
+    await rig.loop.run_due_slot()
+    assert attempt(rig)[0][:2] == ("FAILED", "MODEL_FAILED_UNKNOWN")
+    counter = ExternalAdapterCounter()
+    replayed = await replay_author_attempt(rig.store, "aut-20261008", config=rig.config, counter=counter)
+    assert replayed.status == COMPLETE and counter.total == 0
+    assert (replayed.value["state"], replayed.value["reason"], replayed.value["calls"]) == (
+        "FAILED", "MODEL_FAILED_UNKNOWN", 2)

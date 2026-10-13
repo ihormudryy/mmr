@@ -43,6 +43,8 @@ AWAY = (RpcNotSent, RpcOutcomeUnknown)
 STORE_DOWN = "AUTHORED_STORE_UNAVAILABLE"   # an RpcRefused: the trader's store failed; wait inside the slot
 STORE_UNAVAILABLE = "STORE_UNAVAILABLE"     # the row code when the slot ended during such an outage
 FACTS_UNREADABLE = "FACTS_UNREADABLE"
+ENGINE_ERROR = "ENGINE_ERROR"
+REPORT_OBJECTS = ("account", "splits", "authored_vs_catalogue")    # what scoreboard_facts reads, each an object
 CALLS_PER_NIGHT = 2                       # one answer and one retry (spec 7.4, 9)
 HOLD_SECONDS = 60                         # a waiting gate is not asked again every second
 SUBMITTING, FAILED = "SUBMITTING", "FAILED"
@@ -58,6 +60,14 @@ class _Skip(Exception):
 
 class _Wait(_Skip):
     """A gate cannot be read now (trader away, cap unread, store down): no row; tried again while the slot is due."""
+
+
+class _Fail(Exception):
+    """The night's facts could not be built: one FAILED row with this code."""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -105,9 +115,19 @@ def _problems_json(problems: tuple[StaticViolation, ...]) -> Optional[str]:
 
 
 def _as_report(reply: Any) -> dict:
+    """The shape scoreboard_facts reads: a PAPER report whose account, splits, splits.strategy_version and
+    authored_vs_catalogue are each an object or absent (Ruling 21: the view may be missing)."""
     if not isinstance(reply, dict) or reply.get("label") != "PAPER":
         raise WireError("get_scoreboard: the reply is not a PAPER report")
+    for name in REPORT_OBJECTS:
+        _require_object(reply.get(name), name)
+    _require_object((reply.get("splits") or {}).get("strategy_version"), "splits.strategy_version")
     return reply
+
+
+def _require_object(value: Any, name: str) -> None:
+    if value is not None and not isinstance(value, dict):
+        raise WireError(f"get_scoreboard: {name} is not an object")
 
 
 async def _call_author(tools: Any, request: ModelRequest, call_no: int, seconds: float) -> Any:
@@ -171,6 +191,8 @@ class AuthorLoop:
 
     # -- the slot ------------------------------------------------------------------------------------
     async def run_due_slot(self) -> None:
+        if self._leadership.current_epoch() is None:
+            return                                   # a non-leader reads, asks, writes and sends nothing
         await self._resend_submissions()
         now = self._clock.now()
         slot = self._slots.author_slot(now)
@@ -179,11 +201,11 @@ class AuthorLoop:
         if not self._slots.author_due(slot, now):
             await self._close_unstarted(slot)
             return
-        if self._held(slot, now) or self._leadership.current_epoch() is None or not self._watch.known:
+        if self._held(slot, now) or not self._watch.known:
             return
         try:
             experiment_id, reply, bar_sizes = await self._gate()
-            facts = await self._facts(slot, reply, bar_sizes)
+            facts = await self._guarded_facts(slot, reply, bar_sizes)
         except _Wait as wait:
             self._hold_slot(slot, wait.code, now)
             return
@@ -191,9 +213,8 @@ class AuthorLoop:
             await self._open(slot, "SKIPPED", skip.code)
             logger.info("author slot %s skipped: %s", slot.attempt_id, skip.code)
             return
-        except AuthorFactsError as exc:
-            logger.error("author slot %s: no strategy tonight, a stored row cannot be read: %s", slot.attempt_id, exc)
-            await self._open(slot, FAILED, FACTS_UNREADABLE)
+        except _Fail as failed:
+            await self._open(slot, FAILED, failed.code)
             return
         if await self._open(slot, "RUNNING", None):
             await self._run(slot, experiment_id, facts)
@@ -253,6 +274,21 @@ class AuthorLoop:
             raise _Wait("BUDGET_CAP_UNKNOWN") from None
         return snapshot.effective_cap_micros - snapshot.committed_micros >= worst_case
 
+    async def _guarded_facts(self, slot: AuthorSlot, reply: AuthoredStrategiesReply,
+                             bar_sizes: tuple[str, ...]) -> dict:
+        """_facts, with every failure but a wait or a skip turned into a FAILED night: nothing escapes the loop."""
+        try:
+            return await self._facts(slot, reply, bar_sizes)
+        except (_Skip, asyncio.CancelledError):
+            raise
+        except AuthorFactsError as exc:
+            logger.error("author slot %s: no strategy tonight, a stored row cannot be read: %s", slot.attempt_id, exc)
+            raise _Fail(FACTS_UNREADABLE) from None
+        except Exception:
+            logger.error("author slot %s: building the facts failed; no strategy tonight", slot.attempt_id,
+                         exc_info=True)
+            raise _Fail(ENGINE_ERROR) from None
+
     async def _facts(self, slot: AuthorSlot, reply: AuthoredStrategiesReply, bar_sizes: tuple[str, ...]) -> dict:
         report = await self._read(self._supervisor, "get_scoreboard", _as_report)
         return build_author_facts(
@@ -264,19 +300,25 @@ class AuthorLoop:
     async def _run(self, slot: AuthorSlot, experiment_id: str, facts: dict) -> None:
         try:
             outcome = await self._write(slot, experiment_id, facts)
+            if outcome.state != FAILED:
+                await self._store_body(slot.attempt_id, outcome)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("author slot %s failed", slot.attempt_id)
-            await self._finish(slot.attempt_id, FAILED, "ENGINE_ERROR")
+            await self._fail_running(slot.attempt_id, ENGINE_ERROR)
             return
         if outcome.state == FAILED:
             logger.warning("author slot %s: no strategy tonight (%s)", slot.attempt_id, outcome.reason)
             await self._finish(slot.attempt_id, FAILED, outcome.reason, calls=outcome.calls,
                                problems=outcome.problems)
             return
-        await self._store_body(slot.attempt_id, outcome)
         await self._submit(slot.attempt_id)
+
+    async def _fail_running(self, attempt_id: str, reason: str) -> None:
+        """Only a night still RUNNING: a body already stored as SUBMITTING keeps being sent."""
+        await self._update("UPDATE author_attempts SET state = ?, reason = ?, finished_at = ? "
+                           "WHERE attempt_id = ? AND state = 'RUNNING'", [FAILED, reason, self._clock.now(), attempt_id])
 
     async def _write(self, slot: AuthorSlot, experiment_id: str, facts: dict) -> AuthorOutcome:
         now = self._clock.now()

@@ -33,6 +33,9 @@ SP2c Plan 5 Task 8 (renewal) mappings:
   reader does, so a SHADOW/REJECT renewal ends the old version.
 - ``RenewalRequests`` takes ``incomplete_after_hours`` from this world's ``ResearchServiceConfig`` (the default 16 h).
 - ``research_signer`` is the world's ``signer``; ``node_rows`` takes ``params``.
+
+SP3 Plan 5 Task 12 seams (defaults are the behaviour above, unchanged): ``NODE_CLASS``, ``STRATEGY_NODE_CLASS``,
+``extra_trader_prepare``, ``evaluation_path_overrides``, ``research_evaluate`` and ``strategy_options``.
 """
 from __future__ import annotations
 
@@ -116,7 +119,14 @@ class ResearchDecisionNode(DecisionNode):
 
 
 class ResearchStrategyNode(StrategyNode):
-    """Plan 2's strategy node; ``feed_bar`` returns the source_event_id of the one signal it recorded."""
+    """Plan 2's strategy node; ``feed_bar`` returns the source_event_id of the one signal it recorded.
+
+    ``authored_deployments`` is the runtime's authored loader, which only ``StrategyRuntime.connect`` builds."""
+
+    def __init__(self, served: Any, *, strategies_dir: Path, authored_deployments: Any = None):
+        super().__init__(served, strategies_dir=strategies_dir)
+        if authored_deployments is not None:
+            self.runtime._authored_deployments = authored_deployments
 
     def feed_bar(self, conid: int, frame: pd.DataFrame) -> Optional[str]:
         before = len(self._signals())
@@ -167,6 +177,9 @@ def _write_universe(path: str) -> None:
 
 
 class ResearchWorld:
+    NODE_CLASS: type = ResearchDecisionNode
+    STRATEGY_NODE_CLASS: type = ResearchStrategyNode
+
     def __init__(self) -> None:
         self._closers: list = []
         self._flaky_lab = False
@@ -203,7 +216,7 @@ class ResearchWorld:
         self.artifacts = trader_side.artifacts
 
         market = TraderMarket()
-        market.extra_prepare = trader_side.prepare
+        market.extra_prepare = lambda trader: (trader_side.prepare(trader), self.extra_trader_prepare(trader))
         self.world = TraderWorld(tmp_path, loop_thread, monkeypatch, prepare=market.prepare)
         self._closers.append(self.world.close)
         market.now = self.world.served.now
@@ -219,7 +232,7 @@ class ResearchWorld:
 
         digest = register_discretionary(self.world)
         block = decisions_block(self.world, digest, AI_DEPLOYMENTS_BRACKET) + RESEARCH_BLOCK
-        self.node = ResearchDecisionNode(self.world, tmp_path, block)
+        self.node = self.NODE_CLASS(self.world, tmp_path, block)
         await self.node.start()
         lab = PrincipalClient("ai_research", command=self.lab_socket("command"), query=self.lab_socket("query"),
                               commands=LAB_COMMANDS, queries=LAB_QUERIES, timeout=30.0,
@@ -230,7 +243,25 @@ class ResearchWorld:
                                           slots=build_session_slots(self.node.config), leadership=ai.leadership,
                                           watch=ai.watch, clients=clients, gateway=self.node.gated,
                                           strategies_root=self.repo)
-        self.strategy = ResearchStrategyNode(served, strategies_dir=self.repo / "strategies")
+        self.strategy = self.STRATEGY_NODE_CLASS(served, strategies_dir=self.repo / "strategies",
+                                                 **self.strategy_options())
+
+    # -- seams for SP3 Plan 5's authored world (each default keeps SP2c's behaviour) ------------------------------
+    def extra_trader_prepare(self, trader: Any) -> None:
+        """A subclass's own change to the trader before its stack is built."""
+
+    def evaluation_path_overrides(self) -> dict:
+        """Fields of the research service's ``EvaluationPaths`` to replace."""
+        return {}
+
+    def research_evaluate(self, paths: EvaluationPaths, now: Any) -> Any:
+        """The research service's ``evaluate(spec)``."""
+        return lambda spec: evaluate_cohort(spec, research_db=self.research_db, paths=paths, now=now,
+                                            ruleset=holdout_ruleset())
+
+    def strategy_options(self) -> dict:
+        """Keyword options of ``STRATEGY_NODE_CLASS``."""
+        return {}
 
     def _start_research_service(self, root: Path, holdout_drift: Optional[float], deploy_expiry_sessions: int,
                                 renewals: bool) -> None:
@@ -251,8 +282,9 @@ class ResearchWorld:
                                       served.sockets.client("research", "trader", "command", timeout=30.0))
         config = ResearchServiceConfig(period_sessions=40, folds=2, embargo_sessions=1, holdout_sessions=5)
         judge = BacktestJudgeConfig(strategy_allowlist=(KEY,), deploy_expiry_sessions=deploy_expiry_sessions)
-        paths = EvaluationPaths(bars, bars, "Universes", str(costs_path), self.repo, root / "reports",
-                                self.artifacts / "evaluations")
+        paths = dataclasses.replace(EvaluationPaths(bars, bars, "Universes", str(costs_path), self.repo,
+                                                    root / "reports", self.artifacts / "evaluations"),
+                                    **self.evaluation_path_overrides())
         universe = UniverseAccessor(bars, "Universes")
         now = served.now
 
@@ -263,8 +295,7 @@ class ResearchWorld:
 
         self.evaluations = EvaluationService(
             store=store, trader=self.trader_port, build_spec=build_spec,
-            evaluate=lambda spec: evaluate_cohort(spec, research_db=self.research_db, paths=paths, now=now,
-                                                  ruleset=holdout_ruleset()),
+            evaluate=self.research_evaluate(paths, now),
             signer=self.signer, artifacts_root=self.artifacts, warmup_sessions=judge.shadow_warmup_sessions,
             order_notional=config.order_notional, queue_max=config.queue_max, now=now,
             renewals=RenewalRequests(store=store, trader=self.trader_port, signer=self.signer,

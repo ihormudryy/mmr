@@ -110,13 +110,14 @@ def _write_atomically(path: str, text: str) -> None:
 class AiController:
     def __init__(self, *, config: Any, store: Any, clock: Any, supervisor: Any, leadership: Any,
                  watch: ExperimentWatch, submitter: Any, outbox: Any, intake: Any, slots: Any, engine: Any,
-                 gateway: Any, cap_sync: Any = None, research: Any = None):
+                 gateway: Any, cap_sync: Any = None, research: Any = None, author: Any = None):
         self._config, self._store, self._clock = config, store, clock
         self._supervisor, self._leadership, self._watch = supervisor, leadership, watch
         self._submitter, self._outbox, self._intake = submitter, outbox, intake
         self._slots, self._engine, self._gateway = slots, engine, gateway
         self._cap_sync = cap_sync                      # BudgetCapSync (Ruling 19); None in unit tests
         self._research = research                      # ResearchCycle (SP2c Plan 4); None when research is off
+        self._author = author                          # AuthorLoop (SP3 Plan 5); None while authoring is off
         self._ttl = dt.timedelta(seconds=config.decision_ttl_seconds)
         self._tasks: set[asyncio.Task] = set()
         self._opportunity_tasks: dict[str, asyncio.Task] = {}
@@ -134,7 +135,11 @@ class AiController:
             await asyncio.gather(*list(self._tasks), return_exceptions=True)
 
     async def start(self) -> None:
-        """After a restart: possibly-sent work is reconciled, unfinished cycles are never replayed (spec 9)."""
+        """After a restart: possibly-sent work is reconciled, unfinished cycles are never replayed (spec 9).
+
+        Research and author recovery run before this process holds an epoch. That is safe because one ai
+        container runs per deployment, so no second process shares ai.duckdb; the author loop's own
+        ``run_due_slot`` checks the epoch before it sends anything."""
         await self._submitter.recover()
         now = self._clock.now()
         await self._store.atransaction(lambda conn: conn.execute(
@@ -145,6 +150,8 @@ class AiController:
             await self._cap_sync.sync()                # a failure is logged; the gateway stays closed (Ruling 19)
         if self._research is not None:
             await self._research.recover()             # the gateway already turned STARTED attempts into UNKNOWN
+        if self._author is not None:
+            await self._author.recover()               # after the gateway marked half-finished calls UNKNOWN
 
     async def refresh_experiment(self) -> None:
         await self._watch.refresh()
@@ -444,7 +451,8 @@ class AiController:
                   "budget_cap_ready": None if self._cap_sync is None else self._cap_sync.ready(),
                   "exit_waits_stuck": sum(1 for until, _alert in (await self._intake.waits()).values()
                                           if self._clock.now() > until + EXIT_WAIT_OVERRUN),
-                  "research": None if self._research is None else await self._research.counts()}
+                  "research": None if self._research is None else await self._research.counts(),
+                  "author": None if self._author is None else await self._author.counts()}
         if self._config.heartbeat_path:
             await asyncio.to_thread(_write_atomically, self._config.heartbeat_path, json.dumps(status))
         return status
@@ -480,6 +488,9 @@ class AiController:
             for seconds, step, name in ((SLOT_POLL_SECONDS, self._research.run_due_slot, "research_slot"),
                                         (self._research.poll_seconds, self._research.pump, "research_pump")):
                 loops.append(asyncio.create_task(self._every(stop, seconds, step, name)))
+        if self._author is not None:
+            loops.append(asyncio.create_task(self._every(stop, SLOT_POLL_SECONDS, self._author.run_due_slot,
+                                                         "author_slot")))
         try:
             await stop.wait()
         finally:

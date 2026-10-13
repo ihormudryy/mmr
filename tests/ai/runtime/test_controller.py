@@ -647,3 +647,53 @@ async def test_research_loops_run_only_when_enabled(rig, tmp_path):
     assert research.calls[0] == "recover" and {"run_due_slot", "pump"} <= set(research.calls)
     assert (await controller.heartbeat())["research"] == await research.counts()
     assert (await rig.controller.heartbeat())["research"] is None
+
+
+# -- SP3 Plan 5 Task 9: the author loop ----------------------------------------------------------------------------
+class StubAuthor:
+    def __init__(self, stop, *, fail_first_runs=0):
+        self.calls, self.stop, self._failures_left = [], stop, fail_first_runs
+
+    async def recover(self):
+        self.calls.append("recover")
+
+    async def run_due_slot(self):
+        self.calls.append("run_due_slot")
+        if self._failures_left > 0:
+            self._failures_left -= 1
+            raise RuntimeError("the author loop broke")
+        self.stop.set()
+
+    async def counts(self):
+        return {"unsubmitted": 0, "last": None}
+
+
+def controller_with_author(rig, tmp_path, author):
+    return AiController(
+        config=ControllerConfig(heartbeat_path=str(tmp_path / "hb.json")), store=rig.store, clock=rig.clock,
+        supervisor=rig.trader, leadership=RenewingLeadership(1), watch=rig.watch, submitter=rig.submitter,
+        outbox=ReportingOutbox(store=rig.store, journal=AttemptJournal(rig.store), supervisor=rig.trader,
+                               clock=rig.clock),
+        intake=rig.intake, slots=SessionSlots(), engine=rig.engine, gateway=FakeGateway(rig.clock), author=author)
+
+
+@pytest.mark.asyncio
+async def test_the_author_loop_runs_only_when_authoring_is_on(rig, tmp_path):
+    stop = asyncio.Event()
+    author = StubAuthor(stop)
+    controller = controller_with_author(rig, tmp_path, author)
+    await asyncio.wait_for(controller.run(stop), timeout=10)
+    assert author.calls[0] == "recover" and "run_due_slot" in author.calls
+    assert (await controller.heartbeat())["author"] == {"unsubmitted": 0, "last": None}
+    assert (await rig.controller.heartbeat())["author"] is None
+
+
+@pytest.mark.asyncio
+async def test_an_author_loop_that_raises_is_logged_and_tried_again(rig, tmp_path, caplog):
+    caplog.set_level(logging.ERROR, logger="trader.ai.controller")
+    stop = asyncio.Event()
+    author = StubAuthor(stop, fail_first_runs=2)
+    controller = controller_with_author(rig, tmp_path, author)
+    await asyncio.wait_for(controller.run(stop), timeout=10)
+    assert author.calls.count("run_due_slot") == 3
+    assert "ai controller step author_slot failed" in caplog.text

@@ -1,7 +1,6 @@
 """SP2 Plan 5 Task 10: the entry point fails loudly and installs nothing it should not."""
 import logging
 
-import pytest
 
 # Importing typed_rpc runs dictConfig, which replaces the root handlers (caplog's too). Do it before any test
 # sets up caplog, so these tests do not depend on which test file imported it first.
@@ -70,7 +69,7 @@ def test_the_research_cycle_uses_the_cap_gated_gateway_and_is_built_only_when_en
 
     clock = FakeClock(dt.datetime(2026, 10, 8, 21, tzinfo=dt.timezone.utc))
     store = AiStore(tmp_path / "ai.duckdb", clock=clock)
-    clients, gateway = SimpleNamespace(lab=object(), research=object()), object()
+    clients, gateway = SimpleNamespace(lab=object(), research=object(), author=None), object()
 
     def build(config):
         return build_research_cycle(config, store=store, clock=clock, slots=build_session_slots(config),

@@ -281,3 +281,9 @@ def test_settle_is_cli_only_and_the_listing_is_for_humans(served_with_acl):     
     assert TRADER_ACL[("query", "list_unresolved_commands")] == HUMAN
     registered = {(r.socket_role, r.method) for r in build_full_production_registry().registrations()}
     assert {("command", "settle_unknown_command"), ("query", "list_unresolved_commands")} <= registered
+
+
+def test_a_port_zero_server_reports_the_port_it_bound(served):    # #163: no free-port probe to race
+    port = served.ports[("trader", "query")]
+    assert port == served.servers[("trader", "query")].bound_port and port > 0
+    assert served.raw_code(served.signed("cli")) == "METHOD_NOT_ALLOWED"    # a signed reply came back on it

@@ -80,9 +80,9 @@ class ServedStack:
 
         self.identities = identities
         self.registries = registries
-        self.ports = {key: free_port() for key in registries}
+        # Port 0: each server binds a port the OS picks, so no parallel worker can take it first (#163).
         self.servers = {
-            key: TypedRpcServer(key[1], registry, identities[key[0]], port=self.ports[key])
+            key: TypedRpcServer(key[1], registry, identities[key[0]], port=0)
             for key, registry in registries.items()
         }
         self._clients = []
@@ -110,6 +110,7 @@ class ServedStack:
         assert ready.wait(timeout=5.0), "typed RPC servers did not start"
         time.sleep(0.05)
         self._state = state
+        self.ports = {key: server.bound_port for key, server in self.servers.items()}
 
     def client(self, caller, server="trader", role="query", timeout=5.0, identity=None):
         from trader.messaging.typed_rpc import TypedRpcClient

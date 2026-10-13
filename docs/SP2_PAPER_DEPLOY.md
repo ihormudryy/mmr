@@ -78,7 +78,7 @@ Owner rule: no legacy data, no upgrade. Drop them and let the migrations create 
    - Creates `~/.config/mmr/keys/private/signing.pem` (0600) and `keys/verify/paper-automation.pem`. It never overwrites.
 3. `./docker.sh -k`
    - Creates every missing RPC pair, including `research`. It never overwrites.
-   - check: `ls ~/.config/mmr/keys/rpc` shows `.key` and `.pub` for `trader strategy cli dashboard ai_supervisor ai_research research`.
+   - check: `ls ~/.config/mmr/keys/rpc` shows `.key` and `.pub` for `trader strategy cli dashboard ai_supervisor ai_research ai_author research`.
 4. `./docker.sh -K`
    - It runs alone and does not touch the live stack.
    - check: "Key check passed for every service". On a failure, stop. Do not go on.
@@ -156,7 +156,7 @@ Config templates are copied only when a file is missing, so your old files lack 
    ```
    - check: the list contains 90, 95, 96, 100, 110, 111, 115, 116, 120, 125.
 5. `docker compose --profile ai logs --tail 50 ai research` has no ERROR lines.
-   - `ai.duckdb` has migrations 1-5, 10-17, 20-22, 30-34 and the research DB 1-11, 20-22. No `mmr` command lists them.
+   - `ai.duckdb` has migrations 1-5, 10-18, 20-22, 30-34, 40 and the research DB 1-11, 20-22. No `mmr` command lists them.
 
 ## 7. SP1 paper acceptance (OWNER ONLY, places IB orders)
 
@@ -234,3 +234,84 @@ Stop commands:
 
 A KILLED experiment is never resumed: flatten, `mmr reconcile`, `mmr experiment stop`, then a new `experiment start`.
 `./docker.sh -d` keeps all data. Never run `./docker.sh -c` or `-f` here: they delete volumes.
+
+## 10. SP3: AI-written strategies (OWNER ONLY)
+
+Built and merged with the switch off and the author model empty. Turn it on in this order. Do it after sections 1 to 9
+work. Never write a key or a token into a file you share.
+
+1. Keys. `./docker.sh -k` creates the missing pairs, including `ai_author.key` and `ai_author.pub`. Only the `ai`
+   service mounts `ai_author.key`; the trader mounts `ai_author.pub`. Then `./docker.sh -K`.
+   - check: `ls ~/.config/mmr/keys/rpc` shows `ai_author.key` and `ai_author.pub`; `-K` prints "Key check passed for
+     every service". A mount of `ai_author.key` outside `ai` fails it. On a failure, stop.
+2. Build and start the sandbox. `./docker.sh -b -u` as in section 5 (the build id comes from `./docker.sh -b`; a plain
+   `docker build` gives a sandbox that does not start). Leave the switch off: no `authored_strategies` block in
+   `~/.config/mmr/trader.yaml`, or `ai_paper.authored_strategies.enabled: false`. Leave `roles.author.model` empty in
+   `~/.config/mmr/ai.yaml`. `sandbox` is in compose profile `ai` (also `test`), so `./docker.sh -u` does not start it:
+   `docker compose --profile ai up -d sandbox`, then `docker compose --profile ai up -d --force-recreate ai research`
+   (as in section 5).
+   - check: `docker compose --profile ai ps` shows `sandbox`, `research` and `ai` as "healthy" within about 2 minutes.
+   - check: `docker compose --profile ai exec -T sandbox cat /etc/mmr-build-id` prints a build id (git sha and a time),
+     not `unset`.
+3. Check the authored store mount. The trader writes `/store`, the sandbox reads it. A missing or unreadable store
+   file is `SANDBOX_DIGEST_MISMATCH`, and that code retires the deployment. So a wrong `/store` mount would retire every
+   deployed authored file (OPERATIONAL_STATE.md, "AI-written strategies", known limits). Look at both mounts:
+   ```bash
+   docker inspect --format '{{.Name}}: {{range .Mounts}}{{if eq .Destination "/store"}}{{.Name}} rw={{.RW}}{{end}}{{end}}' \
+       $(docker compose --profile ai ps -q trader sandbox)
+   docker compose --profile ai exec -T trader ls -l /store
+   docker compose --profile ai exec -T sandbox ls -l /store
+   ```
+   - check: two lines, both with the same volume name (it ends in `mmr_authored_strategies`); the trader line says
+     `rw=true`, the sandbox line says `rw=false`. The two `ls` listings are the same: empty on a first turn-on; later one
+     `<64 hex>.py` file per stored strategy, mode `-rw-r--r--`. Any difference: stop, fix the mount, do not go on.
+     Run this step again after every rebuild and before step 6.
+4. Prove the isolation of the running sandbox (host only): `mmr ai-author prove-isolation`. Run it only while no
+   live sandbox session is open (owner ruling 2026-10-11: a hostile probe must never run next to a live strategy's
+   child). On first turn-on there is none. Later (after a rebuild): set `ai_paper.authored_strategies.enabled: false`,
+   `docker compose restart trader`, wait one strategy reconcile (30 s) so the strategy service closes its authored
+   sessions, run the command, then turn the switch back on. If compose says it has no service `research`, run
+   `mmr ai-author prove-isolation --compose "docker compose --profile ai"`.
+   - check: exit code 0. It prints `RECORDED` (or `EXISTING`) with a proof whose `passed` is `true` and whose
+     `image_digest` is the build id from step 2. It never prints "the sandbox image is NOT proven". Until a pass exists
+     for that build the trader refuses every authored registration (`AUTHORED_ISOLATION_UNPROVEN`) and the strategy
+     service opens no live session for an authored deployment. A rebuilt sandbox image needs a new run.
+   - check (only if a live session is open): it fails with `LIVE_SESSIONS_OPEN` (the in-container step exits 3, the
+     host command exits 1) and records nothing. Switch authoring off, wait, run again.
+5. Set the author model. In `~/.config/mmr/ai.yaml`:
+   - `roles.author.backend` and `roles.author.model` (the model id).
+   - Its price row under `pricing.<backend>`: `"vendor/model-id": {input_usd_per_million: X, output_usd_per_million: Y}`.
+     Take X and Y from the provider page.
+   - The provider key in the repo `.env`, the same one `roles.orchestrator` uses: `OPENROUTER_API_KEY` for
+     `openrouter`; `AWS_REGION` with `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` for `bedrock`; `AZURE_OPENAI_ENDPOINT`,
+     `AZURE_OPENAI_API_KEY` and `AZURE_OPENAI_API_VERSION` for `azure`. Set no new key if that one is already there.
+   - Keep `research.enabled: true`. Leave `authoring:` at its defaults (`run_after_close_minutes: 60`,
+     `call_timeout_seconds: 300`; do not set `call_timeout_seconds` under `roles.author`).
+   - Then `docker compose --profile ai up -d --force-recreate ai` (a bind-mounted file is not re-read by a plain restart).
+   - check: `docker compose --profile ai logs --tail 50 ai` has no `AUTHOR_PRICE_MISSING`, `AUTHORING_NEEDS_RESEARCH` or
+     `AUTHOR_TIMEOUT_IN_ROLE`, and the service stays "healthy".
+   - check: `docker compose --profile ai exec -T ai cat /tmp/mmr_ai_heartbeat.json` has an `author` object
+     (`unsubmitted` 0, `last` null before the first night), not `null`.
+6. Turn the switch on. Check step 3 again first. In `~/.config/mmr/trader.yaml` under the existing `ai_paper:`:
+   `authored_strategies: {enabled: true, max_active: 3}` (it needs `ai_paper.enabled: true`; keep `bar_sizes`
+   overlapping `research.bar_sizes` in `ai.yaml`), then `docker compose restart trader`.
+   - check: `mmr --json ai-author list` shows `"enabled": true`, `"max_active": 3` and no records yet. An unknown key
+     stops the trader at start and the error names it.
+7. The next evening (one hour after the close): the heartbeat `author.last` shows `aut-YYYYMMDD` with state `STORED`
+   (or a `SKIPPED`, `FAILED` or `REFUSED` code, read OPERATIONAL_STATE.md "AI-written strategies"); `mmr ai-author
+   list` shows the file; the research cycle evaluates it the same night (state `EVALUATING`, then `SHADOW` or a final
+   state); Jev judges it; a DEPLOY registers (state `DEPLOYED`) and trades from the next session.
+   - check: `mmr --json ai-author list` has one record for the file, with its digest, class and state. At most one new
+     file per night.
+8. Watch `mmr scoreboard`: "AI-written vs catalogue" says `yes` only with at least 20 closed trips each side, a higher
+   daily-P&L Sharpe and no worse drawdown. It is a report; it changes no gate.
+   - check: the line starts "AI-written vs catalogue (PAPER)" and says `not enough data` with a reason (for example
+     `TOO_FEW_TRIPS`) until both sides have 20 closed trips.
+
+Stop: `ai_paper.authored_strategies.enabled: false` and `docker compose restart trader` (no new authoring, evaluation
+or authored entries; closes go on; records stay).
+   - check: `mmr --json ai-author list` shows `"enabled": false`.
+
+Or empty `roles.author.model` and `docker compose --profile ai up -d --force-recreate ai` (no new authoring; stored files
+are not offered for evaluation).
+   - check: the heartbeat `author` entry is `null`.

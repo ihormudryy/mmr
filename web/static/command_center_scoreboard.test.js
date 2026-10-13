@@ -187,4 +187,28 @@ test('incidents are listed', () => {
   assert.match(renderScoreboard(report), /SESSION_MISSING/);
 });
 
+const VIEW_SIDE = {closed_trips: 21, unresolved_fee_trips: 0, pnl_usd: 120.5, sharpe_daily: 0.21,
+                   max_drawdown_usd: 30, strategies: ['sha256:a']};
+
+test('the AI-written vs catalogue view shows the verdict, both sides and the paper label', () => {
+  const html = renderScoreboard({...FULL_REPORT, authored_vs_catalogue: {
+    label: 'PAPER', note: 'A report only: it never changes a gate.', verdict: 'yes', reason: null,
+    min_closed_trips: 20, sessions: 12, conids: [265598], authored: VIEW_SIDE,
+    catalogue: {...VIEW_SIDE, sharpe_daily: 0.1}}});
+  assert.match(html, /AI-written vs catalogue/);
+  assert.match(html, /data-authored-verdict="yes"/);
+  assert.match(html, /\$120\.50/);
+  assert.match(html, /never changes a gate/);
+});
+
+test('a report without the view, or with unknown sides, renders without throwing', () => {
+  assert.doesNotMatch(renderScoreboard(FULL_REPORT), /AI-written vs catalogue/);
+  const html = renderScoreboard({...FULL_REPORT, authored_vs_catalogue: {
+    label: 'PAPER', note: 'A report only.', verdict: 'not enough data', reason: 'SCOPE_UNKNOWN',
+    min_closed_trips: 20, sessions: 0, conids: [], authored: null, catalogue: null}});
+  assert.match(html, /not enough data/);
+  assert.match(html, /SCOPE_UNKNOWN/);
+  assert.doesNotMatch(html, /NaN|undefined|null/);
+});
+
 console.log(`command_center_scoreboard.test.js: ${passed} tests passed`);

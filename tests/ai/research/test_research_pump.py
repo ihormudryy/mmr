@@ -542,7 +542,7 @@ def gated_cycle(rig, cap):
     from trader.ai_service import build_research_cycle
     return build_research_cycle(rig.config, store=rig.store, clock=rig.clock, slots=SessionSlots(),
                                 leadership=Leader(1), watch=Watch(EXPERIMENT),
-                                clients=SimpleNamespace(lab=rig.lab, research=rig.registry),
+                                clients=SimpleNamespace(lab=rig.lab, research=rig.registry, author=None),
                                 gateway=CapGatedGateway(rig.gateway, cap), strategies_root=rig.tmp_path)
 
 

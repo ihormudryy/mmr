@@ -45,13 +45,31 @@ class ResearchSlot:
         return f"rcy-{self.session_date:%Y%m%d}"
 
 
+@dataclass(frozen=True)
+class AuthorSlot:
+    session_date: dt.date
+    start: dt.datetime                    # the official close + authoring.run_after_close_minutes
+    ends_at: dt.datetime                  # New York midnight after the session: the same budget day (Ruling 5)
+
+    @property
+    def attempt_id(self) -> str:
+        return f"aut-{self.session_date:%Y%m%d}"
+
+
+def author_slot_end(session_date: dt.date) -> dt.datetime:
+    """New York midnight after the session: the author slot's end and the end of its budget day (Ruling 5)."""
+    return dt.datetime.combine(session_date + dt.timedelta(days=1), dt.time(0), tzinfo=ET)
+
+
 class SessionSlots:
     def __init__(self, *, calendar: Optional[Any] = None, entry_minutes: int = 15, position_minutes: int = 15,
-                 grace_seconds: int = 120, research_after_close_minutes: int = 30):
+                 grace_seconds: int = 120, research_after_close_minutes: int = 30,
+                 author_after_close_minutes: int = 60):
         self._calendar = calendar if calendar is not None else XNYSCalendarPolicy()
         self._interval = {ENTRY: dt.timedelta(minutes=entry_minutes), POSITION: dt.timedelta(minutes=position_minutes)}
         self._grace = dt.timedelta(seconds=grace_seconds)
         self._after_close = dt.timedelta(minutes=research_after_close_minutes)
+        self._author_after_close = dt.timedelta(minutes=author_after_close_minutes)
 
     def entry_window_open(self, now: dt.datetime) -> bool:
         return self._calendar.allows_new_entry(now)
@@ -125,3 +143,17 @@ class SessionSlots:
     def research_window_open(self, now: dt.datetime) -> bool:
         slot = self.research_slot(now)
         return slot is not None and self.research_due(slot, now)
+
+    def author_slot(self, now: dt.datetime) -> Optional[AuthorSlot]:
+        """The newest author slot that started at or before ``now`` (spec 7.4: once per New York trading day)."""
+        day = now.astimezone(ET).date()
+        for _ in range(MAX_CLOSED_DAYS):
+            schedule = self._schedule_on(day)
+            if schedule is not None and schedule.close_utc + self._author_after_close <= now:
+                return AuthorSlot(schedule.session_date, schedule.close_utc + self._author_after_close,
+                                  author_slot_end(schedule.session_date))
+            day -= dt.timedelta(days=1)
+        return None
+
+    def author_due(self, slot: AuthorSlot, now: dt.datetime) -> bool:
+        return slot.start <= now < slot.ends_at

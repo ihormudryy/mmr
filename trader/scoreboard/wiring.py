@@ -11,6 +11,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Sequence
 
+from trader.scoreboard.authored_vs_catalogue import read_authored_scope
 from trader.scoreboard.bar_sources import default_bar_sources
 from trader.scoreboard.benchmark import BenchmarkBook, BenchmarkSourceError, read_spy_closes
 from trader.scoreboard.close_fills import JournalCloseFills
@@ -122,7 +123,8 @@ def build_scoreboard(trader: Any, *, migrator: Any, broker: Any, experiments: An
     book = BenchmarkBook(store, _history_source(getattr(trader, "history_duckdb_path", "") or ""), calendar, now)
     outbox, sender = build_telegram(_telegram_section(trader), db, now)
     service = ScoreboardService(store=store, db=db, experiments=reader, ledger=ledger, book=book, links=links,
-                                calendar=calendar, now=now, outbox=outbox, shadow_owed=shadow_owed)
+                                calendar=calendar, now=now, outbox=outbox, shadow_owed=shadow_owed,
+                                authored_scope=lambda: read_authored_scope(db))
     decisions = NullDecisionFacts() if decision_store is None else DecisionStoreFacts(decision_store, command_ledger)
     ingest = AiIngest(store=store, experiments=reader, decisions=decisions, calendar=calendar, now=now, sizer=sizer)
     close_fills = NullCloseFills() if decision_store is None else JournalCloseFills(

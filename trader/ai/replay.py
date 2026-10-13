@@ -228,8 +228,8 @@ class ReplayGateway:
         self._clock = clock
         self._served: Counter[str] = Counter()
 
-    def new_deadline(self, label: str = "") -> DecisionDeadline:
-        return DecisionDeadline(self._clock, 1e9, label)
+    def new_deadline(self, label: str = "", seconds: Optional[float] = None) -> DecisionDeadline:
+        return DecisionDeadline(self._clock, 1e9, label)              # replay waits for nothing
 
     async def call(self, role: str, request: ModelRequest, deadline: DecisionDeadline) -> GatewayResult:
         number = self._served[request.request_key] + 1

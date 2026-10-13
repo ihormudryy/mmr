@@ -368,7 +368,7 @@ message with no traceback.
 3. The operator runs `mmr ai-author prove-isolation` (Plan 3). It calls `run_isolation_checks` against the running service, on the research socket, and the host records the result. It refuses while a live session is open, and while it runs the sandbox refuses every new live session (`SANDBOX_BUSY`, `isolation probe running`): a live authored strategy misses its bars for the few minutes of the proof. Run it while the research pool is quiet, or the slot-wipe check can hit `SANDBOX_BUSY` and fail (it never passes wrongly).
 4. A rebuild of the image is a new build id. It needs a fresh `prove-isolation` (Plan 3 gate).
 
-**Do not** run the container tests against the live stack. Use `scripts/run_sandbox_fullstack.sh`. It uses compose project `mmr-sbxtest`, starts only `sandbox` and the test container, and removes everything when it ends.
+**Do not** run the container tests against the live stack. Use `scripts/run_sandbox_fullstack.sh`. It uses compose project `mmr-sbxtest`, starts only `sandbox`, a test-only `research` stand-in and the test container, and removes everything when it ends. `--test tests/fullstack/test_prove_isolation_in_research.py` runs the isolation proof from inside the research container: it passed on 2026-10-13 (1 passed).
 
 **Seccomp.** `config_defaults/sandbox-seccomp.json` is made by `scripts/build_sandbox_seccomp.py` from moby v27.5.1 `profiles/seccomp/default.json` (sha256 `9c1025c88ccaa517b648da571961838744ea2137f176bfe6a48b21294cae9c76`, vendored as `config_defaults/docker-default-seccomp.json`). Five syscalls are removed: `ptrace`, `process_vm_readv`, `process_vm_writev`, `kcmp`, `pidfd_open`. Do not edit the JSON by hand: rerun the script.
 
@@ -847,6 +847,94 @@ Known limits of renewal:
 - Research universes need local daily bars. See "Daily bars for every conid" above.
 
 ---
+
+## AI-written strategies (SP3)
+
+**Status: built, off.** `ai_paper.authored_strategies.enabled: false`, `roles.author.model: ""`, no isolation proof
+recorded. Turn-on order: SP2_PAPER_DEPLOY.md section 10.
+
+### What runs
+- Once per New York trading day, `authoring.run_after_close_minutes` (60) after the close and before midnight, the
+  `ai` service asks the `author` model for one strategy file. Code builds the facts (the authored-strategy API, the
+  allow-lists, the first research universe by name, the bar sizes, catalogue evaluations, the scoreboard, earlier
+  authored files with their outcome and Jev's reason, the authored trial count). The static check runs on the
+  answer; a refused answer gets one retry with the problems (at most 20 problems, each cut to 200 characters). A
+  clean file goes to the trader as `ai_author` (`submit_authored_strategy`); the trader checks it again, stores it
+  (file in the `mmr_authored_strategies` volume at `/store`, record in the journal table `authored_strategies`).
+- A SUBMITTING row left from an earlier night is resent before tonight's slot. Two files can land on one calendar
+  day, but there is still at most one new file per night, and the trader cap (`max_active`) bounds the total.
+- The research cycle offers each `STORED` file as an evaluation candidate on the same night, inside SP2c's daily
+  evaluation limit. The research service runs it only through the sandbox. Jev judges it as any case.
+- Authored code runs only in the `sandbox` service (no network, no keys, no config). The `ai`, `research`, `strategy`
+  and `trader` processes never run it.
+
+### Watch it
+- `ai.duckdb` `author_attempts`: one row per night. `state` is `STORED`, `SKIPPED`, `MISSED`, `FAILED` or `REFUSED`
+  (`RUNNING` and `SUBMITTING` while a night is open), with `reason`, `calls` (at most 2), `violations_json` (the
+  last refused answer's rules), `digest`, `authored_key`.
+- The heartbeat's `author` entry (`unsubmitted`, `last`): `docker compose --profile ai exec -T ai cat /tmp/mmr_ai_heartbeat.json`.
+  `mmr ai-author list` shows the trader's records and states.
+- `ai_research_registrations`: `WAITING_CAP` with `AUTHORED_ISOLATION_UNPROVEN` means a DEPLOY waits for
+  `mmr ai-author prove-isolation`; it registers on the first research evening after a pass.
+- `mmr scoreboard` / the dashboard Scoreboard tab: "AI-written vs catalogue" (PAPER, a report only).
+
+### Codes you will see
+- `SKIPPED`: `NO_EXPERIMENT`, `EXPERIMENT_KILLED`, `AUTHORED_STRATEGIES_DISABLED`, `AUTHORED_CAP_FULL`,
+  `NO_COMMON_BAR_SIZE`, `BUDGET_NO_ROOM`, `READ_REFUSED_<code>`, `WIRE_ERROR`, `STORE_UNAVAILABLE` (the slot ended
+  during a trader store outage). `MISSED LATE_START`: the service was down until midnight.
+- `FAILED`: `CHECK_FAILED_TWICE`, `MODEL_REFUSED_<code>`, `MODEL_FAILED_<outcome>`, `PROCESS_RESTARTED`,
+  `DIGEST_MISMATCH`, `FACTS_UNREADABLE` (a stored row the facts cannot read; no model call), `ENGINE_ERROR`
+  (an unexpected error in the night; the row says so instead of the night being lost), `STORE_UNAVAILABLE`.
+  `REFUSED`: the trader's refusal code, `RPC_<code>` (the trader's final RPC refusal, sent once),
+  `EXISTING_MISMATCH` (the trader already holds this file with another bar size or other tunable ranges or defaults;
+  its stored record wins, the differences are in the `ai` log at INFO) or `EXISTING_TERMINAL` (the trader holds this
+  file as `REJECTED`, `RETIRED`, `EXPIRED` or `FAILED`). `STORED` is `STORED` (new) or `EXISTING` (the trader already
+  held this exact file with the same bar size and tunables). The note is never compared.
+- Trader refusals: `AUTHORED_STRATEGIES_DISABLED`, `AUTHORED_CAP_FULL`, `AUTHORED_STATIC_REJECTED`,
+  `AUTHORED_BAD_TUNABLES`, `AUTHORED_BAD_BAR_SIZE`, `AUTHORED_ISOLATION_UNPROVEN`.
+- Config (the `ai` service exits and the log says so): `AUTHOR_PRICE_MISSING`, `AUTHORING_NEEDS_RESEARCH`,
+  `AUTHOR_TIMEOUT_IN_ROLE`.
+- `LIVE_SESSIONS_OPEN` (`prove-isolation`): a live sandbox session is open; switch authored strategies off first.
+- `AUTHORED_REPORT_REFUSED` (research log): the trader refused an authored evaluation's end; the request stays open
+  and the end is sent again hourly and at a restart. Check the record with `mmr ai-author list`.
+- `AUTHORED_ISOLATION_UNPROVEN` (strategy log): the live sandbox runs a build without a passing proof; no signal
+  until `prove-isolation` passes for it.
+- Scoreboard: `not enough data` with `SCOPE_UNKNOWN`, `NO_COMMON_SESSIONS`, `TOO_FEW_TRIPS`, `FEES_PENDING`,
+  `SHARPE_UNKNOWN`; the warning `AUTHORED_SCOPE_UNKNOWN` says why the scope could not be read.
+
+### Stop it
+- `ai_paper.authored_strategies.enabled: false` + `docker compose restart trader`: no new authoring, evaluations or
+  authored entries; exits and closes go on; states stay.
+- Empty `roles.author.model` + recreate `ai`: no authoring; stored files are not offered until it is set again.
+
+### Replay a night
+`replay_author_attempt(store, "aut-YYYYMMDD", config=...)` gives the night's outcome from recorded evidence with no
+model call; a config or code change, or a night that ran twice after a restart, is `INCOMPLETE`.
+
+### Known limits
+- **A wrong `/store` mount retires every deployed authored file.** A missing or unreadable authored store file is
+  `SANDBOX_DIGEST_MISMATCH` (Plan 2 ruling 9), and the strategy service retires an authored deployment on that code.
+  So a `/store` mount that is empty or points at another volume would retire all of them. It fails closed (no signal,
+  open positions keep their stops). Changing it is an owner decision. Check the mount before the switch goes on:
+  SP2_PAPER_DEPLOY.md section 10, step 2. (A file the sandbox may not read because of owner or mode is
+  `SANDBOX_UNAVAILABLE`, not a mismatch: no retirement.)
+- The "AI-written vs catalogue" view decides the sides by strategy digest. While one-strategy automation is off (owner
+  ruling), that is exact. A catalogue file run by one-strategy automation inside a judged scope would count as
+  catalogue. The fix needs `round_trips.deployment_version`.
+- Author spend reaches the trader's cost records under its own role `author` (trader migration 132); `served_id`
+  `aut-YYYYMMDD` marks the night.
+- Authored files are evaluated on one universe (the first research universe by name) at their default point (the
+  defaults the trader stored with each file).
+- A registration that waited for the isolation proof goes through the next research evening, not at once (the
+  trader keys the registration command by New York date). The wait ends when the record's 20-session SHADOW window
+  closes.
+- A failed authored claim waits up to 24 h for Jev's judgment (`CLAIM_FAILED_GRACE`) before the record returns to
+  `STORED`; a judgment that arrives later is refused.
+- The live sandbox pool has 3 sessions, one per authored deployment (each serves all of its 8-20 conids), and
+  `max_active` is at most 3. A fault on any conid stops the whole deployment and retires it.
+- The isolation proof in the research container ran for real on 2026-10-13
+  (`scripts/run_sandbox_fullstack.sh --test tests/fullstack/test_prove_isolation_in_research.py`, 1 passed, project
+  `mmr-sbxtest`). That proves the harness. A proof against the real sandbox build is still the owner's step 3.
 
 ## Open items / follow-ups (offline)
 

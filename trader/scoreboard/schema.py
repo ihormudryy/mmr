@@ -1,4 +1,4 @@
-"""Journal migrations 60-64: the scoreboard tables (Plan 5 owns 60-69); SP2 Plan 2 adds 95-96; SP2c Plan 3 adds 120."""
+"""Journal migrations 60-64: the scoreboard tables (Plan 5 owns 60-69); SP2 Plan 2 adds 95-96; SP2c Plan 3 adds 120; SP3 Plan 5 adds 132."""
 from __future__ import annotations
 
 from typing import Any
@@ -72,6 +72,20 @@ _COSTS = (
         CHECK ((cost_status = 'unknown') = (cost_usd IS NULL)))""",
 )
 
+# Migration 132 (SP3 Plan 5, owner ruling 2026-10-11): ai_costs.role gains 'author'. DuckDB cannot change a
+# CHECK in place, so the table is rebuilt the way journal migration 52 rebuilt the allocation-authority tables
+# (trader/data/allocation_authority_store.py): the same columns with the wider CHECK, every row copied as it is
+# (the seals cover the row values, so they stay valid), the old table dropped and the new one renamed.
+# SchemaMigrator.apply runs all four statements and the version row in one transaction: a failure leaves the
+# old table and its rows untouched. ai_costs has no index or sequence to recreate (migration 63 creates none).
+_COSTS_AUTHOR_ROLE = (
+    _COSTS[0].replace("CREATE TABLE IF NOT EXISTS ai_costs (", "CREATE TABLE ai_costs_v132 (", 1)
+             .replace("'orchestrator','jev','research'", "'orchestrator','jev','research','author'", 1),
+    "INSERT INTO ai_costs_v132 SELECT * FROM ai_costs",
+    "DROP TABLE ai_costs",
+    "ALTER TABLE ai_costs_v132 RENAME TO ai_costs",
+)
+
 _SIMULATED = (
     """CREATE TABLE IF NOT EXISTS simulated_decisions (
         record_id VARCHAR PRIMARY KEY, experiment_id VARCHAR NOT NULL,
@@ -129,6 +143,7 @@ MIGRATIONS = (
     (95, "sp2_simulated_decisions", _SIMULATED),
     (96, "sp2_simulated_outcomes", _OUTCOMES),
     (120, "sp2c_shadow_results", _SHADOW),
+    (132, "sp3_ai_costs_author_role", _COSTS_AUTHOR_ROLE),
 )
 
 

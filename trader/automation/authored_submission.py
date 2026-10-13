@@ -2,23 +2,26 @@
 
 Pure: no file and no journal. The order follows spec 7.3: the static check, the bar size, the tunables
 (the store checks the switch and the cap first). The trader reads the file with ``ast`` and Plan 1's
-checker only; it never imports or runs it.
+checker only; it never imports or runs it. The ai service's author runs ``check_authored_file`` on the
+body it is about to send (SP3 Plan 5), so this module imports neither the wire models nor the store.
 """
 from __future__ import annotations
 
 import ast
 from collections import Counter
 from dataclasses import dataclass
-from typing import Iterator, Mapping, Optional
+from typing import TYPE_CHECKING, Iterator, Mapping, Optional, Sequence
 
 from trader.authored.static_check import AuthoredStaticRejected, _parse_quietly, require_clean
-from trader.automation.authored_config import AuthoredStrategiesConfig
 from trader.automation.authored_refusals import (
     AUTHORED_BAD_BAR_SIZE, AUTHORED_BAD_TUNABLES, AUTHORED_STATIC_REJECTED, AuthoredRefused,
 )
-from trader.automation.authored_wire import SubmitAuthoredStrategyRequest, TunableRange
 from trader.automation.strategy_binding import bar_size_key
 from trader.research.request_rules import TUNABLE_NAME
+
+if TYPE_CHECKING:
+    from trader.automation.authored_config import AuthoredStrategiesConfig
+    from trader.automation.authored_wire import SubmitAuthoredStrategyRequest
 
 NOT_TUNABLE = frozenset({"LOOKBACK_BARS"})     # fixed by the API (spec 7.1)
 MAX_STATIC_DETAIL_CHARS = 2000
@@ -36,9 +39,17 @@ class CheckedSubmission:
 
 
 def check_submission(request: SubmitAuthoredStrategyRequest, config: AuthoredStrategiesConfig) -> CheckedSubmission:
-    class_name = _static_class(request.source)
-    bar_size = _bar_size(request.bar_size, config)
-    return CheckedSubmission(class_name, bar_size, _tunables(request.source, class_name, request.tunables))
+    tunables = {name: bounds.model_dump() for name, bounds in request.tunables.items()}
+    return check_authored_file(request.source, request.bar_size, tunables, config.bar_sizes)
+
+
+def check_authored_file(source: str, bar_size: str, tunables: Mapping[str, Mapping[str, float]],
+                        bar_sizes: Sequence[str]) -> CheckedSubmission:
+    """The checks of one submitted file, from the body's own fields: ``tunables`` maps each name to
+    ``{"low", "high", "default"}`` and ``bar_sizes`` is the configured list."""
+    class_name = _static_class(source)
+    checked_bar_size = _bar_size(bar_size, bar_sizes)
+    return CheckedSubmission(class_name, checked_bar_size, _tunables(source, class_name, tunables))
 
 
 def _static_class(source: str) -> str:
@@ -50,13 +61,14 @@ def _static_class(source: str) -> str:
                               detail[:MAX_STATIC_DETAIL_CHARS] or "the static check refused the file") from None
 
 
-def _bar_size(bar_size: str, config: AuthoredStrategiesConfig) -> str:
-    if bar_size_key(bar_size) not in {bar_size_key(size) for size in config.bar_sizes}:
-        raise AuthoredRefused(AUTHORED_BAD_BAR_SIZE, f"{bar_size!r} is not one of {list(config.bar_sizes)}")
+def _bar_size(bar_size: str, bar_sizes: Sequence[str]) -> str:
+    if bar_size_key(bar_size) not in {bar_size_key(size) for size in bar_sizes}:
+        raise AuthoredRefused(AUTHORED_BAD_BAR_SIZE, f"{bar_size!r} is not one of {list(bar_sizes)}")
     return bar_size
 
 
-def _tunables(source: str, class_name: str, tunables: Mapping[str, TunableRange]) -> dict[str, dict[str, float]]:
+def _tunables(source: str, class_name: str,
+              tunables: Mapping[str, Mapping[str, float]]) -> dict[str, dict[str, float]]:
     if not tunables:
         raise AuthoredRefused(AUTHORED_BAD_TUNABLES, "an authored file needs at least one tunable: SP2c varies one "
                                                      "for its neighbour points")
@@ -64,10 +76,11 @@ def _tunables(source: str, class_name: str, tunables: Mapping[str, TunableRange]
     checked = {}
     for name in sorted(tunables):
         bounds = tunables[name]
-        problem = _tunable_problem(name, bounds.low, bounds.high, bounds.default, constants)
+        low, high, default = bounds["low"], bounds["high"], bounds["default"]
+        problem = _tunable_problem(name, low, high, default, constants)
         if problem is not None:
             raise AuthoredRefused(AUTHORED_BAD_TUNABLES, problem)
-        checked[name] = {"low": bounds.low, "high": bounds.high, "default": bounds.default}
+        checked[name] = {"low": low, "high": high, "default": default}
     if all(bounds["low"] == bounds["high"] for bounds in checked.values()):
         raise AuthoredRefused(AUTHORED_BAD_TUNABLES, "nothing to vary: at least one tunable needs low < high")
     return checked
@@ -107,11 +120,27 @@ def class_constants(source: str, class_name: str) -> dict[str, float]:
     A name the class body binds more than once (a reassignment, ``+=``, a tuple target, a method of
     that name) is left out: its first number need not be the class value.
     """
+    return {name: value for name, (value, bindings) in _number_constants(source, class_name).items()
+            if bindings == 1}
+
+
+def rebound_constants(source: str, class_name: str) -> frozenset[str]:
+    """The upper-case number constants that ``class_constants`` leaves out because the class binds them
+    more than once (a bare annotation before the value counts as a binding)."""
+    return frozenset(name for name, (_, bindings) in _number_constants(source, class_name).items()
+                     if bindings > 1)
+
+
+def _number_constants(source: str, class_name: str) -> dict[str, tuple[float, int]]:
+    """Each upper-case number constant of the class body: its first number and how often the class binds it."""
     for node in _parse_quietly(source).body:
         if isinstance(node, ast.ClassDef) and node.name == class_name:
             bindings = Counter(_bound_names(node.body))
-            pairs = (_constant(statement) for statement in node.body)
-            return {name: value for name, value in pairs if name is not None and bindings[name] == 1}
+            found: dict[str, tuple[float, int]] = {}
+            for name, value in map(_constant, node.body):
+                if name is not None and name not in found:
+                    found[name] = (value, bindings[name])
+            return found
     return {}
 
 

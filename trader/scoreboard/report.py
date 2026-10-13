@@ -11,6 +11,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
+from trader.scoreboard.authored_vs_catalogue import compare_authored_vs_catalogue
 from trader.scoreboard.books import build_books, build_shadow_books, summarize_costs
 from trader.scoreboard.metrics import (EOD_DRAWDOWN_LABEL, SPLIT_KEYS, SPY_LABEL, daily_sharpe, eod_drawdown_pct,
                                        group_trip_metrics, session_returns, trip_metrics)
@@ -38,6 +39,7 @@ class ReportInputs:
     calendar: Any                 # previous_session(day) for the SPY base (ruling 14)
     shadow_rows: Sequence[Mapping[str, Any]] = ()   # SP2c Plan 3: forward replay rows, global (not per experiment)
     shadow_owed: Optional[Mapping[str, Mapping[str, Any]]] = None   # judgment -> closed window sessions; None: unknown
+    authored_scope: Optional[Any] = None   # SP3 Plan 5: AuthoredScope; None is unknown
 
 
 def _round(value: Any) -> Any:
@@ -153,6 +155,8 @@ def build_report(inputs: ReportInputs) -> dict:
         "shadow_books": build_shadow_books(inputs.shadow_rows, inputs.shadow_owed),
         "trips": trip_metrics(inputs.trips, start_nlv_usd=start),
         "splits": {key: group_trip_metrics(inputs.trips, key, start_nlv_usd=start) for key in SPLIT_KEYS},
+        "authored_vs_catalogue": compare_authored_vs_catalogue(
+            trips=inputs.trips, sessions=[row["session_date"] for row in rows], scope=inputs.authored_scope),
         "sessions": [_session_view(row, inputs.adjustments) for row in rows],
         "warnings": list(inputs.warnings),
         "incidents": [{"kind": i["kind"], "key": i["key"], "detail": i["detail"], "recorded_at": i["recorded_at"]}

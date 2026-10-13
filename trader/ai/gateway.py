@@ -80,7 +80,7 @@ class GatewayResult:
 
 
 class ModelCaller(Protocol):
-    def new_deadline(self, label: str = "") -> DecisionDeadline: ...
+    def new_deadline(self, label: str = "", seconds: Optional[float] = None) -> DecisionDeadline: ...
 
     async def call(self, role: str, request: ModelRequest, deadline: DecisionDeadline) -> GatewayResult: ...
 
@@ -95,7 +95,7 @@ class _Begun:
 class ModelGateway:
     def __init__(self, *, config: AiConfig, store: AiStore, clock: Clock, clients: Mapping[str, ModelClient],
                  budget: Optional[Budget] = None, journal: Optional[AttemptJournal] = None):
-        for name in ROLE_NAMES:
+        for name in config.roles:
             role, client = config.role(name), clients.get(name)
             if client is None or client.backend != role.backend or client.model_id != role.model:
                 raise AiConfigError("CLIENT_ROLE_MISMATCH", f"the client for role {name!r} does not match ai.yaml")
@@ -125,8 +125,10 @@ class ModelGateway:
 
         await self.store.atransaction(work)
 
-    def new_deadline(self, label: str = "") -> DecisionDeadline:
-        return DecisionDeadline(self.clock, self.config.budget.decision_deadline_seconds, label)
+    def new_deadline(self, label: str = "", seconds: Optional[float] = None) -> DecisionDeadline:
+        """One decision's deadline; the author passes its own, longer limit (spec 6)."""
+        length = self.config.budget.decision_deadline_seconds if seconds is None else seconds
+        return DecisionDeadline(self.clock, length, label)
 
     # --- the call --------------------------------------------------------
 
@@ -152,6 +154,8 @@ class ModelGateway:
     def _prepare(self, role: str, request: ModelRequest) -> tuple[RoleConfig, ModelClient, ModelPrice]:
         if role not in ROLE_NAMES:
             raise CallRefused("ROLE_UNKNOWN", role)
+        if role not in self.config.roles:
+            raise CallRefused("ROLE_DISABLED", f"role {role!r} has no model in ai.yaml")
         role_config = self.config.role(role)
         if request.max_output_tokens > role_config.max_output_tokens:
             raise CallRefused("OUTPUT_LIMIT_ABOVE_ROLE", f"{request.max_output_tokens} > {role_config.max_output_tokens}")
@@ -331,5 +335,5 @@ def build_gateway(config: AiConfig, *, store: AiStore, clock: Clock, environ: Ma
                   clients: Optional[Mapping[str, ModelClient]] = None) -> ModelGateway:
     """Build real adapters from env unless the caller passes ready clients (tests do)."""
     built = {name: (clients or {}).get(name) or build_model_client(config.role(name), environ=environ)
-             for name in ROLE_NAMES}
+             for name in config.roles}
     return ModelGateway(config=config, store=store, clock=clock, clients=built)

@@ -217,6 +217,9 @@ scoreboard verify                            # rebuild every number from stored 
 # baseline (follow_signal.v1, fixed_rule.v1, no_trade.v1, matched_entry_bracket_exit.v1); books are never
 # summed; P&L is gross (no commissions or slippage). "AI cost" shows the total with its status label
 # (confirmed, estimated, incomplete), the confirmed and estimated parts and the unknown calls; unavailable when none.
+# "AI-written vs catalogue" (SP3): verdict yes / no / not enough data (with its reason), the sessions and conids
+# both sides covered, and per side closed trips, P&L, daily-P&L Sharpe, max drawdown and trips with unknown fees.
+# yes needs at least 20 closed trips each side, a higher Sharpe and no worse drawdown. A report; it changes no gate.
 experiment acceptance preflight              # SP1 clean-account gate: PASS, or STOP + reasons (exit 1)
 experiment acceptance run                    # dry run: reads the gate, prints the planned calls, sends nothing
 experiment acceptance run --place-orders --deployment-version sha256:... --confirm-account DU123 --signing-key KEY
@@ -288,7 +291,7 @@ was judged DEPLOY and waits for an isolation proof.
 sandbox checks: the supervisor's posture from `PONG` (capabilities SETUID/SETGID/KILL only, seccomp, no-new-privileges,
 network none, read-only root, pids limit 64, no provider variables), a benign session and every hostile escape. It
 prints one JSON proof with the build id the sandbox reports. The step refuses with `LIVE_SESSIONS_OPEN` (exit 3, nothing
-printed) while the sandbox reports an open live session, before or after the run. The host checks the JSON and records it
+printed) while the sandbox reports an open live session, before or after the run; the host command then exits 1 and records nothing. The host checks the JSON and records it
 with typed `record_isolation_proof` as `cli`. The newest proof of a build is the run that ran last (`ran_at`); a failing
 run at the same moment as a pass wins. A proof whose `ran_at` is more than 5 minutes after the trader's clock is
 refused with the RPC error `PROOF_FROM_THE_FUTURE` and not stored. Until every build research reported `STARTED` on the record's evaluation, and the

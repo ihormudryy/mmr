@@ -1,7 +1,7 @@
 """The ai service: `python -m trader.ai_service` (SP2 Plan 5).
 
 Holds model-provider credentials only (spec 4) and talks to the trader over
-signed typed RPC as ai_supervisor and ai_research. It never publishes a risk
+signed typed RPC as ai_supervisor, ai_research and, when authoring is on, ai_author. It never publishes a risk
 policy (spec 6.7) and never changes the budget cap from an AI path (spec 5.4):
 the cap is the owner's trader.yaml value, read with get_ai_model_budget (Ruling 19).
 """
@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
+from trader.ai.author_loop import AuthorLoop
+from trader.ai.authored_offers import AuthoredOffers
 from trader.ai.backtest_judge import BacktestJudgeRunner
 from trader.ai.budget_cap import BudgetCapSync, CapGatedGateway
 from trader.ai.clock import Clock, SystemClock
@@ -67,7 +69,21 @@ def build_session_slots(config: AiConfig) -> SessionSlots:
     cfg = config.controller
     return SessionSlots(entry_minutes=cfg.entry_slot_minutes, position_minutes=cfg.position_slot_minutes,
                         grace_seconds=cfg.slot_start_grace_seconds,
-                        research_after_close_minutes=config.research.after_close_minutes)
+                        research_after_close_minutes=config.research.after_close_minutes,
+                        author_after_close_minutes=config.authoring.run_after_close_minutes)
+
+
+def build_author_loop(config: AiConfig, *, store: AiStore, clock: Clock, slots: SessionSlots, leadership: Any,
+                      watch: ExperimentWatch, clients: AiRpcClients, gateway: CapGatedGateway) -> Optional[AuthorLoop]:
+    """SP3 spec 7.4: only with an author model (Plan 5 ruling 1). Signs as ai_author; reads the scoreboard as
+    ai_supervisor; books the same budget and journal as every other role through the cap-gated gateway."""
+    if not config.authoring_enabled:
+        return None
+    if clients.author is None:
+        raise AiConfigError("AUTHOR_CLIENT_MISSING", "authoring is on but no ai_author client was connected")
+    return AuthorLoop(config=config, store=store, clock=clock, slots=slots, leadership=leadership, watch=watch,
+                      author=clients.author, supervisor=clients.supervisor, gateway=gateway,
+                      recorder=ReplayRecorder(store))
 
 
 def build_research_cycle(config: AiConfig, *, store: AiStore, clock: Clock, slots: SessionSlots, leadership: Any,
@@ -78,9 +94,10 @@ def build_research_cycle(config: AiConfig, *, store: AiStore, clock: Clock, slot
         return None
     judge = BacktestJudgeRunner(config=config, gateway=gateway, store=store, clock=clock,
                                 recorder=ReplayRecorder(store))
+    authored = None if clients.author is None else AuthoredOffers(client=clients.author, clock=clock)
     return ResearchCycle(config=config, store=store, clock=clock, slots=slots, leadership=leadership, watch=watch,
                          lab=clients.lab, registry=clients.research, gateway=gateway, judge=judge,
-                         strategies_root=strategies_root)
+                         strategies_root=strategies_root, authored=authored)
 
 
 @dataclass(frozen=True)
@@ -107,7 +124,7 @@ async def serve(settings: ServiceSettings, *, engine_factory: Callable[[EngineDe
         keys_dir=settings.keys_dir, address=settings.trader_address, query_port=cfg.trader_query_port,
         command_port=cfg.trader_command_port, research_address=settings.research_address,
         research_query_port=cfg.research_query_port, research_command_port=cfg.research_command_port,
-        timeout=cfg.rpc_timeout_seconds))
+        timeout=cfg.rpc_timeout_seconds, author=config.authoring_enabled))
     if wrap_clients is not None:
         clients = wrap_clients(clients)
     try:
@@ -138,7 +155,9 @@ async def serve(settings: ServiceSettings, *, engine_factory: Callable[[EngineDe
                                 page_limit=cfg.signal_page_limit, max_age_seconds=cfg.signal_max_age_seconds),
             slots=slots, engine=engine, gateway=gateway, cap_sync=cap_sync,
             research=build_research_cycle(config, store=store, clock=clock, slots=slots, leadership=leadership,
-                                          watch=watch, clients=clients, gateway=gateway))
+                                          watch=watch, clients=clients, gateway=gateway),
+            author=build_author_loop(config, store=store, clock=clock, slots=slots, leadership=leadership,
+                                     watch=watch, clients=clients, gateway=gateway))
         await controller.run(stop)
     finally:
         clients.close()

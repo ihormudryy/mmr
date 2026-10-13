@@ -1,6 +1,7 @@
 from __future__ import annotations
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
@@ -11,10 +12,16 @@ from pydantic import (BaseModel, BeforeValidator, ConfigDict, Field, StrictBool,
 
 
 SUPPORTED_BACKENDS = ("openrouter", "bedrock", "azure")
-ROLE_NAMES = ("orchestrator", "jev")
+REQUIRED_ROLE_NAMES = ("orchestrator", "jev")
+AUTHOR_ROLE = "author"
+OPTIONAL_ROLE_NAMES = (AUTHOR_ROLE,)
+ROLE_NAMES = REQUIRED_ROLE_NAMES + OPTIONAL_ROLE_NAMES
 MAX_IN_FLIGHT_LIMIT = 2
 MICROS_PER_USD = 1_000_000
 DEFAULT_CONFIG_PATH = "~/.config/mmr/ai.yaml"
+# A copy of trader.automation.backtest_judge_wire.JEV_MODEL: the ai process must not import the trader's wire
+# module. tests/ai/author/test_author_config.py keeps the two equal.
+TRADER_MODEL_ID = re.compile(r"^[A-Za-z0-9_./:@+-]{1,128}$")
 
 
 class AiConfigError(ValueError):
@@ -150,6 +157,12 @@ class ResearchCycleConfig(_Section):
     judge_attempts: Whole = Field(2, ge=1, le=3)
 
 
+class AuthoringConfig(_Section):
+    """The nightly author (SP3 spec 6, 7.4). Its call limit is its own, not bounded by the decision deadline."""
+    run_after_close_minutes: Whole = Field(60, ge=0, le=420)           # starts before New York midnight
+    call_timeout_seconds: Number = Field(300.0, gt=0, le=600, allow_inf_nan=False)
+
+
 class _PriceRow(_Section):
     input_usd_per_million: Number = Field(ge=0, allow_inf_nan=False)
     output_usd_per_million: Number = Field(ge=0, allow_inf_nan=False)
@@ -163,6 +176,7 @@ class _RawConfig(_Section):
     controller: ControllerConfig = Field(default_factory=ControllerConfig)
     decisions: DecisionsConfig = Field(default_factory=DecisionsConfig)
     research: ResearchCycleConfig = Field(default_factory=ResearchCycleConfig)
+    authoring: AuthoringConfig = Field(default_factory=AuthoringConfig)
 
 
 @dataclass(frozen=True)
@@ -194,6 +208,12 @@ class AiConfig:
     controller: ControllerConfig = ControllerConfig()
     decisions: DecisionsConfig = DecisionsConfig()
     research: ResearchCycleConfig = ResearchCycleConfig()
+    authoring: AuthoringConfig = AuthoringConfig()
+
+    @property
+    def authoring_enabled(self) -> bool:
+        """Spec 6: an author role with a model. The trader's switch and cap are checked each night, not here."""
+        return AUTHOR_ROLE in self.roles
 
     def role(self, name: str) -> RoleConfig:
         try:
@@ -213,6 +233,7 @@ class AiConfig:
             "controller": self.controller.model_dump(),
             "decisions": self.decisions.model_dump(mode="json"),
             "research": self.research.model_dump(mode="json"),
+            "authoring": self.authoring.model_dump(),
         }
         return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
 
@@ -236,21 +257,7 @@ def load_ai_config(path: str = DEFAULT_CONFIG_PATH) -> AiConfig:
 
 
 def _check(parsed: _RawConfig) -> AiConfig:
-    for name in ROLE_NAMES:
-        if name not in parsed.roles:
-            raise AiConfigError("ROLE_MISSING", f"role {name!r} is not configured")
-    for name, role in parsed.roles.items():
-        if name not in ROLE_NAMES:
-            raise AiConfigError("ROLE_UNKNOWN", f"unknown role {name!r}")
-        if not role.model.strip():
-            raise AiConfigError("ROLE_MODEL_MISSING", f"role {name!r} has no model id")
-        if role.backend not in SUPPORTED_BACKENDS:
-            raise AiConfigError(
-                "ROLE_BACKEND_UNSUPPORTED",
-                f"role {name!r}: backend must be one of {', '.join(SUPPORTED_BACKENDS)}",
-            )
-        if role.call_timeout_seconds > parsed.budget.decision_deadline_seconds:
-            raise AiConfigError("CALL_TIMEOUT_ABOVE_DEADLINE", f"role {name!r} call timeout is above the decision deadline")
+    roles = _required_roles(parsed)
     if parsed.roles["jev"].backend != "openrouter":
         raise AiConfigError("JEV_BACKEND_NOT_OPENROUTER", "Jev runs on openrouter only")
     if parsed.budget.max_in_flight > MAX_IN_FLIGHT_LIMIT:
@@ -263,6 +270,9 @@ def _check(parsed: _RawConfig) -> AiConfig:
             rows[(backend, model)] = ModelPrice(
                 Decimal(repr(row.input_usd_per_million)), Decimal(repr(row.output_usd_per_million))
             )
+    author = _active_author(parsed, rows)
+    if author is not None:
+        roles[AUTHOR_ROLE] = author
     controller = parsed.controller
     if controller.renew_seconds * 3 > controller.lease_seconds:
         raise AiConfigError("CONTROLLER_RENEW_TOO_SLOW", "renew_seconds must be at most a third of lease_seconds")
@@ -274,8 +284,62 @@ def _check(parsed: _RawConfig) -> AiConfig:
         raise AiConfigError("FIXED_RULE_VERSION_MISMATCH",
                             "fixed_rule.v1 is 0.02 / 0.04; other values need a new baseline version")
     _check_research(parsed.research)
-    return AiConfig(dict(parsed.roles), PriceBook(rows), parsed.budget, parsed.database_path, controller,
-                    parsed.decisions, parsed.research)
+    return AiConfig(roles, PriceBook(rows), parsed.budget, parsed.database_path, controller,
+                    parsed.decisions, parsed.research, parsed.authoring)
+
+
+def _required_roles(parsed: _RawConfig) -> dict[str, RoleConfig]:
+    """The orchestrator and Jev, each with a model, a backend and a call limit inside the decision deadline."""
+    for name in REQUIRED_ROLE_NAMES:
+        if name not in parsed.roles:
+            raise AiConfigError("ROLE_MISSING", f"role {name!r} is not configured")
+    for name in parsed.roles:
+        if name not in ROLE_NAMES:
+            raise AiConfigError("ROLE_UNKNOWN", f"unknown role {name!r}")
+    roles = {name: parsed.roles[name] for name in REQUIRED_ROLE_NAMES}
+    for name, role in roles.items():
+        if not role.model.strip():
+            raise AiConfigError("ROLE_MODEL_MISSING", f"role {name!r} has no model id")
+        _check_backend(name, role)
+        if role.call_timeout_seconds > parsed.budget.decision_deadline_seconds:
+            raise AiConfigError("CALL_TIMEOUT_ABOVE_DEADLINE", f"role {name!r} call timeout is above the decision deadline")
+    return roles
+
+
+def _active_author(parsed: _RawConfig, prices: Mapping[tuple[str, str], ModelPrice]) -> Optional[RoleConfig]:
+    """Spec 6: the author is optional. No role or a blank model is authoring off (Ruling 1); a set model needs
+    a price row and the research cycle (Rulings 3, 4). Its call limit is authoring.call_timeout_seconds (Ruling 2)."""
+    author = parsed.roles.get(AUTHOR_ROLE)
+    if author is None:
+        return None
+    if "call_timeout_seconds" in author.model_fields_set:
+        raise AiConfigError("AUTHOR_TIMEOUT_IN_ROLE", "the author's call limit is authoring.call_timeout_seconds")
+    if not author.model.strip():
+        return None
+    _check_backend(AUTHOR_ROLE, author)
+    if not TRADER_MODEL_ID.fullmatch(author.model):
+        raise AiConfigError("AUTHOR_MODEL_INVALID", "the author model id is not an id the trader accepts")
+    if (author.backend, author.model) not in prices:
+        raise AiConfigError("AUTHOR_PRICE_MISSING", "the author model needs a row under pricing")
+    if not parsed.research.enabled:
+        raise AiConfigError("AUTHORING_NEEDS_RESEARCH", "authored strategies are evaluated by the research cycle")
+    return author.model_copy(update={"call_timeout_seconds": parsed.authoring.call_timeout_seconds})
+
+
+def _check_backend(name: str, role: RoleConfig) -> None:
+    if role.backend not in SUPPORTED_BACKENDS:
+        raise AiConfigError(
+            "ROLE_BACKEND_UNSUPPORTED",
+            f"role {name!r}: backend must be one of {', '.join(SUPPORTED_BACKENDS)}",
+        )
+
+
+def authored_universe(research: ResearchCycleConfig) -> tuple[str, tuple[int, ...]]:
+    """Ruling 6: authored files are evaluated on the research universe whose name sorts first."""
+    if not research.universes:
+        raise AiConfigError("RESEARCH_MENU_EMPTY", "authored strategies need at least one research universe")
+    name = min(research.universes)
+    return name, tuple(research.universes[name])
 
 
 def _check_research(research: ResearchCycleConfig) -> None:

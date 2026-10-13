@@ -6,6 +6,7 @@ pump(): inside the research window, moves each durable row one step. Every step 
 safe to repeat: a lost reply resends the stored body unchanged. A candidate is submitted only inside its own
 slot's window; an INITIAL one that window never sent is closed as STALE_NOT_SUBMITTED, never carried into another
 night (a waiting renewal is never closed so; it is asked again in the next window).
+pump() also offers STORED authored strategies (SP3) as INITIAL candidates of the open cycle.
 recover(): at controller start, settles what a dead process left RUNNING or JUDGING; the pump resumes the rest."""
 from __future__ import annotations
 
@@ -17,8 +18,10 @@ import logging
 from pathlib import Path
 from typing import Any, Optional
 
+from trader.ai.authored_offers import authored_submit_body, default_point
 from trader.ai.backtest_judge import (NO_VERDICT, BacktestCase, JudgmentDecision, NotJudged, jev_menu,
                                       judgment_body, judgment_id_for)
+from trader.ai.config import authored_universe
 from trader.ai.gateway import CallFailed, CallRefused
 from trader.ai.ids import canonical_json
 from trader.ai.model_client import NOT_SENT, ModelRequest
@@ -41,7 +44,7 @@ LINE_ENDING_STATES = frozenset({"WITHDRAWN", "ENDED"})
 THESIS_LABEL = "orchestrator_thesis"
 THESIS_MAX_CHARS = 1000                   # the proposal schema's own limit
 TERMINAL = frozenset({"DONE", "FAILED"})
-RETRY_REGISTRATION = frozenset({"DEPLOY_CAP_REACHED"})
+RETRY_REGISTRATION = frozenset({"DEPLOY_CAP_REACHED", "AUTHORED_ISOLATION_UNPROVEN"})   # wait for the next evening (SP3 Plan 5 ruling 8)
 INTERNAL_ERROR = "INTERNAL_ERROR"                # the typed RPC server's catch-all: the handler may have committed
 UNSETTLED_ERROR_SECONDS = 900                    # the trader reconciler's critical-alert boundary
 ATTEST_WAITS_FOR_TRADER = "TRADER_UNAVAILABLE"   # infrastructure behind the research service: no try is spent
@@ -96,12 +99,14 @@ def stored_thesis(thesis: str) -> str:
 
 class ResearchCycle:
     def __init__(self, *, config: Any, store: Any, clock: Any, slots: Any, leadership: Any, watch: Any, lab: Any,
-                 registry: Any, gateway: Any, judge: Any, strategies_root: Path):
+                 registry: Any, gateway: Any, judge: Any, strategies_root: Path, authored: Any = None):
         self._config, self._cfg = config, config.research
         self._store, self._clock, self._slots = store, clock, slots
         self._leadership, self._watch = leadership, watch
         self._lab, self._registry, self._gateway, self._judge = lab, registry, gateway, judge
         self._root = strategies_root
+        self._authored = authored                                 # AuthoredOffers (SP3); None while authoring is off
+        self._authored_conids = None if authored is None else authored_universe(config.research)[1]
         self._stuck_reported: set[str] = set()            # JUDGING rows already logged as stuck
         self._registration_waits: set[tuple[str, str]] = set()   # (judgment_id, code) already logged
         self._unsettled_since: dict[str, dt.datetime] = {}      # judgment_id -> first NOT_SETTLED receipt
@@ -340,6 +345,7 @@ class ResearchCycle:
         if slot is None or not self._slots.research_due(slot, now) or experiment_id is None:
             return                                                        # Rulings 2 and 3
         await self._close_unsent_of_closed_windows(slot.cycle_id)
+        await self._offer_authored(slot)
         await self._start_new(slot, now)
         await self._poll_submitted(now)
         await self._judge_evaluated(experiment_id)
@@ -374,6 +380,34 @@ class ResearchCycle:
             else:
                 logger.warning("research candidate %s of %s was never submitted inside its window: %s",
                                candidate_id, cycle_id, STALE_NOT_SUBMITTED)
+
+    async def _offer_authored(self, slot: ResearchSlot) -> None:
+        """SP3 Plan 5 ruling 7: STORED authored files join tonight's cycle as INITIAL candidates, one try per file
+        per night. The candidate id follows from the cycle and the key, so a repeated offer inserts nothing."""
+        if self._authored is None:
+            return
+        records = await self._authored.due_records()
+        if not records:
+            return
+        now = self._clock.now()
+
+        def work(conn: Any) -> list[str]:
+            offered = []
+            for record in records:
+                text = canonical_json(authored_submit_body(record, self._authored_conids, default_point(record)))
+                row = conn.execute(
+                    "INSERT INTO ai_research_candidates (candidate_id, cycle_id, kind, strategy_key, body_json, "
+                    "body_sha256, state, next_try_at, created_at, updated_at) "
+                    "VALUES (?, ?, 'INITIAL', ?, ?, ?, 'NEW', ?, ?, ?) ON CONFLICT (candidate_id) DO NOTHING "
+                    "RETURNING candidate_id",
+                    [candidate_id_for(slot.cycle_id, record.key), slot.cycle_id, record.key, text,
+                     _sha(text), now, now, now]).fetchone()
+                if row is not None:
+                    offered.append(record.key)
+            return offered
+        offered = await self._store.atransaction(work)
+        for key in offered:
+            logger.info("authored strategy %s offered for evaluation in %s", key, slot.cycle_id)
 
     # submit, and resend the unchanged body after a lost reply (Ruling 9) ------------------------------
     async def _start_new(self, slot: ResearchSlot, now: dt.datetime) -> None:

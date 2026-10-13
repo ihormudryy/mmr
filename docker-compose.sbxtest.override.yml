@@ -1,9 +1,10 @@
 # SP3 Plan 2 ruling 30 (review r2 #2): the sandbox full-stack test shares nothing with a live stack on the same
 # host. Applied ONLY by scripts/run_sandbox_fullstack.sh (never auto-loaded), after docker-compose.test.override.yml.
-# The runner renders and starts only `sandbox` and `fullstack-tests`, so ib-gateway (and trader, strategy, data,
-# dashboard, scheduler) never start. Both rendered services use a test-only image tag; fullstack-tests runs the
-# sandbox test and depends only on a healthy `sandbox` (the runner starts it with `up -d --wait` and then
-# runs the tests with `run --rm --no-deps`); no host port is published; nothing reads .env.
+# The runner renders and starts only `sandbox`, `research` and `fullstack-tests`, so ib-gateway (and trader,
+# strategy, data, dashboard, scheduler) never start. Every rendered service uses a test-only image tag;
+# fullstack-tests runs one test file (MMR_SBXTEST_TEST, the sandbox test by default) and depends only on a healthy
+# `sandbox` (the runner starts sandbox and research with `up -d --wait` and then runs the tests with
+# `run --rm --no-deps`); no host port is published; nothing reads .env.
 # scripts/check_sbxtest_config.py refuses the run if the rendered config names another service, publishes a port,
 # carries a credential variable with a value, binds a path under the operator's ~/.config/mmr or
 # ~/.local/share/mmr, reads an env file, or still carries the mmr:latest tag.
@@ -22,12 +23,30 @@ services:
       MMR_FAKE_BROKER: "1"
       MMR_SBXTEST_STRICT: "1"
       TZ: UTC
-    command: ["python", "-m", "pytest", "tests/fullstack/test_sandbox_service.py", "-vv", "-rA", "--timeout=600"]
+    command: ["python", "-m", "pytest", "${MMR_SBXTEST_TEST:-tests/fullstack/test_sandbox_service.py}", "-vv", "-rA",
+              "--timeout=600"]
     # The checks write authored files to the store and reach both sockets through the sandbox's own named volumes.
     # Only here, not in docker-compose.yml: the trader-facing fullstack run (project `mmr`) never mounts them.
     volumes:
       - mmr_authored_strategies:/store
       - mmr_sandbox_live:/run/sandbox-live
+      - mmr_sandbox_research:/run/sandbox-research
+  # SP3 Plan 5 ruling G12: the research container of tests/fullstack/test_prove_isolation_in_research.py. It runs
+  # the sandbox's own runtime image (no second build) and only sleeps until the test execs the in-container step
+  # (`mmr ai-author prove-isolation --in-container`), which needs no trader, no key and no network.
+  # Only the research socket is mounted: no keys, no config, no DB, no logs.
+  research:
+    image: ${MMR_SBXTEST_IMAGE}
+    build: !reset null
+    pull_policy: never
+    restart: "no"
+    network_mode: none
+    networks: !reset []
+    environment: !override
+      TZ: UTC
+      PYTHONDONTWRITEBYTECODE: "1"
+      MMR_CONFIG_DEFAULTS: "off"
+    volumes: !override
       - mmr_sandbox_research:/run/sandbox-research
   # Defensive: even though the runner never starts these, strip their published ports and the gateway's .env so a
   # future `up` of the whole profile by mistake still cannot bind a live port or log in to IB.

@@ -3549,6 +3549,25 @@ def _dash(value, fmt='{:,.2f}', suffix=''):
     return fmt.format(value) + suffix
 
 
+def _authored_vs_catalogue_lines(view) -> list:
+    """SP3 spec 7.8: the AI-written vs catalogue report; nothing when the trader sends no such section."""
+    if not view:
+        return []
+    reason = f" ({view['reason']})" if view['reason'] else ''
+    lines = [f"AI-written vs catalogue ({view['label']}): {view['verdict']}{reason}   same conids and sessions: "
+             f"{view['sessions']} sessions, at least {view['min_closed_trips']} closed trips each side. "
+             f"{view['note']}"]
+    for key, label in (('authored', 'AI-written'), ('catalogue', 'catalogue')):
+        side = view.get(key)
+        if side is None:
+            lines.append(f"  {label}: -")
+            continue
+        lines.append(f"  {label}: {side['closed_trips']} closed trips, P&L {_dash(side['pnl_usd'], '${:,.2f}')}, "
+                     f"daily-P&L Sharpe {_dash(side['sharpe_daily'], '{:.3f}')}, max drawdown "
+                     f"{_dash(side['max_drawdown_usd'], '${:,.2f}')}, unresolved fees {side['unresolved_fee_trips']}")
+    return lines
+
+
 def _scoreboard_lines(report: dict) -> list:
     account, bench, trips = report['account'], report['benchmarks'], report['trips']
     experiment = report.get('experiment')
@@ -3591,6 +3610,7 @@ def _scoreboard_lines(report: dict) -> list:
                  f"{_dash(trips['win_rate'], '{:.0%}')}, profit factor {_dash(trips['profit_factor'], '{:.2f}')}, "
                  f"fees {_dash(trips['fees_usd'], '${:,.2f}')}, turnover {_dash(trips['turnover'], '{:.2f}')}x, "
                  f"unresolved fees {trips['unresolved_fee_trips']}")
+    lines.extend(_authored_vs_catalogue_lines(report.get('authored_vs_catalogue')))
     for row in report['sessions']:
         lines.append(f"  {row['date']} {row['end_state']:<11} return {_dash(row['return_pct'], '{:.2f}', '%')} "
                      f"realized {_dash(row['realized_pnl_usd'], '${:,.2f}')} "

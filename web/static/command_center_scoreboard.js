@@ -126,6 +126,26 @@
       + `<th>Win rate</th><th>Profit factor</th><th>Net P&amp;L</th></tr></thead><tbody>${body}</tbody></table>`;
   }
 
+  function sideRow(label, s) {
+    if (!s) return `<tr><td>${escapeHtml(label)}</td><td colspan="5">${DASH}</td></tr>`;
+    return `<tr><td>${escapeHtml(label)}</td><td>${escapeHtml(s.closed_trips)}</td><td>${formatMoney(s.pnl_usd)}</td>`
+      + `<td>${formatNumber(s.sharpe_daily, 3)}</td><td>${formatMoney(s.max_drawdown_usd)}</td>`
+      + `<td>${escapeHtml(s.unresolved_fee_trips)}</td></tr>`;
+  }
+
+  function authoredVsCatalogue(report) {
+    const v = report.authored_vs_catalogue;
+    if (!v) return '';
+    const reason = v.reason ? ` <span class="sb-label">${escapeHtml(v.reason)}</span>` : '';
+    return section('AI-written vs catalogue', `<p><span class="sb-label">${escapeHtml(v.label)}</span> Verdict: `
+      + `<strong data-authored-verdict="${escapeHtml(v.verdict)}">${escapeHtml(v.verdict)}</strong>${reason}. `
+      + `Same conids and sessions: ${escapeHtml(v.sessions)} sessions; at least ${escapeHtml(v.min_closed_trips)} `
+      + `closed trips each side. ${escapeHtml(v.note)}</p>`
+      + '<table class="sb-table"><thead><tr><th>Side</th><th>Closed trips</th><th>P&amp;L</th>'
+      + '<th>Daily-P&amp;L Sharpe</th><th>Max drawdown</th><th>Unknown fees</th></tr></thead><tbody>'
+      + sideRow('AI-written', v.authored) + sideRow('Catalogue', v.catalogue) + '</tbody></table>');
+  }
+
   function sessions(report) {
     if (!report.sessions.length) return section('Sessions', '<p class="dim">No finished session yet.</p>');
     const body = report.sessions.map((s) => `<tr><td>${text(s.date)}</td>`
@@ -169,6 +189,7 @@
       .map((key) => splitTable(key, report.splits[key])).join(''));
     return banner(report) + header + account(report) + benchmarks(report) + books(report)
       + section('Trades', `<table class="sb-kv">${tripRows(report.trips)}</table>`)
+      + authoredVsCatalogue(report)
       + splits + sessions(report) + notes(report) + telegram(report);
   }
 

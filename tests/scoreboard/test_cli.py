@@ -146,3 +146,21 @@ def test_sdk_reads_over_typed_query():
                                       ("get_scoreboard", {"experiment_id": "exp-" + "b" * 20}),
                                       ("verify_scoreboard", {}),
                                       ("get_experiment_trips", {"experiment_id": "exp-" + "b" * 20})]
+
+
+def test_scoreboard_prints_the_ai_written_vs_catalogue_view(cli, sdk, monkeypatch):
+    side = {"closed_trips": 21, "unresolved_fee_trips": 0, "pnl_usd": 120.5, "sharpe_daily": 0.21,
+            "max_drawdown_usd": 30.0, "strategies": ["sha256:" + "a" * 64]}
+    report = copy.deepcopy(REPORT)
+    report["authored_vs_catalogue"] = {"label": "PAPER", "note": "A report only: it never changes a gate.",
+                                       "verdict": "no", "reason": None, "min_closed_trips": 20, "sessions": 12,
+                                       "conids": [265598], "authored": side, "catalogue": None}
+    monkeypatch.setattr(sdk, "scoreboard", lambda experiment_id=None: report)
+    out = cli("scoreboard")
+    assert "AI-written vs catalogue (PAPER): no" in out and "never changes a gate" in out
+    assert "AI-written: 21 closed trips, P&L $120.50, daily-P&L Sharpe 0.210, max drawdown $30.00" in out
+    assert "catalogue: -" in out
+
+
+def test_a_report_without_the_view_prints_no_view(cli):
+    assert "AI-written vs catalogue" not in cli("scoreboard")              # REPORT has no such section

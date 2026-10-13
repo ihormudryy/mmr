@@ -852,6 +852,7 @@ class TypedRpcServer:
         self.registry = registry
         self.identity = identity
         self.address = f"{address}:{port}"
+        self.bound_port: Optional[int] = None    # the real port once bound; port 0 asks the OS for a free one
         configured_max = (
             os.getenv("TYPED_RPC_MAX_IN_FLIGHT", "32")
             if max_in_flight is None else max_in_flight
@@ -898,6 +899,7 @@ class TypedRpcServer:
                 await asyncio.sleep(min(2 ** attempt, 8) * 0.25)
         else:
             raise last_err  # type: ignore[misc]
+        self.bound_port = int(self.socket.getsockopt_string(zmq.LAST_ENDPOINT).rsplit(":", 1)[1])
         self._serve_task = asyncio.create_task(self._serve_loop())
 
     async def _serve_loop(self) -> None:

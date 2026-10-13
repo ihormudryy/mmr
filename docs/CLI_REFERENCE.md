@@ -291,7 +291,7 @@ was judged DEPLOY and waits for an isolation proof.
 sandbox checks: the supervisor's posture from `PONG` (capabilities SETUID/SETGID/KILL only, seccomp, no-new-privileges,
 network none, read-only root, pids limit 64, no provider variables), a benign session and every hostile escape. It
 prints one JSON proof with the build id the sandbox reports. The step refuses with `LIVE_SESSIONS_OPEN` (exit 3, nothing
-printed) while the sandbox reports an open live session, before or after the run. The host checks the JSON and records it
+printed) while the sandbox reports an open live session, before or after the run; the host command then exits 1 and records nothing. The host checks the JSON and records it
 with typed `record_isolation_proof` as `cli`. The newest proof of a build is the run that ran last (`ran_at`); a failing
 run at the same moment as a pass wins. A proof whose `ran_at` is more than 5 minutes after the trader's clock is
 refused with the RPC error `PROOF_FROM_THE_FUTURE` and not stored. Until every build research reported `STARTED` on the record's evaluation, and the

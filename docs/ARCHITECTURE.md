@@ -50,10 +50,23 @@ trader.data_service ──► DataService (data_service.py)
                           ├── IBHistoryWorker (IB history, separate contract-based path)
                           └── ZMQ RPC Server (42003)
 
+trader.sandbox_service (sandbox) ──► one supervisor, network none, read-only root, no keys or config
+                                     ├── /run/sandbox-live/sandbox.sock      ← strategy (3 sessions, one per deployment)
+                                     ├── /run/sandbox-research/sandbox.sock  ← research (4 sessions)
+                                     └── /store (mmr_authored_strategies, read-only; the trader writes it)
+
 web/app.py (dashboard) ──► typed query/command + strategy typed ports
 trader.mmr_cli / sdk.py ──► typed RPC (reads + propose/approve); legacy only for offline direct orders
 scheduler (pycron) ──► cron jobs only (data refresh, backups) — not the process supervisor for split services
 ```
+
+**AI-written strategies (SP3).** The `ai` service's optional `author` role writes at most one strategy file per New
+York trading day (`trader/ai/author_loop.py`, table `author_attempts`), against the API in `trader/authored/api.py`.
+The trader checks it statically and stores it by sha256 digest; the research cycle offers stored files as
+evaluation candidates; the research and strategy services run them only through the `sandbox` sockets
+(`trader/authored/sandbox_client.py`). Jev judges an authored case like any other; a DEPLOY registers only while a
+passing isolation proof exists for the running sandbox image. The scoreboard's "AI-written vs catalogue" section
+(`trader/scoreboard/authored_vs_catalogue.py`) compares both sides on the same conids and sessions; it is a report.
 
 ## Key patterns
 
@@ -294,7 +307,7 @@ The `sandbox` service (`trader/sandbox_service.py`, `trader/sandbox/`) runs code
 
 **Client errors.** `SandboxClient` checks every request with the server's own parser before it sends. `SANDBOX_BUSY`, `SANDBOX_UNAVAILABLE` and a socket that is unreachable, slow, dropped or out of contract raise `SandboxUnavailable` (the strategy is not to blame). `SANDBOX_ERROR` and `SANDBOX_DIGEST_MISMATCH` raise `SandboxFault` (`.code` tells which; the session is over). `SANDBOX_BAD_REQUEST` raises `SandboxProtocolError`; a refused bar leaves the session usable.
 
-**Container tests.** `scripts/run_sandbox_fullstack.sh` builds the sandbox and runs `tests/fullstack/test_sandbox_service.py` against it. It never touches a live stack: its own compose project `mmr-sbxtest` (an override that does not start with `mmr-sbxtest` is refused, exit 2), only the `sandbox` and `fullstack-tests` services (no ib-gateway), a test-only image tag, no published port, a throwaway `HOME` with test keys, no `.env`, and a clean environment (`env -i`). `scripts/check_sbxtest_config.py` checks the rendered config and the run stops before `up` if it names another service, publishes a port, binds an operator path or carries a credential. The run fails unless every test passes and none skips. Never run these tests by hand against the live `mmr` project. Without `MMR_FAKE_BROKER` (a normal pytest run) the module skips.
+**Container tests.** `scripts/run_sandbox_fullstack.sh` builds the sandbox and runs `tests/fullstack/test_sandbox_service.py` against it. It never touches a live stack: its own compose project `mmr-sbxtest` (an override that does not start with `mmr-sbxtest` is refused, exit 2), only the `sandbox`, `research` (a test-only stand-in: sandbox's image, no network, only the research socket volume) and `fullstack-tests` services (no ib-gateway), a test-only image tag, no published port, a throwaway `HOME` with test keys, no `.env`, and a clean environment (`env -i`). `scripts/check_sbxtest_config.py` checks the rendered config and the run stops before `up` if it names another service, publishes a port, binds an operator path or carries a credential. The run fails unless every test passes and none skips. Never run these tests by hand against the live `mmr` project. Without `MMR_FAKE_BROKER` (a normal pytest run) the module skips. `--test tests/fullstack/test_<name>.py` picks another file. `scripts/run_sandbox_fullstack.sh --test tests/fullstack/test_prove_isolation_in_research.py` runs the isolation proof from inside the research container (1 passed, 2026-10-13).
 
 **Known limits.**
 - Children share one network namespace, so two children could reach each other through abstract Unix sockets. The static checker keeps authored code away from socket APIs; this is recorded, not fixed. `prove-isolation` refuses while a live session is open, so a probe never runs beside a live child.

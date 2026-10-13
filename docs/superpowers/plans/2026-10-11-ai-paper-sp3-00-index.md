@@ -250,7 +250,7 @@ All other rulings:
 - Plan 3, made during the build (2026-10-12):
   - Retirement, refresh and proof writes take the trader journal's write lock, the same lock as the saga's SUBMITTING write, so a retirement and a send (or a failed proof and the seal) never commit without seeing each other under DuckDB snapshot isolation.
   - A retirement whose withdrawal fails for a reason other than an SP2c refusal replies `REFUSED AUTHORED_WITHDRAWAL_FAILED` with `retryable: true` and the record already `RETIRED`; `refresh()` withdraws again; Plan 4's resend loop caps its resends.
-  - `tests/fullstack/test_prove_isolation_in_research.py` is written but not run: Plan 2's runner starts no `research` service. Plan 5's acceptance runs it.
+  - `tests/fullstack/test_prove_isolation_in_research.py` was written without a runner that starts a `research` service. Plan 5 extended the runner (Plan 5 ruling G12) and it passed on 2026-10-13 through `scripts/run_sandbox_fullstack.sh --test tests/fullstack/test_prove_isolation_in_research.py` (1 passed).
 - Plan 4, all other rulings: see the plan's Rulings section (R1-R6 in its "Cross-plan requirements" are settled).
 - Plan 4, made during the build (2026-10-12):
   - A bar Plan 2's protocol refuses (high < low, negative volume, time outside 1970-2100, non-finite) is skipped; a live bar dated after today (New York) is skipped and never moves the session day.
@@ -267,6 +267,28 @@ All other rulings:
   - An `ERROR` answered to `OPEN` names the build that answered (`image_digest`). Research and the live proxy blame the file only when that build is the one STARTED or the proof gate checked; no build, or another, is `SANDBOX_UNAVAILABLE`. The second PING is gone.
   - A restart that finds an authored request `RUNNING` with no case, no end marker and a holdout already opened parks it `AUTHORED_OUTCOME_UNKNOWN`: no case is signed and the claim closes FAILED.
 - Plan 5, all other rulings: see the plan's Rulings section.
+- Plan 5, made during the build (2026-10-12/13):
+  - G1: the local check reads the defaults with the trader's `class_constants`; a bare annotation before a constant is refused; `TUNABLE_REBOUND` is a violation and an `AUTHOR_RULES` line; `authored_submission.py` joins `JUDGMENT_SOURCES`.
+  - G2: `check_answer` runs the trader's `check_submission` and maps each refusal to a `StaticViolation`, so the one retry covers it (a differential fuzz of 4200 answers found no answer the local check passed and the trader refused).
+  - G3: `AUTHORED_STORE_UNAVAILABLE` is an availability code: a read waits, a submit resends the same body; every other RPC code stays final (Plan 5 ruling 17).
+  - G4: the bar-size menu intersects by bar-size key (the bar size itself), not by spelling.
+  - G5: the acceptance world gets a seam that returns `AuthoredEvaluator(...).evaluate`, so the research path reaches the sandbox.
+  - G6: the world sets `runtime._authored_deployments` directly, because `connect()` is never called there.
+  - G7: the world's `feed_bar` for an authored instance sets `_dispatch_conid` and filters on `bound_conids`; it runs inline and does not exercise Plan 4's per-instance worker thread.
+  - G8: `set_switch` replaces `served.stack.ai_paper.authored._config`; `extra_trader_prepare` keeps the initial value.
+  - G9: `AGENTS.md` and `docs/CLI_REFERENCE.md` already carried `ai_author` and `ai-author` from Plans 3 and 4; Task 13 added only the missing lines.
+  - G10: the runbook starts `sandbox` and `research` with `--profile ai`; they do not start with `./docker.sh -u`.
+  - G11: Plan 5 was rebased onto the Plan 4 round-2 head `f7d1c324`.
+  - G12: the `mmr-sbxtest` runner starts a test-only `research` service (render guard allows exactly `research`) and takes `--test PATH`; the research-container isolation test ran through it.
+  - G13: `OPERATIONAL_STATE.md` known limits say a missing or unreadable store file is `SANDBOX_DIGEST_MISMATCH` and a wrong `/store` mount retires every deployed authored file (owner decision to change it); the runbook checks the mount before the switch goes on.
+  - G14: the six new author modules (`trader.ai.author_*` and `authored_offers`) are in the ai import-isolation test; `trader.sandbox` and `trader.automation.authored*` are forbidden there, except `authored_submission` and `authored_refusals`, which load no forbidden module.
+  - Task 5: the retry message lists at most 20 problems, each cut to 200 characters.
+  - Task 7: `JUDGMENT_SOURCES` pins `static_check.py`, `allowed_api.py`, `keys.py` and `api.py` (the prompt source), not the whole `trader/authored` directory (it holds the sandbox client, streaming and the isolation proof).
+  - Task 7: the epoch is checked first, before any resend, so a non-leader sends nothing.
+  - Task 7: an unreadable stored row in the facts is `FAILED FACTS_UNREADABLE` (no model call); any unexpected error inside a night is `FAILED ENGINE_ERROR`; a malformed scoreboard is `SKIPPED WIRE_ERROR`.
+  - Task 7: a SUBMITTING row from an earlier night is resent before tonight's slot; two files can land on one calendar day, but there is still at most one new file per night and the trader cap bounds the total.
+  - Task 8: a DEPLOY waiting for the isolation proof is retried once per evening (`WAITING_CAP`) and ends when the record's 20-session SHADOW window closes; Plan 3's 24 h `CLAIM_FAILED_GRACE` bounds how long a FAILED authored claim waits for Jev's judgment.
+  - Task 10: the AI-written vs catalogue view decides sides by strategy digest; exact while one-strategy automation is off; a fix for the other case needs `round_trips.deployment_version`.
 
 ## Tests
 
@@ -274,5 +296,5 @@ All other rulings:
   lock (`/private/tmp/mmr-suite.lock`), `-n 8 --timeout=120`.
 - No real model, IB or network calls. Plan 2's container tests run in the `fullstack-tests` compose profile against
   the real `sandbox` stanza (`scripts/run_sandbox_fullstack.sh`), never against the live stack. Plan 3's
-  `tests/fullstack/test_prove_isolation_in_research.py` needs a `research` service that runner does not start; Plan 5's
-  acceptance runs it.
+  `tests/fullstack/test_prove_isolation_in_research.py` runs through the same runner with `--test`, which starts a
+  test-only `research` service (Plan 5; 1 passed on 2026-10-13).

@@ -217,6 +217,9 @@ scoreboard verify                            # rebuild every number from stored 
 # baseline (follow_signal.v1, fixed_rule.v1, no_trade.v1, matched_entry_bracket_exit.v1); books are never
 # summed; P&L is gross (no commissions or slippage). "AI cost" shows the total with its status label
 # (confirmed, estimated, incomplete), the confirmed and estimated parts and the unknown calls; unavailable when none.
+# "AI-written vs catalogue" (SP3): verdict yes / no / not enough data (with its reason), the sessions and conids
+# both sides covered, and per side closed trips, P&L, daily-P&L Sharpe, max drawdown and trips with unknown fees.
+# yes needs at least 20 closed trips each side, a higher Sharpe and no worse drawdown. A report; it changes no gate.
 experiment acceptance preflight              # SP1 clean-account gate: PASS, or STOP + reasons (exit 1)
 experiment acceptance run                    # dry run: reads the gate, prints the planned calls, sends nothing
 experiment acceptance run --place-orders --deployment-version sha256:... --confirm-account DU123 --signing-key KEY

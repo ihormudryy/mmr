@@ -254,12 +254,18 @@ All other rulings:
 - Plan 4, all other rulings: see the plan's Rulings section (R1-R6 in its "Cross-plan requirements" are settled).
 - Plan 4, made during the build (2026-10-12):
   - A bar Plan 2's protocol refuses (high < low, negative volume, time outside 1970-2100, non-finite) is skipped; a live bar dated after today (New York) is skipped and never moves the session day.
-  - A research or live session on a build other than the STARTED build, and a fault at OPEN after the sandbox moved to another build, count as `SANDBOX_UNAVAILABLE`, never as the strategy's fault.
+  - A research or live session on a build other than the STARTED build, and a fault at OPEN that names another build or none, count as `SANDBOX_UNAVAILABLE`, never as the strategy's fault.
   - The trader's claim also refuses (`STRATEGY_NOT_ALLOWED`) a cohort whose points do not name exactly the stored tunables or whose point 0 is not the stored defaults; Plan 5's author must build cohorts that way.
   - A parked authored request (a refused STARTED, a wire error) closes its SP2c claim FAILED, resent each tick, so Plan 3's 24 h grace returns the record to `STORED`.
   - The strategy service resends a retryable retire refusal or a remote error at most 20 times per digest, then logs one ERROR; an unreachable trader and `AUTHORED_STORE_UNAVAILABLE` are resent without counting. Pending retirements live in memory (ruling 18).
   - A crashing authored instance is re-enabled after 60 s, doubling to at most 30 min; a decided bar resets it.
   - The end report uses `update_claim`'s loud-code rule: a non-loud remote code (`AUTHORED_STORE_UNAVAILABLE`, `PERMISSION_DENIED`, `AUTHENTICATION_ERROR`) stops the research service; a restart resends.
+- Plan 4, made in PR #161 review (2026-10-13):
+  - A decided authored signal carries the build whose session decided it (`Signal.metadata["authored_build"]`); dispatch, held or not, checks that build's proof, not the build of a later session.
+  - The proof gate reads the trader before every BAR, warm-up bars included. Measured: about 4.3 ms per read on the trader side against 0.54 ms per streamed bar, so a 2000-bar warm-up goes from about 1 s to about 10 s per conid, about 3.5 min for a 20-conid deployment at each session open, and up to about 120k reads at the open for three deployments. *Cost if wrong: first-minute decisions of later conids go STALE at the open, and the trader journal lock is busier then.* Follow-up #164.
+  - A strategy fault notes the retirement under the instance lock before the fault is visible, then disables under the signal hold, like an operator disable: a dispatch in flight finishes first, none starts after.
+  - An `ERROR` answered to `OPEN` names the build that answered (`image_digest`). Research and the live proxy blame the file only when that build is the one STARTED or the proof gate checked; no build, or another, is `SANDBOX_UNAVAILABLE`. The second PING is gone.
+  - A restart that finds an authored request `RUNNING` with no case, no end marker and a holdout already opened parks it `AUTHORED_OUTCOME_UNKNOWN`: no case is signed and the claim closes FAILED.
 - Plan 5, all other rulings: see the plan's Rulings section.
 
 ## Tests

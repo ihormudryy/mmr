@@ -201,6 +201,12 @@ def test_shadow_ingest_shares_the_scoreboard_store_the_judgments_and_the_version
     assert stack.scoreboard.service._shadow_owed() == {}                   # the same judgments: none recorded yet
 
 
+def test_the_served_stack_reads_the_authored_scope_from_its_own_journal(prod_stack):   # SP3 Plan 5
+    _trader, stack = prod_stack
+    scope = stack.scoreboard.service._authored_scope()           # raises when a table of 55/115/116/130 is missing
+    assert (scope.windows, scope.authored_digests) == ((), frozenset())
+
+
 def test_no_shadow_ingest_without_an_ai_paper_stack():
     from types import SimpleNamespace
     from trader.trading.command_stack import _build_shadow_ingest, _shadow_owed

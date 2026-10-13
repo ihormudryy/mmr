@@ -6,6 +6,7 @@ import json
 import logging
 from typing import Any, Callable, Mapping, Optional
 
+from trader.scoreboard.authored_vs_catalogue import scope_or_warning
 from trader.scoreboard.ports import session_date_et
 from trader.scoreboard.report import ReportInputs, build_report
 from trader.scoreboard.round_trips import project_round_trips
@@ -21,7 +22,8 @@ EXPERIMENT_NOT_FOUND = "EXPERIMENT_NOT_FOUND"
 class ScoreboardService:
     def __init__(self, *, store: ScoreboardStore, db: Any, experiments: Any, ledger: Any, book: Any, links: Any,
                  calendar: Any, now: Callable[[], dt.datetime], outbox: Any = None,
-                 shadow_owed: Optional[Callable[[], Mapping[str, Mapping[str, Any]]]] = None):
+                 shadow_owed: Optional[Callable[[], Mapping[str, Mapping[str, Any]]]] = None,
+                 authored_scope: Optional[Callable[[], Any]] = None):
         self.store = store
         self.db = db
         self.experiments = experiments
@@ -32,6 +34,7 @@ class ScoreboardService:
         self.outbox = outbox
         self._now = now
         self._shadow_owed = shadow_owed              # None: no ai_paper stack, so no shadow book can be COMPLETE
+        self._authored_scope = authored_scope        # None: the AI-written vs catalogue view is SCOPE_UNKNOWN
 
     # -- derived tables --------------------------------------------------------
 
@@ -91,6 +94,7 @@ class ScoreboardService:
         incidents = [i for i in self.store.incidents()
                      if exp_id in i["key"] or i["kind"].startswith("BENCHMARK")]
         shadow, shadow_warnings = self._shadow_inputs()
+        scope, scope_warnings = scope_or_warning(self._authored_scope)
         return build_report(self._inputs(
             experiment,
             self.store.fetch("equity_daily", {"experiment_id": exp_id}),
@@ -99,7 +103,7 @@ class ScoreboardService:
             self.store.fetch("ai_costs", {"experiment_id": exp_id}),
             self.store.fetch("simulated_decisions", {"experiment_id": exp_id}),
             self.store.fetch("simulated_outcomes", {"experiment_id": exp_id}),
-            incidents, warnings + shadow_warnings, **shadow))
+            incidents, warnings + shadow_warnings + scope_warnings, authored_scope=scope, **shadow))
 
     def _shadow_inputs(self) -> tuple[dict, list[dict]]:
         """Every shadow row, digest re-checked (an edited row reads as INCOMPLETE and raises a warning), and the
@@ -145,14 +149,15 @@ class ScoreboardService:
         return _verify(self, experiment_id)
 
     def _inputs(self, experiment, rows, adjustments, trips, ai_costs, sim_decisions, sim_outcomes, incidents,
-                warnings, shadow_rows=(), shadow_owed=None):
+                warnings, shadow_rows=(), shadow_owed=None, authored_scope=None):
         return ReportInputs(
             experiment=experiment, rows=rows, adjustments=adjustments, trips=trips,
             spy_closes=self.book.closes(), spy_version=self.book.current_version(),
             spy_provider=self.book.provider(), ai_costs=ai_costs, sim_decisions=sim_decisions,
             sim_outcomes=sim_outcomes, incidents=incidents,
             warnings=warnings, outbox=None if self.outbox is None else self.outbox.counts(),
-            calendar=self.calendar, shadow_rows=shadow_rows, shadow_owed=shadow_owed)
+            calendar=self.calendar, shadow_rows=shadow_rows, shadow_owed=shadow_owed,
+            authored_scope=authored_scope)
 
 
 def _trip_view(row: dict) -> dict:

@@ -124,13 +124,13 @@ class SignalHold:
     """
 
     def __init__(self, *, dispatch: Callable[[HeldSignal], None],
-                 block_reason: Callable[[Any], Optional[str]],
+                 block_reason: Callable[[HeldSignal], Optional[str]],
                  latest_bar_time: Callable[[HeldSignal], Optional[dt.datetime]],
                  recorded_ids: Callable[[List[str]], frozenset],
                  write_gap: Callable[[str, int, dict], None],
                  capacity: int = MAX_HELD_SIGNALS):
         self._dispatch = dispatch            # raises SignalRecordWriteFailed when the record write failed
-        self._block_reason = block_reason    # why a strategy may no longer act, or None
+        self._block_reason = block_reason    # why a held signal's strategy may no longer act on it, or None
         self._latest_bar_time = latest_bar_time   # newest completed bar of the signal's (conId, bar size), or None
         self._recorded_ids = recorded_ids    # which source_event_ids the signal record already holds
         self._write_gap = write_gap
@@ -255,7 +255,7 @@ class SignalHold:
     def _why_blocked(self, held: HeldSignal) -> Optional[str]:
         if self._disables.get(held.strategy.name, 0) != held.disables_when_held:
             return STRATEGY_DISABLED
-        return self._block_reason(held.strategy) or self._staleness(held)
+        return self._block_reason(held) or self._staleness(held)
 
     def _staleness(self, held: HeldSignal) -> Optional[str]:
         latest = self._latest_bar_time(held)

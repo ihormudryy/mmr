@@ -969,6 +969,7 @@ class StrategyRuntime():
                                                     universe_accessor=self.universe_accessor)
         if instance is None:
             return None
+        instance.disable_after_fault = lambda: self._disable_after_authored_fault(instance)
         try:
             instance.history_depth = self._history_depth_for(instance, AI_HISTORY_DAYS)
             if self._load_enabled(name) is False:
@@ -978,6 +979,12 @@ class StrategyRuntime():
             self._release_instance(name, instance)
             return None
         return instance
+
+    def _disable_after_authored_fault(self, instance: AuthoredLiveStrategy) -> None:
+        """Like an operator disable: a dispatch already in flight finishes first, and none starts after."""
+        with self._signal_hold.no_dispatch():
+            instance.disable()
+            self._signal_hold.note_disabled(instance.name)
 
     @staticmethod
     def _release_instance(name: str, instance: Strategy) -> None:
@@ -1937,12 +1944,13 @@ class StrategyRuntime():
     def _dispatch_held(self, held: HeldSignal) -> None:
         self._dispatch_once(held.strategy, held.signal, held.conid, held.frame)
 
-    def _held_signal_block_reason(self, strategy: Strategy) -> Optional[str]:
+    def _held_signal_block_reason(self, held: HeldSignal) -> Optional[str]:
+        strategy = held.strategy
         if self.get_strategy(strategy.name) is not strategy:
             return STRATEGY_UNLOADED
         if not _is_dispatchable(strategy):
             return STRATEGY_DISABLED
-        if isinstance(strategy, AuthoredLiveStrategy) and not strategy.session_build_proven():
+        if isinstance(strategy, AuthoredLiveStrategy) and not strategy.decided_build_proven(held.signal):
             return AUTHORED_UNPROVEN
         return None
 

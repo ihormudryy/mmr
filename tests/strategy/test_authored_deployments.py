@@ -12,7 +12,7 @@ import pandas as pd
 import pytest
 import zmq
 
-from tests.authored.fake_sandbox import IMAGE_DIGEST, FakeSandbox, caller_source
+from tests.authored.fake_sandbox import IMAGE_DIGEST, FakeSandbox, caller_source, fault
 from tests.rpc_identity_fixtures import free_port, make_identities
 from tests.test_strategy_artifact_soft_load import _make_runtime, _write_strategy
 from trader.authored.sandbox_client import SandboxProtocolError
@@ -690,18 +690,19 @@ def test_a_crash_on_the_worker_stops_the_bars_queued_behind_it(world, service_lo
     assert world.rt.signal_record.read(0, 10).signals == ()
 
 
-def test_a_fault_callback_on_the_worker_may_close_the_sessions_without_a_deadlock(world, service_loop):
+def test_the_disable_after_a_fault_on_the_worker_may_close_the_sessions_without_a_deadlock(world, service_loop):
     reconcile(world, [authored_active(world.sandbox, "faults_above_limit", "FaultsAboveLimit",
                                       params={"LIMIT": 104.5})])
     authored = instance_of(world)
     world.rt._strategy_frame = lambda conid, bar_size: bars(10)           # close 109 > 104.5: a fault
     faults, reported = [], threading.Event()
 
-    def close_from_the_worker(digest, code):
+    def close_from_the_worker():                    # runs outside the instance lock, after the retirement is noted
         authored.close_sessions()
-        faults.append((threading.current_thread() is authored._worker._thread, code))
+        faults.append((threading.current_thread() is authored._worker._thread,
+                       world.rt._authored_deployments._retiring.get(authored.digest)))
         reported.set()
-    authored._on_fault = close_from_the_worker
+    authored.disable_after_fault = close_from_the_worker
     on_loop(service_loop, world.rt._on_tick_for_strategy, authored, CONID).result(timeout=2)
     assert reported.wait(timeout=5) and faults == [(True, "SANDBOX_ERROR")]
     authored._worker._thread.join(timeout=5)
@@ -732,3 +733,98 @@ def test_an_authored_decision_that_crossed_a_disable_is_a_gap_never_recorded(wor
     assert loop_free.wait(timeout=5)                             # the queued decision has run on the loop
     assert world.rt.signal_record.read(0, 10).signals == () and published == []
     assert [gap["reason"] for gap in gaps] == ["STRATEGY_DISABLED"]
+
+
+# PR #161 review round 2: a decision is bound to the build that decided it, a fault is serialized with dispatch,
+# and the retirement is noted before any thread can see the fault.
+
+BUILD_B = "e4f5a6b-20261012T090000Z"
+
+
+def proven_builds(world, builds):
+    """The trader answers a passing proof for exactly the builds in ``builds``, read at each call."""
+    def call(method, body, response_model, timeout=None):
+        assert method == "get_isolation_proof"
+        image = body["image_digest"]
+        return proof(image) if image in builds else {"found": False, "proof": None}
+    world.query.call = call
+
+
+def test_a_held_signal_of_build_a_is_a_gap_once_a_is_withdrawn_even_on_a_proven_build_b(world):
+    gaps, builds = [], {IMAGE_DIGEST, BUILD_B}
+    world.rt.event_store = SimpleNamespace(append=lambda event: gaps.append(event.metadata))
+    proven_builds(world, builds)
+    reconcile(world, [authored_active(world.sandbox)])
+    instance, frame = instance_of(world), bars(3)
+    instance._dispatch_conid = CONID
+    world.rt._strategy_frame = lambda conid, bar_size: frame          # never stale: only the proof decides
+    signal = instance.on_prices(frame)                                 # decided on build A
+    key = (CONID, instance.name)
+
+    def lost_write(entry):
+        raise OSError("disk full")
+    world.rt.signal_record.append = lost_write
+    world.rt._signal_hold.dispatch(key, instance, signal, CONID, frame)
+    assert world.rt._signal_hold.held_count(key) == 1
+    world.sandbox.unavailable = True
+    assert instance.on_prices(bars(4)) is None                         # an outage ends the session on A
+    world.sandbox.unavailable, world.sandbox.image_digest = False, BUILD_B
+    assert instance.on_prices(bars(5)) is not None                     # a new session on proven build B
+    builds.discard(IMAGE_DIGEST)                                       # A's proof is withdrawn
+    del world.rt.signal_record.append
+    world.rt._signal_hold.retry(key)
+    assert world.rt.signal_record.read(0, 10).signals == ()
+    assert [gap["reason"] for gap in gaps] == [AUTHORED_UNPROVEN]
+
+
+def test_the_retirement_is_noted_before_a_reconcile_can_see_the_fault(world):
+    deployment = authored_active(world.sandbox)
+    reconcile(world, [deployment])
+    instance = instance_of(world)
+    instance._dispatch_conid = CONID
+    assert instance.on_prices(bars(3)) is not None
+    world.sandbox.sessions[0].bar = lambda *args, **kwargs: (_ for _ in ()).throw(fault("SANDBOX_ERROR"))
+    seen = []
+
+    def reconcile_in_the_pause():               # the first moment another thread can see the fault
+        reconcile(world, [deployment])          # the trader still lists the deployment
+        seen.append(dict(world.rt.ai_instances()))
+    instance.disable_after_fault = reconcile_in_the_pause
+    assert instance.on_prices(bars(4)) is None
+    assert seen == [{}]                                                 # unloaded, no replacement loaded
+    assert world.rt._authored_deployments._retiring == {deployment.strategy_digest: "SANDBOX_ERROR"}
+
+
+def test_a_fault_waits_for_a_dispatch_in_flight_and_no_dispatch_follows_it(world):
+    order, in_append, release, fault_seen = [], threading.Event(), threading.Event(), threading.Event()
+    world.rt.event_store = SimpleNamespace(append=lambda event: order.append(("event", event.event_type.name)))
+    world.rt.zmq_messagebus_client = SimpleNamespace(write=lambda *args: order.append(("published",)))
+    reconcile(world, [authored_active(world.sandbox)])
+    instance, frame = instance_of(world), bars(3)
+    instance._dispatch_conid = CONID
+    world.rt._strategy_frame = lambda conid, bar_size: frame
+    signal = instance.on_prices(frame)
+    real_append, real_disable = world.rt.signal_record.append, instance.disable
+
+    def slow_append(entry):
+        in_append.set()
+        release.wait(timeout=10)
+        real_append(entry)
+        order.append(("recorded",))
+    world.rt.signal_record.append = slow_append
+    instance.disable = lambda: (order.append(("disabled",)), real_disable())[1]
+    real_disable_after_fault = instance.disable_after_fault
+    instance.disable_after_fault = lambda: (fault_seen.set(), real_disable_after_fault())
+    dispatch = threading.Thread(target=world.rt._signal_hold.dispatch,
+                                args=((CONID, instance.name), instance, signal, CONID, frame))
+    dispatch.start()
+    assert in_append.wait(timeout=5)                                  # the BUY passed its checks, write paused
+    world.sandbox.sessions[0].bar = lambda *args, **kwargs: (_ for _ in ()).throw(fault("SANDBOX_ERROR"))
+    faulting = threading.Thread(target=instance.on_prices, args=(bars(4),))
+    faulting.start()
+    assert fault_seen.wait(timeout=5)                                 # the fault reached its disable
+    release.set()
+    dispatch.join(timeout=5)
+    faulting.join(timeout=5)
+    assert order == [("recorded",), ("event", "SIGNAL"), ("published",), ("disabled",)]
+    assert instance.state == StrategyState.DISABLED

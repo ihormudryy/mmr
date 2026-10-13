@@ -37,8 +37,10 @@ SANDBOX_UNAVAILABLE_ALARM = "AUTHORED_SANDBOX_UNAVAILABLE"
 SANDBOX_FAULT_ALARM = "AUTHORED_SANDBOX_FAULT"
 ISOLATION_ALARM = "AUTHORED_ISOLATION_UNPROVEN"
 DIGEST_ALARM = "AUTHORED_DIGEST_MISMATCH"
-# The SIGNAL_GAP reason for a decided signal whose session build has no passing proof at dispatch, or no session.
+# The SIGNAL_GAP reason for a decided signal whose deciding build has no passing proof at dispatch, or no session.
 AUTHORED_UNPROVEN = "AUTHORED_BUILD_UNPROVEN"
+# Signal.metadata key: the build whose OPENED session decided the signal; dispatch checks that build's proof.
+DECIDED_BY_BUILD = "authored_build"
 # Only these are the strategy's fault and retire it; every other sandbox error is an alarm and a retry.
 STRATEGY_FAULT_CODES = frozenset({SANDBOX_ERROR, SANDBOX_DIGEST_MISMATCH})
 # Errors that end the session and are retried with a new session at a later bar. A protocol error reaching this
@@ -140,15 +142,18 @@ class AuthoredLiveStrategy(Strategy):
                  now: Callable[[], dt.datetime] = _utc_now):
         super().__init__()
         # Plan 4 ruling 19 (review r1 #6): True only for a build with a passing isolation proof. Asked before
-        # every OPEN for the build PING reported, and on every bar for the build the session's OPENED reported,
-        # so a first OPEN, a reconnect, a day rollover or a proof withdrawn mid-session never sends a bar to an
-        # unproven build.
+        # every OPEN for the build PING reported, and before every BAR for the build the session's OPENED
+        # reported (PR #161 review: also inside a warm-up frame), so a first OPEN, a reconnect, a day rollover or
+        # a proof withdrawn mid-session never sends a bar to an unproven build.
         self._proof_gate = proof_gate
         self.digest = digest
         # Not the base class's ``conids`` property: its setter drops the value until install (pre-flight F3).
         self._bound_conids = _bound_conids(conids)
         self._client, self._class_name, self._params, self._bar_size = client, class_name, dict(params), bar_size
+        # Record only, never blocks: called under this instance's lock (PR #161 review).
         self._on_fault = on_fault
+        # The runtime replaces it with a disable under the signal hold, so no dispatch straddles a fault.
+        self.disable_after_fault: Callable[[], Any] = self.disable
         self._now = now
         self._current: Optional[_DaySession] = None
         # The worker sends; the reconcile thread may close. One bar at a time on the session (Plan 2 ruling 25).
@@ -186,7 +191,7 @@ class AuthoredLiveStrategy(Strategy):
                 if fault.code not in STRATEGY_FAULT_CODES:
                     self._end_session_with_outage(fault)
                     return None
-                self._stop_after_fault()
+                self._stop_after_fault(fault)
                 strategy_fault = fault          # ``fault`` is unbound once the except block ends
             except _UnprovenBuild as unproven:
                 self._end_session()
@@ -203,8 +208,8 @@ class AuthoredLiveStrategy(Strategy):
                 self._clear_outage_alarm()
                 self._in_unproven = False
                 self._consecutive_crashes, self._recover_after = 0, None
-                return decision_signal(decision, self.name)
-        # Outside the lock: the callback may close the sessions or queue work for the reconcile thread.
+                return self._signal_of(decision)
+        # Outside the instance lock: the disable waits for a dispatch in flight, which may ask this instance.
         self._report_fault(strategy_fault)
         return None
 
@@ -213,17 +218,18 @@ class AuthoredLiveStrategy(Strategy):
         bound = getattr(self, "ai_source_digest", None)
         return not (self._faulted or self._closed) and isinstance(bound, str) and hmac.compare_digest(self.digest, bound)
 
-    def session_build_proven(self) -> bool:
-        """The dispatch check for a decided signal, held or not (final review minor): the build of the open
-        session still has a passing proof. No open session is unproven: fail closed. Not the reconcile check
-        (``authored_binding_intact``): an instance without a session is not to be unloaded.
+    def decided_build_proven(self, signal: Any) -> bool:
+        """The dispatch check for a decided signal, held or not (PR #161 review): the build that decided it, not
+        the build of a later session, still has a passing proof. A signal without its build, or no open session,
+        is unproven: fail closed. Not the reconcile check (``authored_binding_intact``): an instance without a
+        session is not to be unloaded.
 
         Never takes the instance lock: the service loop asks this while a bar may hold the lock."""
-        current = self._current
-        if current is None or self._faulted or self._closed:
+        build = getattr(signal, "metadata", {}).get(DECIDED_BY_BUILD)
+        if self._current is None or self._faulted or self._closed or not isinstance(build, str):
             return False
         try:
-            return self._proof_gate(current.session.image_digest) is True
+            return self._proof_gate(build) is True
         except Exception as exc:
             logger.warning("authored strategy %s: the isolation proof check at dispatch failed: %s", self.name, exc)
             return False
@@ -266,12 +272,19 @@ class AuthoredLiveStrategy(Strategy):
             self._end_session()
         if self._current is None:
             self._current = self._open_day_session(day)
-        # The OPENED build, checked on every bar: a restart between PING and OPEN, or a proof withdrawn
-        # mid-session, sends nothing (fail closed).
-        self._require_proven(self._current.session.image_digest)
+        build = self._current.session.image_digest
         stream = self._current.streams[conid]
-        decisions = stream.send_frame(_unsent(prices, stream.last_sent))
+        # The OPENED build, checked before every BAR, a warm-up's too: a restart between PING and OPEN, or a
+        # proof withdrawn mid-frame, sends no further bar (fail closed).
+        decisions = stream.send_frame(_unsent(prices, stream.last_sent),
+                                      before_each_bar=lambda: self._require_proven(build))
         return decisions[-1] if decisions else None
+
+    def _signal_of(self, decision: Optional[Decision]) -> Optional[Signal]:
+        signal = decision_signal(decision, self.name)
+        if signal is not None:
+            signal.metadata[DECIDED_BY_BUILD] = self._current.session.image_digest
+        return signal
 
     def _open_day_session(self, day: dt.date) -> _DaySession:
         build = self._ping_build()
@@ -357,16 +370,18 @@ class AuthoredLiveStrategy(Strategy):
             self._in_outage = False
             logger.info("authored strategy %s: the live sandbox answers again", self.name)
 
-    def _stop_after_fault(self) -> None:
+    def _stop_after_fault(self, fault: SandboxFault) -> None:
+        """Under the instance lock. The retirement is recorded before ``_faulted`` is visible, so a reconcile
+        that unloads this instance never loads a replacement first (PR #161 review)."""
+        self._on_fault(self.digest, str(fault.code))
         self._faulted = True
-        self.disable()
         self._end_session()                                                # a fault ends the session for every conid
 
     def _report_fault(self, fault: SandboxFault) -> None:
         alarm = DIGEST_ALARM if fault.code == SANDBOX_DIGEST_MISMATCH else SANDBOX_FAULT_ALARM
         logger.error("%s: authored strategy %s (%s) failed in the sandbox (%s); it stops and is retired, open "
                      "positions keep their stops", alarm, self.name, self.digest, fault.code)
-        self._on_fault(self.digest, str(fault.code))
+        self.disable_after_fault()
 
 
 # The proof read runs on an instance's worker before every bar, and on the service loop at each signal's dispatch:

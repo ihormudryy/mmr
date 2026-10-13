@@ -114,7 +114,7 @@ def test_a_gate_that_raises_counts_as_unproven(caplog):
 
 def test_a_gate_that_raises_mid_session_ends_the_session():
     sandbox, faults = live_sandbox(), []
-    answers = iter([True, True])                                           # the PING build, then the OPENED build
+    answers = iter([True] * 4)                             # the PING build, then the OPENED build before each BAR
 
     def gate(build):
         try:
@@ -269,12 +269,12 @@ def test_a_stored_file_that_changed_retires_as_a_digest_fault(caplog):
     assert DIGEST_ALARM in caplog.text and strategy.state == StrategyState.DISABLED
 
 
-def test_the_fault_callback_may_close_the_sessions_without_a_deadlock():
+def test_the_disable_after_a_fault_may_close_the_sessions_without_a_deadlock():
     sandbox, faults = live_sandbox(), []
     strategy = live(sandbox, faults, "faults_above_limit", "FaultsAboveLimit", {"LIMIT": 104.5})
-    strategy._on_fault = lambda digest, code: (strategy.close_sessions(), faults.append(code))
+    strategy.disable_after_fault = lambda: (strategy.close_sessions(), faults.append("disabled"))
     assert strategy.on_prices(bars(10)) is None
-    assert faults == [SANDBOX_ERROR]
+    assert faults == [(strategy.digest, SANDBOX_ERROR), "disabled"]     # the retirement is noted first
 
 
 @pytest.mark.parametrize("code", ["SANDBOX_BAD_REQUEST", "SANDBOX_SOMETHING_NEW"])
@@ -515,3 +515,15 @@ def test_a_fault_answered_to_ping_is_an_outage_not_a_retirement(caplog):
     with caplog.at_level(logging.ERROR):
         assert strategy.on_prices(bars(5)) is None
     assert faults == [] and SANDBOX_UNAVAILABLE_ALARM in caplog.text and strategy.state == StrategyState.RUNNING
+
+
+def test_a_proof_withdrawn_after_the_first_bar_of_a_frame_stops_the_frame():                 # PR #161 review
+    sandbox, faults = live_sandbox(), []
+    answers = iter([True, True])                    # the PING build, then the OPENED build before BAR 1 only
+
+    def gate(build):
+        return next(answers, False)
+    strategy = live(sandbox, faults, proof_gate=gate)
+    assert strategy.on_prices(bars(3)) is None
+    assert len(sandbox.sessions[0].stamps_of(CONID)) == 1                  # BAR 2 and BAR 3 were never sent
+    assert sandbox.open_sessions == [] and faults == []

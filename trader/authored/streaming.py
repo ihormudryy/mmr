@@ -8,7 +8,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import math
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 import pandas as pd
 
@@ -75,10 +75,16 @@ class BarStream:
         self.last_sent = fields["t"]
         return decision
 
-    def send_frame(self, frame: pd.DataFrame) -> tuple[Optional[Decision], ...]:
-        """One decision per row of ``frame``, in row order."""
+    def send_frame(self, frame: pd.DataFrame,
+                   before_each_bar: Callable[[], None] = lambda: None) -> tuple[Optional[Decision], ...]:
+        """One decision per row of ``frame``, in row order. ``before_each_bar`` runs before each row and may
+        raise to stop the frame: no later row is sent."""
         rows = frame.loc[:, list(OHLCV)].itertuples(index=False, name=None)
-        return tuple(self.send(stamp, values) for stamp, values in zip(frame.index, rows))
+        decisions = []
+        for stamp, values in zip(frame.index, rows):
+            before_each_bar()
+            decisions.append(self.send(stamp, values))
+        return tuple(decisions)
 
     def close(self) -> None:
         """Best effort: closes the whole session (every conid); a session whose child already died has nothing

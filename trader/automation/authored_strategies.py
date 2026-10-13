@@ -17,7 +17,7 @@ import threading
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any, Callable, Iterator, Mapping, Optional
+from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
 
 from trader.authored.keys import authored_key, parse_authored_key, source_digest
 from trader.automation.ai_deployment_activity import EXPIRED as VERSION_EXPIRED
@@ -407,7 +407,27 @@ def _claim_problem(record: Optional[AuthoredRecord], class_name: str, body: Eval
             problem = _point_problem(record.tunables, name, value)
             if problem is not None:
                 return problem
+    return _cohort_names_problem(record.tunables, body.cohort) or _defaults_problem(record.tunables, body.cohort[0])
+
+
+def _cohort_names_problem(tunables: Mapping[str, Mapping[str, float]],
+                          cohort: Sequence[Mapping[str, Any]]) -> Optional[str]:
+    """The sandbox runs on exactly the OPEN params (no class defaults), so every point names every tunable."""
+    for index, point in enumerate(cohort):
+        missing = sorted(set(tunables) - set(point))
+        if missing:
+            return f"point {index} leaves out {missing}; every point names every tunable of the authored file"
     return None
+
+
+def _defaults_problem(tunables: Mapping[str, Mapping[str, float]], first: Mapping[str, Any]) -> Optional[str]:
+    """Point 0 is the file as written: research takes it as the base spec without reading the file."""
+    defaults = {name: bounds.get("default") for name, bounds in tunables.items()}
+    moved = sorted(name for name, default in defaults.items() if first.get(name) != default)
+    if not moved:
+        return None
+    changes = ", ".join(f"{name}={first.get(name)!r} (default {defaults[name]!r})" for name in moved)
+    return f"point 0 is not the stored defaults: {changes}"
 
 
 def _point_problem(tunables: Mapping[str, Mapping[str, float]], name: str, value: Any) -> Optional[str]:

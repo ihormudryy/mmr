@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.automation.authored_fixtures import authored_world, report, stored, with_config
+from tests.automation.authored_fixtures import TUNABLES, authored_world, report, stored, with_config
 from tests.automation.backtest_judge_fixtures import (
     World, case_keys, count_judgments, finished, judge_config, judgment, request_body,
 )
@@ -25,8 +25,16 @@ def hooked(tmp_path, *, judge=None, **config):
     return World(aw.db, aw.clock, claims, judgments, keys), aw
 
 
+DEFAULTS = {name: bounds["default"] for name, bounds in TUNABLES.items()}
+
+
+def point(**changes) -> dict:
+    """A cohort point naming every stored tunable: the defaults with ``changes`` (Plan 4 ruling F6)."""
+    return {**DEFAULTS, **changes}
+
+
 def authored_body(digest, class_name="RangeBreak", **changes):
-    raw = {"strategy_key": authored_key(digest, class_name), "cohort": [{"RANGE_BARS": 10}, {"RANGE_BARS": 20}]}
+    raw = {"strategy_key": authored_key(digest, class_name), "cohort": [point(), point(RANGE_BARS=20)]}
     raw.update(changes)
     return request_body(**raw)
 
@@ -73,6 +81,20 @@ def test_a_claim_outside_the_authored_file_is_not_allowed(tmp_path, change, hint
     digest = stored(aw)
     refused = refused_claim(w, authored_body(digest, **change))
     assert refused.code == "STRATEGY_NOT_ALLOWED" and hint in refused.detail
+    assert aw.store.get(digest).state == STORED
+
+
+@pytest.mark.parametrize("cohort, hint", [
+    ([{"RANGE_BARS": 15}], "point 0 leaves out ['MIN_PROBABILITY']"),
+    ([point(), {"RANGE_BARS": 20}], "point 1 leaves out ['MIN_PROBABILITY']"),
+    ([point(), point(RANGE_BARS=20, WINDOW=3)], "WINDOW is not a tunable"),
+    ([point(RANGE_BARS=10), point()], "point 0 is not the stored defaults"),
+])
+def test_a_cohort_must_name_every_tunable_and_start_at_the_defaults(tmp_path, cohort, hint):        # ruling F6
+    w, aw = hooked(tmp_path)
+    digest = stored(aw)
+    refused = refused_claim(w, authored_body(digest, cohort=cohort))
+    assert refused.code == "STRATEGY_NOT_ALLOWED" and hint in refused.detail, refused.detail
     assert aw.store.get(digest).state == STORED
 
 

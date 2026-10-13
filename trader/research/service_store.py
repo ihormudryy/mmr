@@ -11,6 +11,10 @@ RESEARCH_MIGRATION_SHADOW = 22
 REQUEST_STATES = ("CLAIMING", "REFUSED", "QUEUED", "RUNNING", "DONE", "FAILED", "PARKED")
 OPEN_STATES = ("QUEUED", "RUNNING")                  # PARKED is terminal and takes no queue slot
 UNREAD = ""                                          # a NOT NULL column whose value was never read
+# Plan 4 F5: the ``code`` of a PARKED authored request whose trader claim is not closed FAILED yet, then how it ended.
+CLAIM_CLOSE_OWED = "CLAIM_CLOSE_OWED"
+CLAIM_CLOSED = "CLAIM_CLOSED"
+CLAIM_CLOSE_REFUSED = "CLAIM_CLOSE_REFUSED"
 
 _REQUESTS = ("""CREATE TABLE IF NOT EXISTS research_requests (
     request_id VARCHAR PRIMARY KEY, body_json VARCHAR NOT NULL, strategy_key VARCHAR NOT NULL,
@@ -97,6 +101,20 @@ class ResearchStore:
         self._db.execute("UPDATE research_requests SET state = 'PARKED', parked_reason = ?, pending_report = NULL, "
                          "updated_at = ? WHERE request_id = ?", [reason, now, request_id])
 
+    def park_owing_claim_close(self, request_id: str, reason: str, *, now: dt.datetime) -> None:
+        """Park, and remember in the same write that the trader's claim still has to close FAILED."""
+        self._db.execute("UPDATE research_requests SET state = 'PARKED', parked_reason = ?, pending_report = NULL, "
+                         "code = ?, updated_at = ? WHERE request_id = ?", [reason, CLAIM_CLOSE_OWED, now, request_id])
+
+    def parked_owing_claim_close(self) -> list[dict]:
+        return self._select(f"state = 'PARKED' AND code = '{CLAIM_CLOSE_OWED}'")
+
+    def settle_claim_close(self, request_id: str, outcome: str, *, now: dt.datetime) -> None:
+        if outcome not in (CLAIM_CLOSED, CLAIM_CLOSE_REFUSED):
+            raise ValueError(f"a claim close ends {CLAIM_CLOSED} or {CLAIM_CLOSE_REFUSED}, not {outcome!r}")
+        self._db.execute("UPDATE research_requests SET code = ?, updated_at = ? WHERE request_id = ? "
+                         "AND state = 'PARKED' AND code = ?", [outcome, now, request_id, CLAIM_CLOSE_OWED])
+
     def count(self, states) -> int:
         marks = ", ".join("?" for _ in states)
         return int(self._db.execute(f"SELECT COUNT(*) FROM research_requests WHERE state IN ({marks})",
@@ -113,8 +131,11 @@ class ResearchStore:
     def finished(self) -> list[dict]:
         return self._select("state IN ('DONE','FAILED')")
 
-    def hold_report(self, request_id: str, final: str, *, now: dt.datetime, case_digest: str, summary: dict) -> None:
-        """Ruling 24: the case is signed, but the row stays RUNNING until the trader confirms ``final``."""
+    def hold_report(self, request_id: str, final: str, *, now: dt.datetime, case_digest: Optional[str],
+                    summary: Optional[dict]) -> None:
+        """Ruling 24: the case is signed, but the row stays RUNNING until the trader confirms ``final``.
+
+        An authored end (Plan 4 ruling 11) holds neither a case nor a summary."""
         if final not in ("DONE", "FAILED"):
             raise ValueError(f"a report owes DONE or FAILED, not {final!r}")
         self._db.execute("UPDATE research_requests SET pending_report = ?, case_digest = ?, summary_json = ?, "

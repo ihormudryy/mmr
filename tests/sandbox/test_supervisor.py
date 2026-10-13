@@ -121,6 +121,13 @@ def test_a_missing_store_file_is_a_digest_mismatch(tmp_path):
     sup = _supervisor(tmp_path)
     reply = sup.handle("live", 1, p.parse_request(_open_frame("sha256:" + "a" * 64)))
     assert reply["type"] == "ERROR" and reply["code"] == p.SANDBOX_DIGEST_MISMATCH
+    assert reply["image_digest"] == "mmr-build-id"                    # PR #161: an OPEN fault names its build
+
+
+def test_an_error_to_a_bar_names_no_build(tmp_path):
+    sup = _supervisor(tmp_path)
+    reply = _bar(sup, "s" + "0" * 16, T0)
+    assert reply["type"] == "ERROR" and "image_digest" not in reply
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")

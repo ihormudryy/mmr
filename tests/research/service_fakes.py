@@ -12,6 +12,10 @@ class FakeTrader:
         self.judgments, self.shadow_rows = {}, {}
         self.shadow_calls, self.refuse_shadow = [], {}    # (judgment_id, session_date) -> (code, retryable)
         self.forward, self.forward_reads = {}, []
+        self.authored_reports, self.judged_count = [], 0
+        self.lose_authored_report, self.refuse_authored_report = False, None
+        self.lose_authored_reply = False       # the report is applied, then its reply is lost (once)
+        self.reported_after_close = False      # Plan 4 ruling 10: an end must reach the trader before FAILED
 
     def claim(self, request_id, body):
         existing = self.claims.get(request_id)
@@ -74,6 +78,27 @@ class FakeTrader:
         status = "DUPLICATE" if key in self.shadow_rows else "INSERTED"
         self.shadow_rows[key] = dict(body)
         return {"status": status, "code": None, "retryable": False}
+
+    def report_authored_evaluation(self, body):
+        """Plan 3's report_authored_evaluation: UPDATED once per body, then UNCHANGED; judged_count rides along."""
+        claim = self.claims.get(body["request_id"])
+        if body["event"] != "STARTED" and claim is not None and claim["state"] == "FAILED":
+            self.reported_after_close = True
+        if self.lose_authored_report:
+            self.lose_authored_report = False
+            raise TraderUnavailable("report_authored_evaluation: request lost")
+        if self.refuse_authored_report is not None:
+            code, retryable = self.refuse_authored_report
+            return {"status": "REFUSED", "code": code, "detail": "refused by the fake", "retryable": retryable,
+                    "record": None, "judged_count": None}
+        status = "UNCHANGED" if body in self.authored_reports else "UPDATED"
+        if status == "UPDATED":
+            self.authored_reports.append(dict(body))
+        if self.lose_authored_reply:
+            self.lose_authored_reply = False
+            raise TraderUnavailable("report_authored_evaluation: reply lost")
+        return {"status": status, "code": None, "detail": None, "retryable": False, "record": None,
+                "judged_count": self.judged_count}
 
 
 def judgment_view(judgment_id, case_digest, verdict, *, decided_at="2024-03-15T21:00:00+00:00",

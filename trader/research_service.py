@@ -29,10 +29,10 @@ from trader.data.duckdb_store import DuckDBConnection
 from trader.data.schema_migrations import SchemaMigrator
 from trader.data.universe import UniverseAccessor
 from trader.messaging.typed_rpc import ServiceIdentity, TypedRpcClient, TypedRpcServer
+from trader.research.authored_evaluation import AuthoredEvaluator
 from trader.research.cohort import build_cohort_spec
-from trader.research.cohort_evaluation import evaluate_cohort
 from trader.research.evaluation import EvaluationPaths
-from trader.research.evaluation_service import EvaluationService
+from trader.research.evaluation_service import EvaluationService, holdout_opened_in
 from trader.research.experiment_registry import ExperimentRegistry
 from trader.research.judgment_attest import JudgmentAttest, is_paper_posture
 from trader.research.key_purpose import default_rpc_keys_dir
@@ -116,11 +116,12 @@ def build_runtime(*, config_path: str, environ: Mapping[str, str], now: Callable
     renewals = RenewalRequests(store=store, trader=trader, signer=signer, artifacts_root=ARTIFACTS_ROOT,
                                repo_root=root, judge=judge, warmup_sessions=judge.shadow_warmup_sessions,
                                incomplete_after_hours=config.shadow_incomplete_after_hours, now=now)
+    evaluator = AuthoredEvaluator(research_db=db, paths=paths, now=now, trader=trader)
     evaluations = EvaluationService(
-        store=store, trader=trader, build_spec=build_spec,
-        evaluate=lambda spec: evaluate_cohort(spec, research_db=db, paths=paths, now=now), signer=signer,
+        store=store, trader=trader, build_spec=build_spec, evaluate=evaluator.evaluate, signer=signer,
         artifacts_root=ARTIFACTS_ROOT, warmup_sessions=judge.shadow_warmup_sessions,
-        order_notional=config.order_notional, queue_max=config.queue_max, now=now, renewals=renewals)
+        order_notional=config.order_notional, queue_max=config.queue_max, now=now, renewals=renewals,
+        holdout_opened=holdout_opened_in(registry))
     shadow = ShadowReplay(store=store, trader=trader, signer=signer, artifacts_root=ARTIFACTS_ROOT, paths=paths,
                           registry=registry, config=config, judge=judge, now=now)
     rpc = build_research_registry(evaluations=evaluations, attest=attest)

@@ -11,12 +11,13 @@ import math
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 import yaml
 
 from trader.objects import BarSize
 from trader.research.request_rules import LONGEST_BAR_SIZE, MIN_INSTRUMENTS  # noqa: F401  re-exported
+from trader.research.strategy_key import authored_strategy_path
 from trader.research.strategy_paths import normalize_strategy_path
 from trader.simulation.execution_costs import (
     ExecutionCostError,
@@ -51,6 +52,8 @@ class EvaluationSpec:
     account_equity: float
     max_gross_allocation: float
     calendar: str
+    # An authored file (SP3): named by its digest, read by the sandbox only.
+    authored_digest: Optional[str] = None
 
 
 def neighbour_points(spec: EvaluationSpec) -> list[dict]:
@@ -162,6 +165,14 @@ def _strategy_file(raw_path: str, repo_root: Path) -> tuple[str, Path]:
     return normalize_strategy_path(str(file), repo_root), file
 
 
+def _authored_strategy(raw: Mapping[str, Any], authored_digest: str) -> tuple[str, Path]:
+    """An authored file is named by its digest and never read here (Plan 4 rulings 3 and 5)."""
+    path = authored_strategy_path(authored_digest)
+    if str(_require(raw, 'strategy')) != path:
+        raise EvaluationSpecError(f"strategy: {raw['strategy']} is not the authored file {path}")
+    return path, Path(path)
+
+
 def _calendar(conids: tuple[int, ...], universe_accessor: Any,
               costs_config: ExecutionCostsConfig) -> str:
     try:
@@ -207,13 +218,17 @@ def load_evaluation_spec(path: str | Path, *, universe_accessor: Any,
 
 
 def build_evaluation_spec(raw: Mapping[str, Any], *, universe_accessor: Any,
-                          costs_config: ExecutionCostsConfig, repo_root: Path) -> EvaluationSpec:
+                          costs_config: ExecutionCostsConfig, repo_root: Path,
+                          authored_digest: Optional[str] = None) -> EvaluationSpec:
     name = str(_require(raw, 'name'))
-    strategy_path, strategy_file = _strategy_file(str(_require(raw, 'strategy')), repo_root)
+    if authored_digest is None:
+        strategy_path, strategy_file = _strategy_file(str(_require(raw, 'strategy')), repo_root)
+    else:
+        strategy_path, strategy_file = _authored_strategy(raw, authored_digest)
     class_name = str(_require(raw, 'class'))
-    tunables = declared_tunables(strategy_file, class_name)
-
     params = dict(_mapping(_require(raw, 'params'), 'params'))
+    # Never import an authored file: the trader's claim matched its names to the record (Plan 4 ruling 5).
+    tunables = set(params) if authored_digest else declared_tunables(strategy_file, class_name)
     unknown = sorted((k for k in params if k not in tunables), key=str)
     if unknown:
         raise EvaluationSpecError(f'params: not upper-case tunables of {class_name}: {unknown}')
@@ -253,5 +268,5 @@ def build_evaluation_spec(raw: Mapping[str, Any], *, universe_accessor: Any,
         period_end=period_end, folds=folds, embargo_sessions=embargo,
         holdout_sessions=holdout, order_notional=order_notional,
         account_equity=account_equity, max_gross_allocation=float(max_gross_allocation),
-        calendar=calendar,
+        calendar=calendar, authored_digest=authored_digest,
     )

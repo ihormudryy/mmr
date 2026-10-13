@@ -21,10 +21,12 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from trader.authored.sandbox_client import SandboxUnavailable
 from trader.data.data_access import TickStorage
 from trader.data.store import DateRange
 from trader.messaging.typed_rpc import TypedRpcRemoteError
 from trader.objects import BarSize
+from trader.research.authored_outcome import sandbox_cause
 from trader.research.evaluation import EvaluationError, _costs_config_digest, _point_key
 from trader.research.evaluation_case import CaseRefused, load_verified_case
 from trader.research.evaluation_jobs import RunEnvironment, WindowJob, run_window_job
@@ -32,7 +34,7 @@ from trader.research.judgment_attest import is_loud_trader_code
 from trader.research.regular_sessions import regular_session_bars
 from trader.research.shadow_window import (TRACKED_VERDICTS, session_close_utc, session_open_utc, sessions_before,
                                            shadow_window, xnys_sessions)
-from trader.research.strategy_key import split_strategy_key
+from trader.research.strategy_key import authored_digest_of_path, is_authored_path, split_evaluation_key
 from trader.research.trader_port import TraderUnavailable
 
 logger = logging.getLogger(__name__)
@@ -58,6 +60,11 @@ def bar_seconds(bar_size: str) -> int:
     if match is None:
         raise ValueError(f"unknown bar size {bar_size!r}")
     return int(match.group(1)) * _UNIT_SECONDS[match.group(2)]
+
+
+def replay_failure_code(exc: BaseException) -> str:
+    """An unreachable sandbox is not the strategy's fault: the row says so (it waits, then reads INCOMPLETE)."""
+    return "SANDBOX_UNAVAILABLE" if isinstance(sandbox_cause(exc), SandboxUnavailable) else "REPLAY_ERROR"
 
 
 def ny_day_start(day: dt.date) -> dt.datetime:
@@ -280,7 +287,7 @@ class ShadowReplay:
             outcome = self._run_job(env, job)
         except Exception as exc:                        # strategy code or data: the row says why, the log says more
             logger.exception("shadow replay of %s on %s failed", member["judgment_id"], session)
-            return self._incomplete(member, case, session, f"REPLAY_ERROR: {type(exc).__name__}")
+            return self._incomplete(member, case, session, f"{replay_failure_code(exc)}: {type(exc).__name__}")
         return self._numbers(member, case, session, env, outcome)
 
     def _numbers(self, member: dict, case: Any, session: dt.date, env: RunEnvironment, outcome: Any) -> dict:
@@ -315,7 +322,11 @@ class ShadowReplay:
         return row
 
     def _source_problem(self, case: Any) -> Optional[str]:
-        path, _ = split_strategy_key(case.strategy_key)
+        path, _ = split_evaluation_key(case.strategy_key)
+        if is_authored_path(path):                      # content-addressed; only the sandbox reads it
+            if authored_digest_of_path(path) != case.strategy_file_hash:
+                return "STRATEGY_SOURCE_CHANGED: the authored file is not the judged one"
+            return None
         try:
             source = (Path(self._paths.repo_root) / path).read_bytes()
         except FileNotFoundError:
@@ -365,12 +376,15 @@ class ShadowReplay:
 
     def _environment(self, case: Any, family: Any) -> RunEnvironment:
         cost = family.cost_model
-        path, class_name = split_strategy_key(case.strategy_key)
+        path, class_name = split_evaluation_key(case.strategy_key)
+        authored = is_authored_path(path)
         return RunEnvironment(
             history_db=self._paths.history_db, universe_db=self._paths.universe_db,
             universe_library=self._paths.universe_library, execution_costs_path=self._paths.execution_costs,
-            strategy_file=str(Path(self._paths.repo_root) / path), class_name=class_name,
+            strategy_file=path if authored else str(Path(self._paths.repo_root) / path), class_name=class_name,
             conids=tuple(case.conids), bar_size=case.bar_size, order_notional=float(cost["order_notional"]),
             account_equity=float(cost["account_equity"]),
             max_gross_allocation=float(cost["max_gross_allocation"]),
-            regular_session_calendar=SHADOW_CALENDAR)          # the bars the evaluation backtested
+            regular_session_calendar=SHADOW_CALENDAR,          # the bars the evaluation backtested
+            authored_digest=authored_digest_of_path(path) if authored else None,
+            sandbox_socket=self._paths.sandbox_socket if authored else None)

@@ -43,6 +43,7 @@ from trader.research.rulesets.paper_v1 import PAPER_V1
 from trader.research.schema import DatasetManifestRepository
 from trader.research.statistics import annualized_sharpe_ci, profit_factor
 from trader.research.validation import ValidationPlan, generate_walk_forward
+from trader.sandbox.protocol import RESEARCH_SOCKET
 
 COST_MULTIPLIERS = (1.0, 1.5, 2.0)
 # The image a run used is provenance (the report records it), not identity:
@@ -63,6 +64,10 @@ class EvaluationPaths:
     repo_root: Path
     reports_dir: Path
     summaries_dir: Path
+    # The research sandbox socket an authored strategy runs behind (Plan 4 ruling 13).
+    sandbox_socket: str = RESEARCH_SOCKET
+    # The build of the STARTED report, set by the authored evaluator only (pre-flight F7).
+    sandbox_image_digest: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -87,10 +92,29 @@ class PointResult:
     outcomes: dict = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class TrialDenominator:
+    """The multiple-testing denominator of one strategy key: the trials it counts and their Sharpes."""
+    count: int
+    sharpes: tuple[float, ...]
+
+
+def trial_denominator(registry: ExperimentRegistry, spec: EvaluationSpec,
+                      authored_judged_count: int = 0) -> TrialDenominator:
+    """A catalogue key counts its own trials. An authored key also counts every authored file the trader has
+    judged (SP3 spec 7.7, Plan 4 ruling 12)."""
+    if spec.authored_digest is None and authored_judged_count:
+        raise ValueError("a judged authored count belongs to an authored key only")
+    own = registry.strategy_trials(spec.strategy_path, spec.class_name)
+    sharpes = tuple(t.metrics['daily_sharpe'] for t in own
+                    if isinstance(t.metrics.get('daily_sharpe'), (int, float)))
+    return TrialDenominator(authored_judged_count + len(own), sharpes)
+
+
 def evaluate(spec: EvaluationSpec, *, research_db: Any, paths: EvaluationPaths,
              now: Callable[[], dt.datetime], max_workers: int = 1,
              ruleset: Ruleset = PAPER_V1) -> EvaluationResult:
-    repository_commit = _repository_commit(paths.repo_root, spec.strategy_file)
+    repository_commit = _commit_of(spec, paths.repo_root)
     registry = ExperimentRegistry(research_db)
     plan = generate_walk_forward((spec.period_start, spec.period_end), n_folds=spec.folds,
                                  embargo=spec.embargo_sessions, holdout=spec.holdout_sessions,
@@ -113,8 +137,7 @@ def evaluate(spec: EvaluationSpec, *, research_db: Any, paths: EvaluationPaths,
                              rerun_existing=False) for point in neighbour_points(spec)]
     context = point_market_context(spec, plan, main, benchmark_closes, bars)
     evidence = _walk_forward_evidence(
-        spec, main, neighbours, registry.strategy_trials(spec.strategy_path, spec.class_name),
-        context.regimes, context.liquidity)
+        spec, main, neighbours, trial_denominator(registry, spec), context.regimes, context.liquidity)
     gate = ev.pre_holdout_outcome(evaluate_eligibility(ruleset, evidence))
     finish = dict(family_id=family_id, main=main, neighbours=neighbours,
                   market_context=context.market_context, missing_causes=context.missing_causes)
@@ -141,7 +164,9 @@ def run_environment(spec: EvaluationSpec, paths: EvaluationPaths) -> RunEnvironm
         strategy_file=str(spec.strategy_file), class_name=spec.class_name,
         conids=tuple(spec.conids), bar_size=spec.bar_size, order_notional=spec.order_notional,
         account_equity=spec.account_equity, max_gross_allocation=spec.max_gross_allocation,
-        regular_session_calendar=spec.calendar)
+        regular_session_calendar=spec.calendar, authored_digest=spec.authored_digest,
+        sandbox_socket=None if spec.authored_digest is None else paths.sandbox_socket,
+        sandbox_image_digest=None if spec.authored_digest is None else paths.sandbox_image_digest)
 
 
 @dataclass(frozen=True)
@@ -325,6 +350,22 @@ def _dependency_lock_digest(repo_root: Path) -> str:
     return 'unknown'
 
 
+# An authored file is not in git; its digest pins it (the family's source digest).
+AUTHORED_COMMIT = 'authored'
+
+
+def _commit_of(spec: EvaluationSpec, repo_root: Path) -> str:
+    if spec.authored_digest is not None:
+        return AUTHORED_COMMIT
+    return _repository_commit(repo_root, spec.strategy_file)
+
+
+def _source_digest(spec: EvaluationSpec) -> str:
+    if spec.authored_digest is not None:
+        return spec.authored_digest.removeprefix('sha256:')
+    return compute_strategy_hash(str(spec.strategy_file))
+
+
 def _repository_commit(repo_root: Path, strategy_file: Path) -> str:
     """The last commit that touched the strategy file.
 
@@ -352,7 +393,7 @@ def _family(spec: EvaluationSpec, manifest_digest: str, repository_commit: str,
     return ExperimentFamily(
         strategy_path=spec.strategy_path, class_name=spec.class_name,
         repository_commit=repository_commit,
-        source_tree_digest=compute_strategy_hash(str(spec.strategy_file)),
+        source_tree_digest=_source_digest(spec),
         dependency_lock_digest=_dependency_lock_digest(paths.repo_root),
         container_digest=FAMILY_CONTAINER_DIGEST,
         dataset_manifest_digest=manifest_digest,
@@ -470,7 +511,7 @@ def _run_point(registry: ExperimentRegistry, family_id: str, env: RunEnvironment
 
 
 def _walk_forward_evidence(spec: EvaluationSpec, main: PointResult,
-                           neighbours: Sequence[PointResult], strategy_trials,
+                           neighbours: Sequence[PointResult], trials: TrialDenominator,
                            regimes: mcx.RegimeEvidence,
                            liquidity: mcx.LiquidityEnvelope) -> EligibilityEvidence:
     trips = {m: _round_trips(main.outcomes[m]) for m in COST_MULTIPLIERS}
@@ -478,8 +519,6 @@ def _walk_forward_evidence(spec: EvaluationSpec, main: PointResult,
     returns = ev.session_returns([o.equity_series() for o in main.outcomes[1.0]],
                                  starting_equity=spec.account_equity)
     sharpe_ci = annualized_sharpe_ci(returns, periods_per_year=ev.TRADING_DAYS_PER_YEAR, seed=0)
-    trial_sharpes = [t.metrics['daily_sharpe'] for t in strategy_trials
-                     if isinstance(t.metrics.get('daily_sharpe'), (int, float))]
     return EligibilityEvidence(
         n_round_trips=len(baseline),
         n_instruments=len(set(spec.conids)),
@@ -487,7 +526,7 @@ def _walk_forward_evidence(spec: EvaluationSpec, main: PointResult,
         expectancy_bps_1_5x=ev.dollar_weighted_expectancy_bps(trips[1.5]),
         expectancy_bps_2x=ev.dollar_weighted_expectancy_bps(trips[2.0]),
         selection_adjusted_confidence=ev.selection_confidence(
-            returns, n_trials=len(strategy_trials), trial_sharpes=trial_sharpes),
+            returns, n_trials=trials.count, trial_sharpes=list(trials.sharpes)),
         annualized_sharpe_ci_low=None if sharpe_ci is None else sharpe_ci.low,
         profit_factor=profit_factor([rt.pnl for rt in baseline]) if baseline else None,
         walk_forward_positive_fraction=ev.positive_fold_fraction(main.metrics['fold_net_pnls']),

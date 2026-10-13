@@ -11,12 +11,14 @@ import exchange_calendars as xcals
 import pandas as pd
 from pydantic import ValidationError
 
+from trader.authored.keys import is_authored_key, parse_authored_key
 from trader.research.evaluation_data import BarsMissing, EvaluationDataError, require_bars_available
 from trader.research.evaluation_request import EvaluationRequestBody, evaluation_request_id
 from trader.research.evaluation_spec import (MIN_INSTRUMENTS, EvaluationSpec, EvaluationSpecError,
                                              build_evaluation_spec, declared_tunables)
 from trader.research.neighbours import NEIGHBOUR_SHARE, neighbours_of  # noqa: F401  re-exported
-from trader.research.strategy_key import split_strategy_key
+from trader.research.service_config import authored_walk_forward
+from trader.research.strategy_key import split_evaluation_key
 from trader.research.validation import generate_walk_forward
 
 
@@ -77,6 +79,17 @@ def _file_hash(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _require_point_names(index: int, point: Mapping[str, Any], tunables: set, *, every_name: bool) -> None:
+    """A catalogue point may leave a tunable at its class value. An authored point may not: the sandbox runs on
+    exactly the OPEN params, so every point names point 0's tunables (Plan 4 ruling 5)."""
+    extra = sorted(set(point) - tunables)
+    if extra:
+        raise RequestRefused("COHORT_POINT_INVALID", f"point {index}: not tunables {extra}")
+    missing = sorted(tunables - set(point)) if every_name else []
+    if missing:
+        raise RequestRefused("COHORT_POINT_INVALID", f"point {index}: leaves out the tunables {missing} of point 0")
+
+
 def _require_bars(history_db: str, base: EvaluationSpec) -> None:
     try:
         require_bars_available(history_db, base)
@@ -88,7 +101,11 @@ def _require_bars(history_db: str, base: EvaluationSpec) -> None:
 
 def build_cohort_spec(body: EvaluationRequestBody, *, config: Any, judge: Any, universe_accessor: Any,
                       costs_config: Any, repo_root: Path, registry: Any, history_db: str) -> CohortSpec:
-    if not judge.allows(body.strategy_key):
+    authored_digest = parse_authored_key(body.strategy_key)[0] if is_authored_key(body.strategy_key) else None
+    if authored_digest is not None:
+        config = authored_walk_forward(config)          # owner ruling: 302 recent sessions, SP2c proportions
+    # An authored key is claimed under the owner switch, not the allowlist (Plan 4 ruling 5).
+    if authored_digest is None and not judge.allows(body.strategy_key):
         raise RequestRefused("STRATEGY_NOT_ALLOWED", f"{body.strategy_key} is not on the allowlist")
     cohort = [dict(point) for point in body.cohort]
     if len(cohort) > judge.max_cohort_points:
@@ -98,7 +115,7 @@ def build_cohort_spec(body: EvaluationRequestBody, *, config: Any, judge: Any, u
     neighbours = tuple(neighbours_of(point) for point in cohort)
     if not all(neighbours):
         raise RequestRefused("COHORT_POINT_INVALID", "every point needs a numeric tunable for its neighbours")
-    path, class_name = split_strategy_key(body.strategy_key)
+    path, class_name = split_evaluation_key(body.strategy_key)
     try:
         start, end = evaluation_period(dt.date.fromisoformat(body.research_day), config)
     except ValueError as exc:                    # the XNYS calendar does not reach back that far
@@ -115,13 +132,12 @@ def build_cohort_spec(body: EvaluationRequestBody, *, config: Any, judge: Any, u
            "max_gross_allocation": config.max_gross_allocation}
     try:
         base = build_evaluation_spec(raw, universe_accessor=universe_accessor, costs_config=costs_config,
-                                     repo_root=repo_root)
+                                     repo_root=repo_root, authored_digest=authored_digest)
     except EvaluationSpecError as exc:
         raise RequestRefused("SPEC_INVALID", str(exc)) from None
-    tunables = declared_tunables(base.strategy_file, base.class_name)
+    tunables = set(first) if authored_digest else declared_tunables(base.strategy_file, base.class_name)
     for index, point in enumerate(cohort[1:], start=1):
-        if set(point) - tunables:
-            raise RequestRefused("COHORT_POINT_INVALID", f"point {index}: not tunables {sorted(set(point) - tunables)}")
+        _require_point_names(index, point, tunables, every_name=authored_digest is not None)
     try:
         plan = generate_walk_forward((base.period_start, base.period_end), n_folds=base.folds,
                                      embargo=base.embargo_sessions, holdout=base.holdout_sessions,
@@ -132,4 +148,5 @@ def build_cohort_spec(body: EvaluationRequestBody, *, config: Any, judge: Any, u
                           pd.Timestamp(plan.holdout.start).date())
     _require_bars(history_db, base)
     return CohortSpec(request_id=evaluation_request_id(body), body=body, strategy_key=body.strategy_key,
-                      base=base, cohort=tuple(cohort), neighbours=neighbours, file_hash=_file_hash(base.strategy_file))
+                      base=base, cohort=tuple(cohort), neighbours=neighbours,
+                      file_hash=authored_digest or _file_hash(base.strategy_file))

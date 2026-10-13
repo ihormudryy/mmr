@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import os
+import pickle
 import shutil
 import socket
 import struct
@@ -250,6 +251,7 @@ def test_a_digest_mismatch_is_a_fault_with_its_code(stack):
     with pytest.raises(SandboxFault) as exc:
         SandboxClient(stack.live).open_session("sha256:" + "a" * 64, "Counter", {}, "1 min", [C1])
     assert exc.value.code == p.SANDBOX_DIGEST_MISMATCH
+    assert exc.value.image_digest == SandboxClient(stack.live).ping().image_digest   # the build that answered
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
@@ -639,3 +641,10 @@ def test_a_live_open_that_is_not_a_count_is_unknown(fake, live_open):
                       "free": 1, "size": 3, "posture": {}, "live_open": live_open})
 
     assert SandboxClient(fake(pong).path).ping().live_open is None
+
+
+def test_a_sandbox_fault_survives_pickling_with_its_code():
+    # A research worker process raises it through the pool (Task 3 review).
+    restored = pickle.loads(pickle.dumps(SandboxFault("a", code="SANDBOX_ERROR")))
+    assert (type(restored), restored.code, restored.detail, str(restored)) == (
+        SandboxFault, "SANDBOX_ERROR", "a", "SANDBOX_ERROR: a")

@@ -21,7 +21,7 @@ from trader.research.review import (
     REVIEW_NARRATIVE_FIELDS, OperatorReview, OperatorReviewRepository, ReviewConflict,
 )
 from trader.research.rulesets.paper_v1 import PAPER_V1
-from trader.research.strategy_key import split_strategy_key
+from trader.research.strategy_key import authored_digest_of_path, is_authored_path, split_evaluation_key
 from trader.messaging.typed_rpc import TypedRpcRemoteError
 from trader.research.trader_port import TraderUnavailable
 
@@ -190,7 +190,7 @@ class JudgmentAttest:
         family = None if artifact is None else registry.get_family(artifact.family_id)
         if artifact is None or family is None:
             raise _Refused("JUDGMENT_MISMATCH", "the case names an artifact the registry does not have")
-        path, class_name = split_strategy_key(case.strategy_key)
+        path, class_name = split_evaluation_key(case.strategy_key)
         protocol = family.validation_protocol
         bound = (artifact.family_id == case.family_id
                  and dict(artifact.selected_parameters) == dict(case.selected_params)
@@ -200,13 +200,22 @@ class JudgmentAttest:
                  and artifact.holdout_opened is True and artifact.holdout_passed is True)
         if not bound:
             raise _Refused("JUDGMENT_MISMATCH", "the case and the registry name different bindings")
+        self._require_judged_source(path, case.strategy_file_hash)
+        return artifact
+
+    def _require_judged_source(self, path: str, file_hash: str) -> None:
+        """The judged bytes are still the strategy. An authored file is content-addressed: its path names its
+        digest, and research holds no store to read (Plan 4 ruling 23)."""
+        if is_authored_path(path):
+            if authored_digest_of_path(path) != file_hash:
+                raise _Refused("STRATEGY_SOURCE_CHANGED", "the authored file is not the evaluated one")
+            return
         try:
             current = (Path(self._repo_root) / path).read_bytes()
         except OSError:
             raise _Refused("STRATEGY_SOURCE_CHANGED", "the strategy file is no longer readable") from None
-        if "sha256:" + hashlib.sha256(current).hexdigest() != case.strategy_file_hash:
+        if "sha256:" + hashlib.sha256(current).hexdigest() != file_hash:
             raise _Refused("STRATEGY_SOURCE_CHANGED", "the strategy file changed after the evaluation")
-        return artifact
 
     def _review(self, case: Any, judgment: Mapping[str, Any], artifact: Any) -> OperatorReview:
         body = judgment.get("body")

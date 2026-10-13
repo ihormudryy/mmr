@@ -43,7 +43,11 @@ def ai_instance_name(version_digest: str) -> str:
 
 
 def source_unchanged(instance: Any) -> bool:
-    """True while the file on disk still hashes to the digest the instance was loaded from."""
+    """True while the instance still runs the judged bytes. An authored instance answers itself (its file is in
+    the sandbox's store, not here); any other re-hashes its file on disk."""
+    authored_binding_intact = getattr(instance, "authored_binding_intact", None)
+    if authored_binding_intact is not None:
+        return authored_binding_intact()
     current = compute_strategy_hash(getattr(instance, "ai_source_path", ""))
     return bool(current) and hmac.compare_digest("sha256:" + current, instance.ai_source_digest)
 
@@ -73,7 +77,8 @@ class AiDeploymentSource:
                 logging.info("unloading AI deployment %s: no longer active", name)
                 self._runtime.unload_strategy(name)
             elif not source_unchanged(instance):
-                logging.error("unloading AI deployment %s: its file changed after load", name)
+                logging.error("unloading AI deployment %s: it no longer runs the judged bytes (its file "
+                              "changed after load, or its authored strategy faulted)", name)
                 self._runtime.unload_strategy(name)
         for name, deployment in wanted.items():
             if self._runtime.get_strategy(name) is None and not self._runtime.load_ai_deployment(deployment):

@@ -124,13 +124,13 @@ class SignalHold:
     """
 
     def __init__(self, *, dispatch: Callable[[HeldSignal], None],
-                 block_reason: Callable[[Any], Optional[str]],
+                 block_reason: Callable[[HeldSignal], Optional[str]],
                  latest_bar_time: Callable[[HeldSignal], Optional[dt.datetime]],
                  recorded_ids: Callable[[List[str]], frozenset],
                  write_gap: Callable[[str, int, dict], None],
                  capacity: int = MAX_HELD_SIGNALS):
         self._dispatch = dispatch            # raises SignalRecordWriteFailed when the record write failed
-        self._block_reason = block_reason    # why a strategy may no longer act, or None
+        self._block_reason = block_reason    # why a held signal's strategy may no longer act on it, or None
         self._latest_bar_time = latest_bar_time   # newest completed bar of the signal's (conId, bar size), or None
         self._recorded_ids = recorded_ids    # which source_event_ids the signal record already holds
         self._write_gap = write_gap
@@ -151,13 +151,24 @@ class SignalHold:
         with self._dispatch_lock:
             self._disables[strategy_name] = self._disables.get(strategy_name, 0) + 1
 
+    def disables_of(self, strategy_name: str) -> int:
+        """How many times the strategy was disabled so far: a signal compares it with the count it was decided under."""
+        with self._dispatch_lock:
+            return self._disables.get(strategy_name, 0)
+
     def held_count(self, key: tuple) -> int:
         hold = self._holds.get(key)
         return len(hold.signals) if hold else 0
 
-    def dispatch(self, key: tuple, strategy: Any, signal: Any, conid: int, frame: pd.DataFrame) -> None:
-        """Dispatch a new signal now, or queue it behind the held (or evicted, not yet written) ones."""
-        held = HeldSignal(strategy, signal, conid, frame, self._disables.get(strategy.name, 0))
+    def dispatch(self, key: tuple, strategy: Any, signal: Any, conid: int, frame: pd.DataFrame,
+                 disables_when_decided: Optional[int] = None) -> None:
+        """Dispatch a new signal now, or queue it behind the held (or evicted, not yet written) ones.
+
+        ``disables_when_decided`` is the ``disables_of`` count when the bar was handed to another thread to
+        decide; a disable since then makes the signal a STRATEGY_DISABLED gap. None: decided just now."""
+        if disables_when_decided is None:
+            disables_when_decided = self._disables.get(strategy.name, 0)
+        held = HeldSignal(strategy, signal, conid, frame, disables_when_decided)
         hold = self._holds.get(key)
         if hold is not None:
             self._enqueue(key, hold, held)
@@ -244,7 +255,7 @@ class SignalHold:
     def _why_blocked(self, held: HeldSignal) -> Optional[str]:
         if self._disables.get(held.strategy.name, 0) != held.disables_when_held:
             return STRATEGY_DISABLED
-        return self._block_reason(held.strategy) or self._staleness(held)
+        return self._block_reason(held) or self._staleness(held)
 
     def _staleness(self, held: HeldSignal) -> Optional[str]:
         latest = self._latest_bar_time(held)

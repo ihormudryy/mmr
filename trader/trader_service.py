@@ -456,6 +456,33 @@ async def _orphan_reservation_loop(
         interval=interval, stuck_after=stuck_after)
 
 
+# How often the dashboard's risk view is recomputed (#169). An unchanged view is not journaled again.
+_RISK_PROJECTION_INTERVAL_SECONDS = 15.0
+
+
+async def _risk_projection_tick(producer):
+    """One recompute off the trader loop and off the liquidation worker: it reads the broker snapshot and the
+    history database for correlations, and never sends anything."""
+    return await asyncio.to_thread(producer.flush_projection)
+
+
+async def _risk_projection_loop(
+    producer, *, interval: float = _RISK_PROJECTION_INTERVAL_SECONDS,
+    stuck_after: float = _WORKER_STUCK_AFTER_SECONDS,
+) -> None:
+    await _watched_ticks('risk projection refresh', lambda: _risk_projection_tick(producer),
+                         interval=interval, stuck_after=stuck_after)
+
+
+def _maybe_start_risk_projection(
+    trader: Trader, loop: AbstractEventLoop, stopping: Callable[[], bool] = _never_stopping,
+) -> None:
+    producer = getattr(trader, 'risk_producer', None)
+    if producer is None or stopping():
+        return
+    loop.create_task(_risk_projection_loop(producer))
+
+
 def _maybe_start_orphan_reservation_sweep(
     trader: Trader, loop: AbstractEventLoop, worker, stopping: Callable[[], bool] = _never_stopping,
 ) -> None:
@@ -612,6 +639,7 @@ def main(simulation: bool,
         # SP1 Plan 5: after session and kill recovery, so their terminal rows are visible to it.
         _maybe_start_scoreboard(trader, loop, stopping)
         _maybe_start_orphan_reservation_sweep(trader, loop, liquidation_worker, stopping)
+        _maybe_start_risk_projection(trader, loop, stopping)
         if stopping():
             _finish_startup_shutdown(loop, shutdown)
             logging.info('shutdown requested during startup recovery; not starting the trader loop')

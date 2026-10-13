@@ -926,3 +926,12 @@ def test_a_real_late_entry_fill_after_a_partial_then_a_full_close_starts_a_new_s
     assert _late_roots(composed) == ["p-1-late-1"]
     assert composed.sim.placed[placed:] == [("p-1-late-1-reduce-265598-1", "MKT", "SELL", 6.0, None, None)]
     assert composed.liquidation.root_for("entry-1") is None
+
+
+def test_cold_start_publishes_the_dashboard_risk_projection(composed):            # #169
+    assert composed.trader.risk_producer.flush_projection() is None      # no complete broker snapshot yet
+    composed.sim.promote()
+    event = composed.trader.risk_producer.flush_projection()
+    assert event is not None and event.entity_type == "risk"
+    assert event.entity_id.startswith("projection:")
+    assert {"net_liquidation", "warnings", "limits"} <= set(event.payload)

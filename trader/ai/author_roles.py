@@ -39,6 +39,10 @@ AUTHOR_RULES = (
     "memoryview, format; no read_*, to_* (except to_numpy), load, save, query or pickle.",
     "Module level: imports, constant assignments and exactly one class that subclasses AuthoredStrategy.",
     "No global, nonlocal, async, yield, decorators, lambdas with defaults, try or except.",
+    "Keep no state between bars: decide from history and params only. No attribute assignment anywhere "
+    "(no self.x = ..., no df.name = ...; use rename). Class-level values are constants or arithmetic on them; "
+    "module-level values and function defaults contain no list, dict, set or call. The class body holds only "
+    "constants and methods.",
     "Bind each tunable constant once in the class body: no bare annotation (NAME: int) before it and no second "
     "assignment, or it is not a tunable.",
     f"Every tunable minimum, maximum and default lies within -{MAX_TUNABLE_ABS:g} and {MAX_TUNABLE_ABS:g}.",

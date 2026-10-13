@@ -767,6 +767,7 @@ class _ScriptedEscape:
     """Stands in for a forked child running an escape. It never runs the escape's code: it only gives the
     fault the real child gives, or hangs until it is killed."""
     pid = -1
+    lookback = 50
 
     def __init__(self, detail):
         self._detail = detail
@@ -784,6 +785,7 @@ class _ScriptedEscape:
 
 class _BenignChild:
     pid = -1
+    lookback = 50
 
     def __init__(self, spec):
         self._runtime = ChildRuntime(source=spec.source, class_name=spec.class_name, params=spec.params,
@@ -801,6 +803,7 @@ class _ScriptedProbe:
     """Stands in for a forked child running a property probe: it answers BUY, as the real one does when the
     property holds, with its slot uid in the probability (writes_own_slot). It never runs the probe's code."""
     pid = -1
+    lookback = 50
 
     def __init__(self, slot_uid):
         self._slot_uid = slot_uid

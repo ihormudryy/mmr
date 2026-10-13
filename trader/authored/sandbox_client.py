@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping, Optional, Sequence
 
-from trader.authored.api import Decision
+from trader.authored.api import MAX_LOOKBACK_BARS, MIN_LOOKBACK_BARS, Decision
 from trader.sandbox import protocol as proto
 
 _HEADER = struct.Struct(">I")
@@ -109,14 +109,15 @@ class SandboxClient:
         try:
             reply = _exchange(sock, request, self._reply_timeout)
             _raise_for(reply)
-            session_id, image_digest = reply.get("session"), reply.get("image_digest")
+            session_id, image_digest, lookback = reply.get("session"), reply.get("image_digest"), reply.get("lookback")
             if (reply.get("type") != "OPENED" or not isinstance(image_digest, str)
-                    or not isinstance(session_id, str) or not proto.SESSION_RE.fullmatch(session_id)):
+                    or not isinstance(session_id, str) or not proto.SESSION_RE.fullmatch(session_id)
+                    or type(lookback) is not int or not MIN_LOOKBACK_BARS <= lookback <= MAX_LOOKBACK_BARS):
                 raise SandboxUnavailable(f"unexpected reply to OPEN: {reply!r}")
         except BaseException:
             sock.close()
             raise
-        return SandboxSession(sock, session_id, tuple(request["conids"]), image_digest, self._reply_timeout)
+        return SandboxSession(sock, session_id, tuple(request["conids"]), image_digest, lookback, self._reply_timeout)
 
     def _connect(self) -> socket.socket:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -136,13 +137,14 @@ class SandboxSession:
     raises SandboxProtocolError. A refused bar (SandboxProtocolError) leaves it usable."""
 
     def __init__(self, sock: socket.socket, session_id: str, conids: tuple[int, ...],
-                 image_digest: str, reply_timeout_s: float):
+                 image_digest: str, lookback: int, reply_timeout_s: float):
         self._sock = sock
         self._id = session_id
         self._reply_timeout = reply_timeout_s
         self._is_open = True
         self.conids = conids
         self.image_digest = image_digest     # the build this session runs on, from OPENED (ruling 29)
+        self.lookback = lookback             # the class's LOOKBACK_BARS, from OPENED: what warms a session (#164)
 
     def bar(self, conid: int, t: datetime, open: float, high: float, low: float, close: float,
             volume: float) -> Decision | None:

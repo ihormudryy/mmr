@@ -630,7 +630,8 @@ def test_a_handle_refuses_a_pid_that_is_not_one_child(pid, monkeypatch):
     left, right = socket.socketpair()
     with left, right:
         with pytest.raises(ValueError, match="pid"):
-            child_module._ForkedChild(pid=pid, pipe=child_module._ChildPipe(sock=right, reply_timeout_s=1.0))
+            child_module._ForkedChild(pid=pid, pipe=child_module._ChildPipe(sock=right, reply_timeout_s=1.0),
+                                         lookback=50)
 
 
 def _handle_with_fake_process(monkeypatch, kill=None):
@@ -648,7 +649,8 @@ def _handle_with_fake_process(monkeypatch, kill=None):
     monkeypatch.setattr(child_module.os, "kill", fake_kill)
     monkeypatch.setattr(child_module.os, "waitpid", fake_waitpid)
     left, right = socket.socketpair()
-    handle = child_module._ForkedChild(pid=4242, pipe=child_module._ChildPipe(sock=right, reply_timeout_s=1.0))
+    handle = child_module._ForkedChild(pid=4242, pipe=child_module._ChildPipe(sock=right, reply_timeout_s=1.0),
+                                         lookback=50)
     return handle, calls, left, right
 
 
@@ -725,7 +727,7 @@ def _spec(**overrides):
 def test_the_child_exits_non_zero_after_a_bar_fault(bar_request):
     parent, child, thread, result = _serve_in_thread(_spec())
     with parent, child:
-        assert child_module.recv_frame(parent, timeout_s=5) == {"ok": True}
+        assert child_module.recv_frame(parent, timeout_s=5) == {"ok": True, "lookback": 3}
         child_module.send_frame(parent, bar_request)
         assert child_module.recv_frame(parent, timeout_s=5)["ok"] is False
         thread.join(5)
@@ -743,7 +745,7 @@ def test_the_child_exits_non_zero_after_a_load_fault():
 def test_the_child_exits_zero_on_close():
     parent, child, thread, result = _serve_in_thread(_spec())
     with parent, child:
-        assert child_module.recv_frame(parent, timeout_s=5) == {"ok": True}
+        assert child_module.recv_frame(parent, timeout_s=5) == {"ok": True, "lookback": 3}
         child_module.send_frame(parent, {"type": "CLOSE"})
         thread.join(5)
     assert result["code"] == 0
@@ -1064,3 +1066,15 @@ def test_the_reset_restores_default_handlers_and_clears_the_wakeup_fd():
                          capture_output=True, text=True, timeout=60, check=True).stdout
     assert json.loads(out) == {"term": True, "int": True, "usr1": True, "pipe_still_ignored": True,
                                "wakeup_fd": -1}
+
+
+@pytest.mark.parametrize("reply", [{"ok": True}, {"ok": True, "lookback": 0}, {"ok": True, "lookback": True},
+                                   {"ok": True, "lookback": 51}, {"ok": True, "lookback": 2001},
+                                   {"ok": True, "lookback": 7.0}])
+def test_a_load_reply_without_a_valid_lookback_is_the_strategys_fault(reply):    # #164
+    with pytest.raises(child_module.ChildError, match="no valid lookback"):
+        child_module.lookback_from_load_reply(reply, ceiling=50)
+
+
+def test_a_load_reply_gives_its_lookback():
+    assert child_module.lookback_from_load_reply({"ok": True, "lookback": 50}, ceiling=2000) == 50

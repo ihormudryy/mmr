@@ -140,6 +140,8 @@ class _Checker(ast.NodeVisitor):
             self.add("banned_name", node, f"attribute {node.attr}")
         if _is_io_attribute(node.attr):
             self.add("io_attribute", node, f"attribute {node.attr}")
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            self.add("keeps_state", node, f"assignment to attribute {node.attr}")
         root = self._chain_root(node)
         if isinstance(root, ast.Name) and root.id in self.module_aliases:
             self._check_module_chain(node, root.id)
@@ -221,6 +223,9 @@ class _Checker(ast.NodeVisitor):
         self._check_identifier(node, node.name)
         self._check_binding(node, node.name)
         self._check_no_decorator_or_type_params(node)
+        for default in [*node.args.defaults, *node.args.kw_defaults]:
+            if default is not None and not _is_immutable_literal(default):
+                self.add("keeps_state", default, f"default of {node.name} must be an immutable literal")
         self.generic_visit(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
@@ -402,6 +407,52 @@ def _has_literal_value(statement: ast.Assign | ast.AnnAssign) -> bool:
     return True
 
 
+def _is_immutable_literal(node: ast.expr) -> bool:
+    """A literal that no later bar can change: no list, dict or set anywhere inside it (#164)."""
+    try:
+        ast.literal_eval(node)
+    except _LITERAL_EVAL_ERRORS:
+        return False
+    return not any(isinstance(inner, (ast.List, ast.Dict, ast.Set, ast.Call)) for inner in ast.walk(node))  # set() too
+
+
+# What a class constant may be built from: constants, names and operators, so ``WINDOW * 10`` passes and no call,
+# list, dict, set or comprehension can leave a mutable object on the class.
+_CLASS_CONSTANT_NODES = (ast.Constant, ast.Name, ast.Load, ast.Tuple, ast.BinOp, ast.UnaryOp, ast.BoolOp,
+                         ast.Compare, ast.IfExp, ast.Attribute, ast.Subscript, ast.Slice, ast.operator,
+                         ast.unaryop, ast.boolop, ast.cmpop)
+
+
+def _check_module_assignment(statement: ast.Assign | ast.AnnAssign, checker: _Checker) -> None:
+    if not _has_literal_value(statement):
+        checker.add("module_statement", statement, "module-level assignment must have a literal value")
+    elif not _is_immutable_literal(statement.value):
+        checker.add("keeps_state", statement, "module-level value must be immutable (no list, dict or set)")
+
+
+def _check_class_assignment(statement: ast.Assign | ast.AnnAssign, checker: _Checker) -> None:
+    if statement.value is None:
+        return                                          # an annotation alone binds nothing
+    for inner in ast.walk(statement.value):
+        if not isinstance(inner, _CLASS_CONSTANT_NODES):
+            checker.add("keeps_state", statement,
+                        f"class-level value may use only constants, names and operators, not {type(inner).__name__}")
+            return
+
+
+def _check_class_body(statement: ast.ClassDef, checker: _Checker) -> None:
+    """The class keeps no state between bars (#164): constants and methods only."""
+    body = statement.body
+    if (body and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str)):
+        body = body[1:]                                 # a class docstring is allowed
+    for inner in body:
+        if isinstance(inner, (ast.Assign, ast.AnnAssign)):
+            _check_class_assignment(inner, checker)
+        elif not isinstance(inner, (ast.FunctionDef, ast.Pass)):
+            checker.add("class_statement", inner, f"class-level {type(inner).__name__}")
+
+
 def _check_module_shape(tree: ast.Module, checker: _Checker) -> None:
     classes = 0
     body = tree.body
@@ -414,13 +465,12 @@ def _check_module_shape(tree: ast.Module, checker: _Checker) -> None:
         if isinstance(statement, (ast.Import, ast.ImportFrom)):
             continue
         if isinstance(statement, (ast.Assign, ast.AnnAssign)):
-            if not _has_literal_value(statement):
-                checker.add("module_statement", statement,
-                            "module-level assignment must have a literal value")
+            _check_module_assignment(statement, checker)
             continue
         if isinstance(statement, ast.ClassDef):
             classes += 1
             _check_class_shape(statement, base_imported, checker)
+            _check_class_body(statement, checker)
             continue
         checker.add("module_statement", statement,
                     f"module-level {type(statement).__name__}")

@@ -194,6 +194,11 @@ is `os`, `sys`, `subprocess` or `builtins`. Also refused, with
   one class that subclasses `AuthoredStrategy`;
 - `global` / `nonlocal`, `async`, `yield`, decorators, lambdas with defaults,
   `try` / `except`;
+- state kept between bars (rule `keeps_state`, owner ruling 2026-10-13, #164):
+  any attribute assignment or deletion; a module-level value or function default
+  holding a list, dict, set or call; a class-level value built from anything but
+  constants, names and operators; a class body holding anything but constants
+  and methods (`class_statement`);
 - a file over 20 KB, or one that does not parse.
 
 ### 7.3 Store, records and the cap (trader)
@@ -293,8 +298,8 @@ Protocol, frames of 4-byte length plus JSON, `"v": 1`:
 
 | Request | Reply |
 |---|---|
-| `OPEN {digest, class, params, bar_size, conids}` | `OPENED {session, image_digest}` or `ERROR {code}` |
-| `OPEN_PROBE {kind, name, conids}` (isolation checks only, 14) | `OPENED {session, image_digest}` or `ERROR {code}` |
+| `OPEN {digest, class, params, bar_size, conids}` | `OPENED {session, image_digest, lookback}` or `ERROR {code}` |
+| `OPEN_PROBE {kind, name, conids}` (isolation checks only, 14) | `OPENED {session, image_digest, lookback}` or `ERROR {code}` |
 | `BAR {session, conid, t, open, high, low, close, volume}` | `SIGNAL {session, conid, t, action, probability}` (action may be null) |
 | `CLOSE {session}` | `CLOSED` |
 | `PING` | `PONG {image_digest (the build id), posture, live_open, ...}` |
@@ -556,3 +561,17 @@ with the plan rulings.
   above the 4 h planning line; the owner accepted it on 2026-10-12, as it fits
   the ~15 h overnight window. Catalogue strategies keep the full SP2c length.
   The sandbox is not weakened.
+
+## 15. Amendment (2026-10-13, owner ruling on #164)
+
+- **Warm-up.** A new live session is warmed with the class's own
+  `LOOKBACK_BARS`, not 2000 bars. The child reports it after the class loads;
+  `OPENED` carries it as `lookback` (1 to 2000), and the client refuses an
+  `OPENED` without a valid one as `SANDBOX_UNAVAILABLE`. The proof is still read
+  before every `BAR`, so the proof reads at an open drop by the same factor
+  (default 200 bars: about 90 %).
+- **No state between bars.** The static check (7.2, rule `keeps_state`) refuses
+  every way a file could carry state from one bar to the next, so a decision
+  depends only on the last `LOOKBACK_BARS` bars and `params`. The child already
+  hands `on_bar` a fresh `history` frame and read-only `params` per bar. With
+  both, a shorter warm-up decides the last bar exactly as a longer one would.

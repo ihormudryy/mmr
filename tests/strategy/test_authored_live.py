@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 from tests.authored.fake_sandbox import FakeSandbox, caller_source, fault
+from trader.authored.streaming import BarStream
 from trader.objects import Action, BarSize
 from trader.sandbox.protocol import SANDBOX_DIGEST_MISMATCH, SANDBOX_ERROR
 from trader.strategy.authored_runtime import (DIGEST_ALARM, ISOLATION_ALARM, SANDBOX_FAULT_ALARM,
@@ -178,11 +179,14 @@ def test_bars_skipped_between_calls_are_sent_and_only_the_newest_counts():
     assert len(sandbox.sessions[0].stamps) == 23
 
 
-def test_the_warm_up_is_capped_at_the_largest_lookback():
+def test_the_warm_up_sends_the_lookback_opened_reports():                       # #164
     sandbox, faults = live_sandbox(), []
     strategy = live(sandbox, faults)
-    strategy.on_prices(bars(2100))
-    assert len(sandbox.sessions[0].stamps) == 2000
+    signal = strategy.on_prices(bars(2100))
+    assert len(sandbox.sessions[0].stamps) == sandbox.sessions[0].lookback == 50   # CountsBars.LOOKBACK_BARS
+    assert signal.probability == 50 / 10000                  # the full lookback decided the last bar
+    strategy.on_prices(bars(2101))
+    assert len(sandbox.sessions[0].stamps) == 51             # later bars stream one at a time
 
 
 def test_a_reconnect_gives_the_same_signal_as_no_drop(caplog):
@@ -542,3 +546,48 @@ def test_a_proof_withdrawn_after_the_first_bar_of_a_frame_stops_the_frame():    
     assert strategy.on_prices(bars(3)) is None
     assert len(sandbox.sessions[0].stamps_of(CONID)) == 1                  # BAR 2 and BAR 3 were never sent
     assert sandbox.open_sessions == [] and faults == []
+
+
+def with_invalid_row(frame, position):
+    frame = frame.copy()
+    frame.iloc[position, frame.columns.get_loc("low")] = frame.iloc[position]["high"] + 1.0   # high < low
+    return frame
+
+
+def research_last_decision(frame):
+    sandbox = FakeSandbox()
+    session = sandbox.open_session(sandbox.add(caller_source("short_history_buys")), "ShortHistoryBuys", {},
+                                   "1 min", (CONID,))
+    return BarStream(session, CONID).send_frame(frame)[-1]
+
+
+def test_an_invalid_row_in_the_warm_up_window_does_not_shorten_the_history():     # PR #168 review (OpenAI)
+    frame = with_invalid_row(bars(4), 1)                     # valid rows 1, 3, 4; row 2 has high < low
+    assert research_last_decision(frame) is None             # research: rows 1, 3, 4 -> a full 3-bar history
+    sandbox, faults = live_sandbox(), []
+    strategy = live(sandbox, faults, name="short_history_buys", class_name="ShortHistoryBuys")
+    assert strategy.on_prices(frame) is None
+    assert sandbox.sessions[0].stamps == [frame.index[0], frame.index[2], frame.index[3]]
+
+
+def test_a_repeated_newest_time_decides_nothing_after_a_warm_up():
+    two = bars(2)
+    frame = pd.concat([two, two.iloc[[-1]]])                 # the newest row repeats row 2's time: never sent
+    assert research_last_decision(frame) is None
+    sandbox, faults = live_sandbox(), []
+    strategy = live(sandbox, faults, name="short_history_buys", class_name="ShortHistoryBuys")
+    assert strategy.on_prices(frame) is None                 # row 2's BUY is not the newest row's decision
+    assert sandbox.sessions[0].stamps == list(two.index)
+
+
+def test_a_reconnect_warm_up_also_skips_an_invalid_row():
+    frame = with_invalid_row(bars(6), 4)
+    sandbox, faults = live_sandbox(), []
+    strategy = live(sandbox, faults, name="short_history_buys", class_name="ShortHistoryBuys")
+    strategy.on_prices(frame.iloc[:3])
+    sandbox.unavailable = True
+    assert strategy.on_prices(frame.iloc[:4]) is None
+    sandbox.unavailable = False
+    assert research_last_decision(frame) is None
+    assert strategy.on_prices(frame) is None                 # new session: rows 3, 4 and 6 (row 5 is invalid)
+    assert sandbox.sessions[-1].stamps == [frame.index[2], frame.index[3], frame.index[5]]

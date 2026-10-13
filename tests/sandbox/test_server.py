@@ -164,6 +164,7 @@ async def test_a_forged_child_reply_is_a_fault(running):
 
     class BadChild:
         pid = -1
+        lookback = 50
 
         def send_bar(self, conid, t, ohlcv):
             return {"action": "SIDEWAYS", "probability": 9.0}   # out of contract
@@ -188,6 +189,7 @@ async def test_a_forged_child_reply_is_a_fault(running):
 class _GatedChild:
     """A child whose bar blocks until the test releases it or the supervisor kills it."""
     pid = -1
+    lookback = 50
 
     def __init__(self):
         self.in_bar = threading.Event()

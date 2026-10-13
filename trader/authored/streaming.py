@@ -56,6 +56,27 @@ def bar_fields(stamp: Any, values: Sequence[Any]) -> Optional[dict]:
     return fields
 
 
+def _follows(fields: Optional[dict], last_sent: Optional[dt.datetime]) -> bool:
+    """Whether a stream that last sent ``last_sent`` sends this bar: a valid bar, strictly later."""
+    return fields is not None and (last_sent is None or fields["t"] > last_sent)
+
+
+def sendable_positions(frame: pd.DataFrame) -> list[int]:
+    """The row positions a new BarStream would send from ``frame``, in order: the bars research streams.
+
+    A live warm-up takes its last LOOKBACK_BARS from these, not from the raw rows, so an invalid or out-of-order
+    row inside the window cannot shorten the history a decision sees (PR #168 review)."""
+    positions: list[int] = []
+    last_sent: Optional[dt.datetime] = None
+    rows = frame.loc[:, list(OHLCV)].itertuples(index=False, name=None)
+    for position, (stamp, values) in enumerate(zip(frame.index, rows)):
+        fields = bar_fields(stamp, values)
+        if _follows(fields, last_sent):
+            positions.append(position)
+            last_sent = fields["t"]
+    return positions
+
+
 class BarStream:
     """One conid of a sandbox session, fed strictly in time order. A bar that cannot be sent decides nothing.
 
@@ -69,7 +90,7 @@ class BarStream:
 
     def send(self, stamp: Any, values: Sequence[Any]) -> Optional[Decision]:
         fields = bar_fields(stamp, values)
-        if fields is None or (self.last_sent is not None and fields["t"] <= self.last_sent):
+        if not _follows(fields, self.last_sent):
             return None
         decision = self.session.bar(self.conid, **fields)
         self.last_sent = fields["t"]

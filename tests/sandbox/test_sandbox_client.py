@@ -167,7 +167,7 @@ def _opened_then(script_after_open):
     def script(conn):
         request = _read_request(conn)
         assert request["type"] == "OPEN"
-        _reply(conn, {"type": "OPENED", "v": 1, "session": "s1", "image_digest": "build-x"})
+        _reply(conn, {"type": "OPENED", "v": 1, "session": "s1", "image_digest": "build-x", "lookback": 50})
         while True:
             request = _read_request(conn)
             if request["type"] == "CLOSE":
@@ -307,6 +307,7 @@ class _FailingSpawner:
 
         class _Child:
             pid = -1
+            lookback = 50
 
             def send_bar(self, conid, t, ohlcv):
                 raise bar_failure
@@ -648,3 +649,19 @@ def test_a_sandbox_fault_survives_pickling_with_its_code():
     restored = pickle.loads(pickle.dumps(SandboxFault("a", code="SANDBOX_ERROR")))
     assert (type(restored), restored.code, restored.detail, str(restored)) == (
         SandboxFault, "SANDBOX_ERROR", "a", "SANDBOX_ERROR: a")
+
+
+@pytest.mark.parametrize("lookback", [None, 0, 2001, True, 5.0, "50"])
+def test_an_opened_without_a_valid_lookback_is_unavailable(fake, lookback):       # #164
+    def script(conn):
+        _read_request(conn)
+        opened = {"type": "OPENED", "v": 1, "session": "s1", "image_digest": "build-x", "lookback": lookback}
+        _reply(conn, {key: value for key, value in opened.items() if value is not None})
+    server = fake(script)
+    with pytest.raises(SandboxUnavailable, match="unexpected reply to OPEN"):
+        SandboxClient(server.path).open_session("sha256:" + "a" * 64, "Counter", {}, "1 min", [C1])
+
+
+def test_a_session_carries_the_lookback_its_opened_reported(fake):               # #164
+    session = _open_fake_session(fake, lambda conn, request: None)
+    assert session.lookback == 50

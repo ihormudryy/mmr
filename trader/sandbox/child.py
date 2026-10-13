@@ -187,6 +187,11 @@ class ChildRuntime:
         self._skip = skip_static_check
         self._books: dict[int, _ConidBook] = {}
 
+    @property
+    def lookback(self) -> int:
+        """The bars a decision sees: the class's LOOKBACK_BARS once loaded, never above the spawn ceiling."""
+        return self._lookback
+
     def load(self) -> None:
         cls = load_authored_class(self._source, self._class_name, skip_static_check=self._skip)
         self._lookback = _class_lookback(cls, ceiling=self._lookback)
@@ -269,6 +274,15 @@ def _raise_for_child_fault(reply: Mapping[str, Any], fallback: str) -> None:
     raise ChildError(fallback)
 
 
+def lookback_from_load_reply(reply: Mapping[str, Any], ceiling: int) -> int:
+    """The LOOKBACK_BARS a loaded child reports (#164): the caller warms a session with exactly that many bars."""
+    _raise_for_child_fault(reply, "child load reply is out of contract")
+    lookback = reply.get("lookback")
+    if type(lookback) is not int or not MIN_LOOKBACK_BARS <= lookback <= min(MAX_LOOKBACK_BARS, ceiling):
+        raise ChildError("child load reply carries no valid lookback")
+    return lookback
+
+
 def signal_from_reply(reply: Mapping[str, Any]) -> dict:
     """The SIGNAL payload in a child's reply to a bar, checked against the protocol."""
     _raise_for_child_fault(reply, "child reply is out of contract")
@@ -301,6 +315,7 @@ class SpawnSpec:
 class ChildHandle(Protocol):
     """One session's child. Any ChildError from ``send_bar`` ends the session: the caller must ``close()``."""
     pid: int
+    lookback: int     # the loaded class's LOOKBACK_BARS, reported to the caller in OPENED (#164)
 
     def send_bar(self, conid: int, t: datetime, ohlcv: Mapping[str, float]) -> dict: ...
 
@@ -326,7 +341,7 @@ class ForkSpawner:
         child_sock.close()
         try:   # a child that hangs or trickles in setup or load must not block the server
             _await_setup(parent_sock, self._open_timeout)
-            _raise_for_child_fault(recv_frame(parent_sock, self._open_timeout), "child load reply is out of contract")
+            lookback = lookback_from_load_reply(recv_frame(parent_sock, self._open_timeout), spec.lookback)
         except (ChildError, OSError) as exc:
             _kill_and_reap(pid)
             parent_sock.close()
@@ -334,7 +349,8 @@ class ForkSpawner:
                 raise
             # After SETUP_OK every fault is the strategy's, even one that names a setup code: it may be forged.
             raise ChildError(getattr(exc, "detail", f"child load failed: {exc}")) from exc
-        return _ForkedChild(pid=pid, pipe=_ChildPipe(sock=parent_sock, reply_timeout_s=self._bar_timeout))
+        return _ForkedChild(pid=pid, pipe=_ChildPipe(sock=parent_sock, reply_timeout_s=self._bar_timeout),
+                            lookback=lookback)
 
 
 def _await_setup(sock: socket.socket, timeout_s: float) -> None:
@@ -490,7 +506,7 @@ def _serve_session(spec: SpawnSpec, sock: socket.socket) -> int:
     except ChildError as exc:
         send_frame(sock, {"ok": False, "detail": exc.detail})
         return _EXIT_CHILD_CRASHED
-    send_frame(sock, {"ok": True})
+    send_frame(sock, {"ok": True, "lookback": runtime.lookback})
     while True:
         try:
             request = recv_frame(sock)
@@ -567,6 +583,7 @@ class _ForkedChild:
     or a dead pipe all end the session, and only ``close()`` kills the process and frees the slot."""
     pid: int
     pipe: _ChildPipe
+    lookback: int
     reaped: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:

@@ -8,7 +8,8 @@ from tests.authored.fake_sandbox import FakeSandbox, caller_source, fault, orb_f
 from trader.authored.api import Decision
 from trader.authored.sandbox_client import SandboxFault, SandboxProtocolError, SandboxUnavailable
 from trader.authored.static_check import require_clean
-from trader.authored.streaming import AUTHORED_SIGNAL_RISK, BarStream, bar_fields, decision_signal
+from trader.authored.streaming import (AUTHORED_SIGNAL_RISK, BarStream, bar_fields, decision_signal,
+                                       sendable_positions)
 from trader.objects import Action
 from trader.sandbox.protocol import MAX_SESSION_CONIDS, SANDBOX_DIGEST_MISMATCH, SANDBOX_ERROR
 from trader.sandbox.supervisor import LIVE_POOL_SIZE, RESEARCH_POOL_SIZE
@@ -250,3 +251,14 @@ def test_a_research_session_takes_one_conid_and_a_live_session_up_to_the_limit()
     assert research.sessions == []
     assert session_of(live, "counts_bars", "CountsBars", conids=tuple(range(1, MAX_SESSION_CONIDS + 1))).conids
     assert (research.pool, live.pool) == (RESEARCH_POOL_SIZE, LIVE_POOL_SIZE)
+
+
+def test_sendable_positions_are_the_rows_a_new_stream_sends():                    # PR #168 review
+    frame = bars(6)
+    frame.iloc[1, frame.columns.get_loc("low")] = 1e9                     # high < low: refused
+    frame = pd.concat([frame.iloc[:4], frame.iloc[[2]], frame.iloc[4:]])  # row 2's time again, out of order
+    sandbox = FakeSandbox()
+    stream = BarStream(session_of(sandbox, "counts_bars", "CountsBars"), CONID)
+    decisions = stream.send_frame(frame)
+    assert sendable_positions(frame) == [i for i, decision in enumerate(decisions) if decision is not None]
+    assert sendable_positions(frame) == [0, 2, 3, 5, 6]

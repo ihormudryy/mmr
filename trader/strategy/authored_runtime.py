@@ -17,11 +17,12 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 
 from trader.authored.api import Decision
 from trader.authored.sandbox_client import SandboxFault, SandboxProtocolError, SandboxUnavailable
-from trader.authored.streaming import OHLCV, BarStream, bar_fields, decision_signal
+from trader.authored.streaming import OHLCV, BarStream, bar_fields, decision_signal, sendable_positions
 from trader.messaging.typed_rpc import TypedRpcError, TypedRpcRemoteError
 from trader.objects import BarSize
 from trader.research.strategy_key import authored_digest_of_path
@@ -31,8 +32,6 @@ from trader.trading.strategy import Signal, Strategy, StrategyContext
 
 logger = logging.getLogger(__name__)
 NEW_YORK = ZoneInfo("America/New_York")
-# The largest LOOKBACK_BARS an authored file may declare (spec 7.1): what a new session is warmed with.
-WARMUP_BARS = 2000
 SANDBOX_UNAVAILABLE_ALARM = "AUTHORED_SANDBOX_UNAVAILABLE"
 SANDBOX_FAULT_ALARM = "AUTHORED_SANDBOX_FAULT"
 ISOLATION_ALARM = "AUTHORED_ISOLATION_UNPROVEN"
@@ -70,14 +69,21 @@ class _DaySession:
     day: dt.date
 
 
-def _unsent(prices: pd.DataFrame, last_sent: Optional[dt.datetime]) -> pd.DataFrame:
-    """The bars a conid's stream has not had yet; its first bar in a session brings the trailing WARMUP_BARS
-    (Plan 4 ruling 14)."""
+def _unsent(prices: pd.DataFrame, last_sent: Optional[dt.datetime], warmup_bars: int) -> tuple[pd.DataFrame, bool]:
+    """The rows a conid's stream has not had yet, and whether the newest row of ``prices`` is among them (only then
+    is the frame's last decision the newest bar's).
+
+    A session's first bar brings the last ``warmup_bars`` sendable bars, the class's LOOKBACK_BARS from OPENED
+    (Plan 4 ruling 14, #164): the same bars research streams, so an invalid row in the window shortens nothing. The
+    class keeps no state between bars (static check), so they decide the newest bar as a longer warm-up would."""
     if last_sent is None:
-        return prices.tail(WARMUP_BARS)
-    index = pd.DatetimeIndex(prices.index)
-    index = index.tz_localize("UTC") if index.tz is None else index.tz_convert("UTC")
-    return prices[index > pd.Timestamp(last_sent)]
+        positions = np.asarray(sendable_positions(prices)[-warmup_bars:], dtype=int)
+    else:
+        index = pd.DatetimeIndex(prices.index)
+        index = index.tz_localize("UTC") if index.tz is None else index.tz_convert("UTC")
+        positions = np.flatnonzero(index > pd.Timestamp(last_sent))
+    has_newest = len(positions) > 0 and positions[-1] == len(prices) - 1
+    return prices.iloc[positions], has_newest
 
 
 class _BarWorker:
@@ -276,9 +282,9 @@ class AuthoredLiveStrategy(Strategy):
         stream = self._current.streams[conid]
         # The OPENED build, checked before every BAR, a warm-up's too: a restart between PING and OPEN, or a
         # proof withdrawn mid-frame, sends no further bar (fail closed).
-        decisions = stream.send_frame(_unsent(prices, stream.last_sent),
-                                      before_each_bar=lambda: self._require_proven(build))
-        return decisions[-1] if decisions else None
+        rows, has_newest = _unsent(prices, stream.last_sent, self._current.session.lookback)
+        decisions = stream.send_frame(rows, before_each_bar=lambda: self._require_proven(build))
+        return decisions[-1] if has_newest else None
 
     def _signal_of(self, decision: Optional[Decision]) -> Optional[Signal]:
         signal = decision_signal(decision, self.name)

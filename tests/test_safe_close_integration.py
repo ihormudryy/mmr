@@ -934,4 +934,4 @@ def test_cold_start_publishes_the_dashboard_risk_projection(composed):          
     event = composed.trader.risk_producer.flush_projection()
     assert event is not None and event.entity_type == "risk"
     assert event.entity_id.startswith("projection:")
-    assert {"net_liquidation", "warnings", "limits"} <= set(event.payload)
+    assert {"net_liquidation", "warnings", "limits", "impacts"} <= set(event.payload)     # H2: pending proposals

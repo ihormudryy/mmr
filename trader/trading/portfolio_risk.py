@@ -1,7 +1,7 @@
 """Portfolio risk analysis — concentration, correlation, group budgets, and warnings."""
 
 from dataclasses import asdict, dataclass, field
-from typing import Dict, List, Optional  # noqa: F401
+from typing import Callable, Dict, List, Optional, Sequence  # noqa: F401
 
 import logging
 import math
@@ -387,6 +387,14 @@ class PortfolioRiskAnalyzer:
         return ' '.join(parts)
 
 
+def budget_pct(max_allocation_pct: float) -> Optional[float]:
+    """A group budget as 0-100, or None for no budget. Stored as a fraction (0.25) or, by hand, as a percent (25)."""
+    cap = float(max_allocation_pct or 0)
+    if cap <= 0:
+        return None
+    return round(cap * 100, 2) if cap <= 1.0 else round(cap, 2)
+
+
 def projection_limit_rows(report: RiskReport) -> list[dict]:
     """Structured ``{id, label, value_pct, cap_pct}`` rows for the dashboard bars.
 
@@ -405,10 +413,9 @@ def projection_limit_rows(report: RiskReport) -> list[dict]:
             'cap_pct': crit_cap,
         })
     for group in report.group_allocations:
-        cap = float(group.get('budget_pct') or 0)
-        if cap <= 0:
+        cap_pct = budget_pct(group.get('budget_pct'))
+        if cap_pct is None:
             continue
-        cap_pct = round(cap * 100, 2) if cap <= 1.0 else round(cap, 2)
         rows.append({
             'id': f"group:{group.get('name') or '?'}",
             'label': f"{group.get('name') or '?'} group",
@@ -431,11 +438,13 @@ def enrich_risk_projection(
     duckdb_path: str = '',
     history_duckdb_path: str = '',
     group_store=None,
+    pending_proposals: Sequence = (),
+    instrument_currency: Callable[[int], Optional[str]] = lambda conid: None,
 ) -> dict:
-    """Broker snapshot plus analyzer-derived warnings/limit rows.
+    """Broker snapshot plus analyzer-derived warnings/limit rows, and each pending proposal's impact (H2).
 
     Enrichment failures never drop the broker numbers — the operator still
-    sees NL / PnL / open orders, and ``limits`` stays empty.
+    sees NL / PnL / open orders, and ``limits`` and ``impacts`` stay empty.
     """
     payload = {
         'net_liquidation': snapshot.net_liquidation,
@@ -443,7 +452,9 @@ def enrich_risk_projection(
         'open_order_count': snapshot.open_order_count,
         'warnings': [],
         'limits': [],
+        'impacts': [],
     }
+    store = group_store if group_store is not None else _open_group_store(duckdb_path)
     try:
         positions = [
             {
@@ -456,14 +467,6 @@ def enrich_risk_projection(
             duckdb_path=duckdb_path,
             history_duckdb_path=history_duckdb_path or duckdb_path,
         )
-        store = group_store
-        if store is None and duckdb_path:
-            try:
-                from trader.data.position_groups import PositionGroupStore
-                store = PositionGroupStore(duckdb_path)
-            except Exception as ex:
-                logging.warning('position groups unavailable for risk projection: %s', ex)
-                store = None
         report = analyzer.analyze(
             positions, float(snapshot.net_liquidation or 0), store,
         )
@@ -478,4 +481,33 @@ def enrich_risk_projection(
         payload['summary'] = report.summary
     except Exception as ex:
         logging.warning('risk projection enrichment failed: %s', ex, exc_info=True)
+    try:
+        payload['impacts'] = _impacts(snapshot, store, pending_proposals, instrument_currency)
+    except Exception as ex:
+        logging.warning('proposal impacts failed: %s', ex, exc_info=True)
     return payload
+
+
+def _open_group_store(duckdb_path: str):
+    if not duckdb_path:
+        return None
+    try:
+        from trader.data.position_groups import PositionGroupStore
+        return PositionGroupStore(duckdb_path)
+    except Exception as ex:
+        logging.warning('position groups unavailable for risk projection: %s', ex)
+        return None
+
+
+def _impacts(snapshot, store, pending_proposals, instrument_currency) -> list[dict]:
+    if not pending_proposals:
+        return []
+    from trader.trading.proposal_impact import proposal_impacts
+    return proposal_impacts(
+        pending_proposals,
+        positions=getattr(snapshot, 'positions', ()) or (),
+        net_liquidation=float(snapshot.net_liquidation or 0),
+        base_currency=getattr(snapshot, 'base_currency', None),
+        groups=store.list_groups() if store is not None else (),
+        instrument_currency=instrument_currency,
+    )

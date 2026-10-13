@@ -145,4 +145,32 @@ test('a malformed view never supersedes', () => {
   assert.equal(U.ccSnapshotSupersedes('s', 1, {}), false);
 });
 
+/* ---- H2: proposal impact ---- */
+const RISK = { 'projection:DU1': { impacts: [
+  { proposal_id: 7, currency: 'USD', fill_value: 2300, symbol_before_pct: 10.6, symbol_after_pct: 12.9,
+    groups: [{ name: 'tech', before_pct: 48, after_pct: 51, budget_pct: 60 }], gross_delta: 17700 },
+  { proposal_id: 8, unavailable: 'INSTRUMENT_NOT_USD' },
+] } };
+test('an impact is found by account and proposal id', () => {
+  assert.equal(U.ccProposalImpact(RISK, { entity_id: '7', account_id: 'DU1' }).proposal_id, 7);
+  assert.equal(U.ccProposalImpact(RISK, { entity_id: '7', account_id: 'DU2' }), null);   // another account
+  assert.equal(U.ccProposalImpact(RISK, { entity_id: '9', account_id: 'DU1' }), null);
+  assert.equal(U.ccProposalImpact(null, { entity_id: '7', account_id: 'DU1' }), null);
+});
+test('an impact reads before -> after with the group budget and the gross change', () => {
+  const impact = U.ccProposalImpactText(U.ccProposalImpact(RISK, { entity_id: '7', account_id: 'DU1' }), 'AAPL');
+  assert.equal(impact.unavailable, false);
+  assert.equal(impact.text, 'Δ exposure AAPL 10.6% → 12.9% · tech 48.0% → 51.0% of 60.0% · gross +$17.7k');
+});
+test('a reducing trade shows a negative gross change', () => {
+  const impact = U.ccProposalImpactText({ symbol_before_pct: 12, symbol_after_pct: 6, groups: [],
+    gross_delta: -950 }, 'MSFT');
+  assert.equal(impact.text, 'Δ exposure MSFT 12.0% → 6.0% · gross −$950');
+});
+test('a missing impact says why, never a number', () => {
+  const impact = U.ccProposalImpactText(U.ccProposalImpact(RISK, { entity_id: '8', account_id: 'DU1' }), 'BHP');
+  assert.deepEqual(impact, { unavailable: true, text: 'Δ exposure unavailable: not a USD instrument' });
+  assert.equal(U.ccProposalImpactText(null, 'X'), null);
+});
+
 console.log(`cc_util.test.js: ${n} tests passed`);

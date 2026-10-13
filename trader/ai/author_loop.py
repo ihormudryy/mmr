@@ -5,6 +5,9 @@ second only to fix a refused answer), then submit_authored_strategy as ai_author
 night: the submit body is stored before the call and resent unchanged after a lost reply.
 recover(): at controller start, a night cut after a call may have left is FAILED and never asked again; a night cut
 after its submit is checked against the trader's records by digest before anything is sent again.
+Every submit is fenced on the controller epoch: ai_author commands carry none, so a stale holder must not send.
+EXISTING (the trader already holds the digest) counts as tonight's file only when the trader's record has this body's
+bar size and tunables and is not finished; the stored metadata wins (Plan 3 ruling 6), so anything else is REFUSED.
 The ai service never reaches the sandbox or the store: it sends text; the trader checks it, stores it and keeps records.
 """
 from __future__ import annotations
@@ -15,13 +18,14 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from trader.ai.author_facts import (AuthorFactsError, authored_history, build_author_facts, catalogue_evaluations,
                                     scoreboard_facts)
 from trader.ai.author_roles import (CheckedAnswer, author_messages, check_answer, parse_author_answer,
                                     refusal_problems, retry_messages)
-from trader.ai.author_wire import AuthoredStrategiesReply, parse_authored_strategies, parse_submit_reply
+from trader.ai.author_wire import (AuthoredRecord, AuthoredStrategiesReply, parse_authored_strategies,
+                                   parse_submit_reply)
 from trader.ai.budget import BudgetNotInitialized
 from trader.ai.config import AUTHOR_ROLE, authored_universe
 from trader.ai.decision_replay import manifest_mismatch
@@ -44,6 +48,10 @@ STORE_DOWN = "AUTHORED_STORE_UNAVAILABLE"   # an RpcRefused: the trader's store 
 STORE_UNAVAILABLE = "STORE_UNAVAILABLE"     # the row code when the slot ended during such an outage
 FACTS_UNREADABLE = "FACTS_UNREADABLE"
 ENGINE_ERROR = "ENGINE_ERROR"
+EXISTING_MISMATCH = "EXISTING_MISMATCH"     # REFUSED: the trader holds the digest with another bar size or tunables
+EXISTING_TERMINAL = "EXISTING_TERMINAL"     # REFUSED: the trader holds the digest in a finished state
+TERMINAL_STATES = frozenset({"REJECTED", "RETIRED", "EXPIRED", "FAILED"})
+TUNABLE_FIELDS = ("low", "high", "default")
 REPORT_OBJECTS = ("account", "splits", "authored_vs_catalogue")    # what scoreboard_facts reads, each an object
 CALLS_PER_NIGHT = 2                       # one answer and one retry (spec 7.4, 9)
 HOLD_SECONDS = 60                         # a waiting gate is not asked again every second
@@ -102,6 +110,24 @@ def common_bar_sizes(ours: Sequence[str], theirs: Sequence[str]) -> tuple[str, .
     for size in ours:
         menu.setdefault(bar_size_key(size), size)
     return tuple(size for key, size in menu.items() if key in allowed)
+
+
+def existing_differences(body: Mapping[str, Any], record: AuthoredRecord) -> list[str]:
+    """Where the trader's stored record differs from the body this night sent: bar size (by bar_size_key) and each
+    tunable's low, high and default. The note is not compared: the trader keeps its stored note, and a note is free
+    text, never part of what is evaluated."""
+    differences = []
+    if bar_size_key(body["bar_size"]) != bar_size_key(record.bar_size):
+        differences.append(f"bar_size sent {body['bar_size']!r}, stored {record.bar_size!r}")
+    sent, stored = body["tunables"], record.tunables
+    for name in sorted(set(sent) | set(stored)):
+        if name not in sent or name not in stored:
+            differences.append(f"tunable {name} {'only stored' if name in stored else 'only sent'}")
+            continue
+        for field in TUNABLE_FIELDS:
+            if float(sent[name][field]) != float(getattr(stored[name], field)):
+                differences.append(f"{name}.{field} sent {sent[name][field]}, stored {getattr(stored[name], field)}")
+    return differences
 
 
 def _sha(text: str) -> str:
@@ -378,17 +404,35 @@ class AuthorLoop:
         return True
 
     async def _settle_cut_submission(self, attempt_id: str, held: dict) -> None:
-        row = await self._store.aquery("SELECT digest FROM author_attempts WHERE attempt_id = ? "
+        row = await self._store.aquery("SELECT digest, body_json FROM author_attempts WHERE attempt_id = ? "
                                        "AND state = 'SUBMITTING'", [attempt_id], fetch="one")
         if row is None:
             return
-        record = held.get(row[0])
+        digest, body_json = row
+        record = held.get(digest)
         if record is None:
-            logger.warning("author %s: the trader holds no file %s; the stored body is sent again", attempt_id, row[0])
+            logger.warning("author %s: the trader holds no file %s; the stored body is sent again", attempt_id, digest)
             return
-        logger.info("author %s: the trader already holds %s; it is not sent again", attempt_id, record.key)
-        await self._finish(attempt_id, "STORED", "EXISTING",
-                           receipt={"source": "get_authored_strategies", "record": record.model_dump()})
+        await self._settle_existing(attempt_id, json.loads(body_json), record,
+                                    {"source": "get_authored_strategies", "record": record.model_dump()})
+
+    async def _settle_existing(self, attempt_id: str, body: Mapping[str, Any], record: AuthoredRecord,
+                               receipt: dict) -> None:
+        """The trader already holds this digest. It is tonight's file only with the same bar size and tunables and
+        a state that is not finished; otherwise the trader's stored record wins and the night is REFUSED."""
+        if record.state in TERMINAL_STATES:
+            logger.warning("author %s: the trader already holds %s as %s; not a new file tonight", attempt_id,
+                           record.key, record.state)
+            await self._finish(attempt_id, "REFUSED", EXISTING_TERMINAL, receipt=receipt)
+            return
+        differences = existing_differences(body, record)
+        if differences:
+            logger.info("author %s: the trader already holds %s with other metadata, which wins: %s", attempt_id,
+                        record.key, "; ".join(differences))
+            await self._finish(attempt_id, "REFUSED", EXISTING_MISMATCH, receipt=receipt)
+            return
+        logger.info("author %s: EXISTING %s", attempt_id, record.key)
+        await self._finish(attempt_id, "STORED", "EXISTING", receipt=receipt)
 
     async def _store_body(self, attempt_id: str, outcome: AuthorOutcome) -> None:
         checked = outcome.checked
@@ -405,6 +449,10 @@ class AuthorLoop:
         if row is None:
             return
         body_json, digest, session_date = row
+        if self._leadership.current_epoch() is None:
+            self._log_once(attempt_id, "NO_EPOCH", logging.WARNING, "leadership is gone; nothing is sent, the row "
+                                                                    "stays SUBMITTING for the next leader")
+            return
         try:
             reply = parse_submit_reply(await self._author.call("submit_authored_strategy", json.loads(body_json)))
         except AWAY as exc:
@@ -434,6 +482,8 @@ class AuthorLoop:
             logger.error("author %s: the trader answered digest %s for the file %s", attempt_id, reply.record.digest,
                          digest)
             await self._finish(attempt_id, FAILED, "DIGEST_MISMATCH", receipt=reply.model_dump())
+        elif reply.status == "EXISTING":
+            await self._settle_existing(attempt_id, json.loads(body_json), reply.record, reply.model_dump())
         else:
             logger.info("author %s: %s %s", attempt_id, reply.status, reply.record.key)
             await self._finish(attempt_id, "STORED", reply.status, receipt=reply.model_dump())

@@ -885,7 +885,11 @@ recorded. Turn-on order: SP2_PAPER_DEPLOY.md section 10.
 - `FAILED`: `CHECK_FAILED_TWICE`, `MODEL_REFUSED_<code>`, `MODEL_FAILED_<outcome>`, `PROCESS_RESTARTED`,
   `DIGEST_MISMATCH`, `FACTS_UNREADABLE` (a stored row the facts cannot read; no model call), `ENGINE_ERROR`
   (an unexpected error in the night; the row says so instead of the night being lost), `STORE_UNAVAILABLE`.
-  `REFUSED`: `RPC_<code>` (the trader's final refusal, sent once).
+  `REFUSED`: the trader's refusal code, `RPC_<code>` (the trader's final RPC refusal, sent once),
+  `EXISTING_MISMATCH` (the trader already holds this file with another bar size or other tunable ranges or defaults;
+  its stored record wins, the differences are in the `ai` log at INFO) or `EXISTING_TERMINAL` (the trader holds this
+  file as `REJECTED`, `RETIRED`, `EXPIRED` or `FAILED`). `STORED` is `STORED` (new) or `EXISTING` (the trader already
+  held this exact file with the same bar size and tunables). The note is never compared.
 - Trader refusals: `AUTHORED_STRATEGIES_DISABLED`, `AUTHORED_CAP_FULL`, `AUTHORED_STATIC_REJECTED`,
   `AUTHORED_BAD_TUNABLES`, `AUTHORED_BAD_BAR_SIZE`, `AUTHORED_ISOLATION_UNPROVEN`.
 - Config (the `ai` service exits and the log says so): `AUTHOR_PRICE_MISSING`, `AUTHORING_NEEDS_RESEARCH`,

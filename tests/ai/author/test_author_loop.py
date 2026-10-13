@@ -7,6 +7,7 @@ import pytest_asyncio
 
 from tests.ai.author.helpers import (BAD_SOURCE, ORB_SOURCE, answer_json, authored_reply, record, submit_reply)
 from tests.ai.author.rig import NIGHT, AuthorRig
+from tests.automation.authored_fixtures import authored_world, submit_request
 from trader.ai.author_loop import replay_author_attempt
 from trader.ai.author_roles import AUTHOR_MARKER
 from trader.ai.config import usd_to_micros_floor
@@ -14,10 +15,21 @@ from trader.ai.replay import COMPLETE, ExternalAdapterCounter
 from trader.ai.rpc_clients import RpcNotSent, RpcOutcomeUnknown, RpcRefused
 from trader.ai.schedule import ET
 from trader.authored.keys import authored_key, source_digest
+from trader.automation.authored_wire import SubmitAuthoredStrategyRequest
 
 DIGEST = source_digest(ORB_SOURCE.encode("utf-8"))
 KEY = authored_key(DIGEST, "OpeningRangeBreakout")
 STORED = submit_reply(digest=DIGEST)
+ORB_WIRE = {"RANGE_BARS": {"low": 1.0, "high": 4.0, "default": 2.0},       # what answer_json() makes code send
+            "ENTRY_MINUTE": {"low": 585.0, "high": 630.0, "default": 600.0},
+            "EXIT_MINUTE": {"low": 630.0, "high": 720.0, "default": 660.0}}
+
+
+def held_reply(status="EXISTING", *, state="STORED", **changes):
+    """The trader's answer for a digest it already holds: its stored record, by default the one this body sent."""
+    reply = submit_reply(status, digest=DIGEST)
+    reply["record"] = {**reply["record"], "tunables": ORB_WIRE, "bar_size": "15 mins", "state": state, **changes}
+    return reply
 ATTEMPT_ROW = ("INSERT INTO ai_model_attempts (attempt_key, request_key, attempt_no, role, backend, model, status, "
                "reservation_id, request_json, request_sha256, started_at) "
                "VALUES (?, ?, 1, 'author', 'openrouter', 'vendor/author-1', ?, 'r1', '{}', 'x', now())")
@@ -157,7 +169,7 @@ async def test_a_slot_not_started_by_midnight_is_missed(rig):
 async def test_a_lost_submit_reply_resends_the_same_body(rig):                         # review focus 1
     happy(rig)
     rig.author.queues["submit_authored_strategy"] = [RpcOutcomeUnknown("REPLY_TIMEOUT"),
-                                                     submit_reply("EXISTING", digest=DIGEST)]
+                                                     held_reply()]
     await rig.loop.run_due_slot()
     assert attempt(rig)[0][0] == "SUBMITTING"
     await rig.loop.run_due_slot()                                        # not resent every second
@@ -289,7 +301,7 @@ async def test_another_refused_read_is_final(rig):
 async def test_an_unavailable_store_on_submit_resends_the_same_body(rig):              # ruling G3
     happy(rig)
     rig.author.queues["submit_authored_strategy"] = [RpcRefused("AUTHORED_STORE_UNAVAILABLE"),
-                                                     submit_reply("EXISTING", digest=DIGEST)]
+                                                     held_reply()]
     await rig.loop.run_due_slot()
     assert attempt(rig)[0][0] == "SUBMITTING"
     await rig.loop.run_due_slot()
@@ -358,7 +370,7 @@ async def cut_after_submit(rig):
 @pytest.mark.asyncio
 async def test_a_restart_after_submit_reconciles_by_digest_and_never_submits_again(rig):   # ruling 6
     restarted = await cut_after_submit(rig)
-    stored = submit_reply(digest=DIGEST)["record"]
+    stored = held_reply()["record"]
     rig.author.queues["get_authored_strategies"] = [authored_reply(counted=1, strategies=[stored])]
     await restarted.run_due_slot()
     assert attempt(rig) == [("STORED", "EXISTING", 1, DIGEST, KEY)]
@@ -379,7 +391,7 @@ async def test_a_restart_after_submit_resends_once_when_the_trader_has_no_record
 @pytest.mark.asyncio
 async def test_a_restart_after_submit_waits_for_the_read_before_any_resend(rig):          # ruling 6
     restarted = await cut_after_submit(rig)
-    stored = submit_reply(digest=DIGEST)["record"]
+    stored = held_reply()["record"]
     rig.author.queues["get_authored_strategies"] = [RpcNotSent("TRADER_UNREACHABLE"),
                                                     authored_reply(counted=1, strategies=[stored])]
     await restarted.run_due_slot()
@@ -452,3 +464,71 @@ async def test_replay_reproduces_a_failed_night(rig):
     assert replayed.status == COMPLETE and counter.total == 0
     assert (replayed.value["state"], replayed.value["reason"], replayed.value["calls"]) == (
         "FAILED", "MODEL_FAILED_UNKNOWN", 2)
+
+
+# -- review round (PR #162): the epoch fences every submit; EXISTING is success only for the same metadata -----
+
+@pytest.mark.asyncio
+async def test_a_revoked_epoch_after_the_body_is_stored_sends_nothing(rig, monkeypatch):
+    happy(rig)
+    store_body = rig.loop._store_body
+
+    async def store_then_lose_leadership(*args):
+        await store_body(*args)
+        rig.leader.epoch = None
+    monkeypatch.setattr(rig.loop, "_store_body", store_then_lose_leadership)
+    await rig.loop.run_due_slot()
+    assert attempt(rig)[0][0] == "SUBMITTING" and rig.author.sent("submit_authored_strategy") == []
+    rig.leader.epoch = 2
+    rig.clock.advance(61)
+    await rig.loop.run_due_slot()
+    assert len(rig.author.sent("submit_authored_strategy")) == 1 and attempt(rig)[0][:2] == ("STORED", "STORED")
+
+
+@pytest.mark.asyncio
+async def test_an_existing_digest_with_other_metadata_is_refused_by_the_real_store(rig, tmp_path):
+    world = authored_world(tmp_path / "trader")
+    old = {"RANGE_BARS": {"low": 1, "high": 3, "default": 2}, "ENTRY_MINUTE": {"low": 590, "high": 620, "default": 600},
+           "EXIT_MINUTE": {"low": 640, "high": 700, "default": 660}}
+    first = world.store.submit(submit_request(ORB_SOURCE, tunables=old, bar_size="5 mins"))
+    assert first["status"] == "STORED" and first["record"]["digest"] == DIGEST
+    happy(rig)
+    rig.author.queues["submit_authored_strategy"] = [
+        lambda body: world.store.submit(SubmitAuthoredStrategyRequest.model_validate(body))]
+    await rig.loop.run_due_slot()
+    (body,) = rig.author.sent("submit_authored_strategy")
+    assert body["bar_size"] == "15 mins" and body["tunables"]["RANGE_BARS"]["high"] == 4.0
+    assert attempt(rig) == [("REFUSED", "EXISTING_MISMATCH", 1, DIGEST, KEY)]
+    (receipt,), = rig.rows("SELECT receipt_json FROM author_attempts")
+    assert json.loads(receipt)["record"]["bar_size"] == "5 mins"
+
+
+@pytest.mark.parametrize("reply,outcome", [
+    (lambda: held_reply(), ("STORED", "EXISTING")),
+    (lambda: held_reply(bar_size="15  MINS"), ("STORED", "EXISTING")),          # the same bar size by key
+    (lambda: held_reply(bar_size="5 mins"), ("REFUSED", "EXISTING_MISMATCH")),
+    (lambda: held_reply(tunables={**ORB_WIRE, "EXIT_MINUTE": {"low": 630, "high": 700, "default": 660}}),
+     ("REFUSED", "EXISTING_MISMATCH")),
+    (lambda: held_reply(state="REJECTED", reason="JEV_REJECT"), ("REFUSED", "EXISTING_TERMINAL")),
+    (lambda: held_reply(state="EVALUATING"), ("STORED", "EXISTING")),
+])
+@pytest.mark.asyncio
+async def test_an_existing_reply_counts_only_for_the_same_metadata(rig, reply, outcome):
+    happy(rig)
+    rig.author.queues["submit_authored_strategy"] = [reply()]
+    await rig.loop.run_due_slot()
+    assert attempt(rig) == [(*outcome, 1, DIGEST, KEY)]
+
+
+@pytest.mark.parametrize("held,outcome", [
+    (lambda: held_reply()["record"], ("STORED", "EXISTING")),
+    (lambda: held_reply(bar_size="5 mins")["record"], ("REFUSED", "EXISTING_MISMATCH")),
+    (lambda: held_reply(state="RETIRED", reason="OWNER")["record"], ("REFUSED", "EXISTING_TERMINAL")),
+])
+@pytest.mark.asyncio
+async def test_a_restart_reconciles_with_the_same_metadata_rules(rig, held, outcome):
+    restarted = await cut_after_submit(rig)
+    rig.author.queues["get_authored_strategies"] = [authored_reply(counted=1, strategies=[held()])]
+    await restarted.run_due_slot()
+    assert attempt(rig) == [(*outcome, 1, DIGEST, KEY)]
+    assert len(rig.author.sent("submit_authored_strategy")) == 1

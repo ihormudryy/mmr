@@ -40,6 +40,19 @@ def test_the_author_timeout_is_not_set_in_the_role(tmp_path):
     assert exc.value.code == "AUTHOR_TIMEOUT_IN_ROLE"
 
 
+def test_a_bad_author_model_id_is_refused_at_load(tmp_path):
+    with pytest.raises(AiConfigError) as exc:
+        load(tmp_path, author_text(model="bad model"))
+    assert exc.value.code == "AUTHOR_MODEL_INVALID"
+    assert load(tmp_path, author_text(model="vendor/author-1")).authoring_enabled is True
+
+
+def test_the_author_model_pattern_is_the_traders_jev_model_pattern():
+    from trader.ai.config import TRADER_MODEL_ID
+    from trader.automation.backtest_judge_wire import JEV_MODEL
+    assert TRADER_MODEL_ID.pattern == JEV_MODEL.pattern
+
+
 def test_a_set_author_model_needs_a_price_row(tmp_path):
     with pytest.raises(AiConfigError) as exc:
         load(tmp_path, author_text(price=False))

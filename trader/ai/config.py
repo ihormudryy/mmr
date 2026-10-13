@@ -1,6 +1,7 @@
 from __future__ import annotations
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
@@ -18,6 +19,9 @@ ROLE_NAMES = REQUIRED_ROLE_NAMES + OPTIONAL_ROLE_NAMES
 MAX_IN_FLIGHT_LIMIT = 2
 MICROS_PER_USD = 1_000_000
 DEFAULT_CONFIG_PATH = "~/.config/mmr/ai.yaml"
+# A copy of trader.automation.backtest_judge_wire.JEV_MODEL: the ai process must not import the trader's wire
+# module. tests/ai/author/test_author_config.py keeps the two equal.
+TRADER_MODEL_ID = re.compile(r"^[A-Za-z0-9_./:@+-]{1,128}$")
 
 
 class AiConfigError(ValueError):
@@ -313,6 +317,8 @@ def _active_author(parsed: _RawConfig, prices: Mapping[tuple[str, str], ModelPri
     if not author.model.strip():
         return None
     _check_backend(AUTHOR_ROLE, author)
+    if not TRADER_MODEL_ID.fullmatch(author.model):
+        raise AiConfigError("AUTHOR_MODEL_INVALID", "the author model id is not an id the trader accepts")
     if (author.backend, author.model) not in prices:
         raise AiConfigError("AUTHOR_PRICE_MISSING", "the author model needs a row under pricing")
     if not parsed.research.enabled:

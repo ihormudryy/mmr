@@ -11,7 +11,7 @@ from tests.ai.decisions.test_flows_acceptance import loop_thread, ruling as entr
 from tests.ai.research.rig import ruling
 from tests.sp1_fixtures import CONID, MSFT
 from trader.ai.author_roles import AUTHOR_MARKER
-from trader.ai.ids import derive_decision_id
+from trader.ai.ids import attempt_ref, derive_decision_id
 from trader.ai.research_roles import BACKTEST_MARKER, RESEARCH_MARKER
 from trader.ai.roles import JEV_MARKER
 from trader.messaging.typed_rpc import TypedRpcRemoteError
@@ -40,6 +40,11 @@ async def test_an_authored_strategy_goes_from_the_author_to_live_signals(tmp_pat
         assert aw.node_rows("SELECT state, error_code FROM ai_research_registrations") == [
             ("WAITING_CAP", "AUTHORED_ISOLATION_UNPROVEN")]                     # review focus 4
         assert aw.authored_state(digest) in ("EVALUATING", "SHADOW")
+        await aw.node.report()                                            # the author's cost reaches the trader
+        (cost_role, cost_attempt, cost_served), = aw.trader_rows(
+            "SELECT role, attempt_id, served_id FROM ai_costs WHERE role = 'author'")
+        (author_key,), = aw.node_rows("SELECT attempt_key FROM ai_model_attempts WHERE request_key LIKE 'aut-%'")
+        assert cost_role == "author" and cost_attempt == attempt_ref(author_key) and cost_served.startswith("aut-")
 
         aw.record_isolation_proof()                     # the running image's digest, as prove-isolation records it
         aw.evening(MONDAY)

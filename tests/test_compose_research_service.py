@@ -72,3 +72,24 @@ def test_signing_key_rule(tmp_path: Path, monkeypatch):
     assert signing_key_problems("research", tmp_path) == []
     assert signing_key_problems("trader", tmp_path) == [f"unexpected {tmp_path / 'signing.pem'}"]
     assert signing_key_problems("research", tmp_path / "missing") == [f"missing {tmp_path / 'missing' / 'signing.pem'}"]
+
+
+def test_a_key_this_uid_cannot_stat_is_not_visible(tmp_path: Path):
+    """Compose hides keys/private from non-holders with a root-owned 0700 tmpfs (#173)."""
+    hidden = tmp_path / "private"
+    hidden.mkdir()
+    hidden.chmod(0o000)
+    try:
+        if _can_stat_inside(hidden):
+            pytest.skip("this user can traverse a mode 000 directory (root)")
+        assert signing_key_problems("trader", hidden) == []
+    finally:
+        hidden.chmod(0o700)
+
+
+def _can_stat_inside(directory: Path) -> bool:
+    try:
+        (directory / "probe").exists()
+    except PermissionError:
+        return False
+    return True

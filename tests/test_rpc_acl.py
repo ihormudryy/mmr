@@ -283,6 +283,16 @@ def test_settle_is_cli_only_and_the_listing_is_for_humans(served_with_acl):     
     assert {("command", "settle_unknown_command"), ("query", "list_unresolved_commands")} <= registered
 
 
+def test_breaker_reset_is_cli_only_and_the_status_is_for_humans(served_with_acl):      # issue #181
+    assert TRADER_ACL[("command", "reset_circuit_breaker")] == frozenset({"cli"})
+    for principal in ("dashboard", "strategy", "ai_supervisor", "ai_research", "research"):
+        assert _code(served_with_acl, principal, "command", "reset_circuit_breaker") == "PERMISSION_DENIED"
+    assert _code(served_with_acl, "cli", "command", "reset_circuit_breaker") == "OK"
+    assert TRADER_ACL[("query", "get_circuit_breaker")] == HUMAN
+    registered = {(r.socket_role, r.method) for r in build_full_production_registry().registrations()}
+    assert {("command", "reset_circuit_breaker"), ("query", "get_circuit_breaker")} <= registered
+
+
 def test_a_port_zero_server_reports_the_port_it_bound(served):    # #163: no free-port probe to race
     port = served.ports[("trader", "query")]
     assert port == served.servers[("trader", "query")].bound_port and port > 0

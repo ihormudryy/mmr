@@ -2622,6 +2622,8 @@ OPERATOR_SETTLEABLE_ACTIONS = frozenset({
     "activate_live_canary", "deactivate_live_canary", "activate_allocation", "suspend_allocation",
     "activate_paper_automation", "deactivate_paper_automation",
     "register_discretionary_deployment", "acceptance_mark_start",
+    # Issue #181: no broker side effect; check `breaker status` (reset_command_id) before settling it.
+    "reset_circuit_breaker",
 })
 OPERATOR_SETTLED = "OPERATOR_SETTLED"
 # A settle command whose own transaction on its target never committed (it crashed before).

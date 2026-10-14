@@ -1257,12 +1257,27 @@ class MMR:
         ``outcome`` is ``resolved`` or ``rejected``. Only actions without a broker side effect are taken; the
         trader refuses any other with its code. Check the real state first: this changes only the ledger row."""
         import uuid
+        return self._operator_command('settle_unknown_command', {
+            'command_id': f'sdk-{uuid.uuid4()}', 'target_command_id': target_command_id,
+            'outcome': outcome, 'reason': reason})
+
+    def circuit_breaker(self) -> dict:
+        """The automation circuit breaker of the account: state, trip reason and the last reset (issue #181)."""
+        return self._typed_query.call('get_circuit_breaker', {}, dict)
+
+    def reset_circuit_breaker(self, reason: str) -> SuccessFail:
+        """Clear a tripped breaker after a review (``cli`` only, audited, no broker action).
+
+        The trader refuses it while reconciliation is incomplete, outside an open session or without ready
+        quotes, and a daily-loss trip until the next session."""
+        import uuid
+        return self._operator_command('reset_circuit_breaker',
+                                      {'command_id': f'sdk-{uuid.uuid4()}', 'reason': reason})
+
+    def _operator_command(self, method: str, body: dict) -> SuccessFail:
         from trader.domain.commands import CommandReceipt
         from trader.messaging.typed_rpc import TypedRpcRemoteError
 
-        method = 'settle_unknown_command'
-        body = {'command_id': f'sdk-{uuid.uuid4()}', 'target_command_id': target_command_id,
-                'outcome': outcome, 'reason': reason}
         try:
             receipt = self._typed_command.call(method, body, CommandReceipt)
         except TypedRpcRemoteError as ex:

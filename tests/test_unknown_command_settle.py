@@ -183,10 +183,12 @@ def _audited(world, command_id):
         "SELECT action, target_id FROM command_audit WHERE command_id = ?", [command_id]).fetchall()
 
 
+@pytest.mark.parametrize("action", ["pause_trading", "reset_circuit_breaker"])      # reset: issue #181
 @pytest.mark.parametrize("outcome,state,error_code", [("resolved", "RESOLVED", None),
                                                        ("rejected", "REJECTED", OPERATOR_SETTLED)])
-def test_the_operator_settles_an_unknown_row_and_reconciliation_is_safe_again(world, outcome, state, error_code):
-    _row(world, "pause-1", "pause_trading", target_type="account")
+def test_the_operator_settles_an_unknown_row_and_reconciliation_is_safe_again(world, outcome, state, error_code,
+                                                                              action):
+    _row(world, "pause-1", action, target_type="account")
     reconciler = world.reconciler()
     reconciler.rescan_on_startup()
     reconciler.run_due(NOW)
@@ -199,7 +201,7 @@ def test_the_operator_settles_an_unknown_row_and_reconciliation_is_safe_again(wo
     assert target.outcome == {"settled_by": "cli", "reason": "checked the control row",
                               "settle_command_id": "settle-1"}
     assert (receipt.state, receipt.error_code) == ("RESOLVED", None)
-    assert receipt.outcome == {"command_id": "pause-1", "action": "pause_trading", "state": state,
+    assert receipt.outcome == {"command_id": "pause-1", "action": action, "state": state,
                                "error_code": error_code, "settled_by": "cli", "reason": "checked the control row"}
     assert _audited(world, "settle-1") == [(SETTLE_ACTION, "pause-1")]
     assert world.ledger.unresolved_for_account(ACCOUNT) == []

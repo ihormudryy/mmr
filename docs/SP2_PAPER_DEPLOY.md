@@ -137,6 +137,9 @@ Config templates are copied only when a file is missing, so your old files lack 
      A bind-mounted file is not re-read by a plain restart.
    - check: `docker compose --profile ai ps` shows `ai` and `research` as "healthy" within about 2 minutes.
    - If `research` exits in a loop: the trader has `ai_paper.enabled` off, or `signing.pem` is missing or not owned by you. Read `docker compose --profile ai logs research`.
+   - If the log says `Cannot open file ".../mmr_research.duckdb": Permission denied`: the `mmr_research_data` volume was
+     created by an image before #180 and is owned by root. A volume keeps its owner, so fix it once while it is empty:
+     `docker run --rm -v mmr_mmr_research_data:/v alpine chown 1000:1000 /v`, then start `research` again.
    - If `ai` exits: the log names the bad field in `ai.yaml` (`RESEARCH_*` codes for the research block).
 
 ## 6. Checks

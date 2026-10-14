@@ -127,6 +127,7 @@ from trader.messaging.typed_rpc import (
 from trader.strategy.strategy_revisions import StrategyCommandReceipt
 from trader.trading.circuit_breaker import BreakerResetRefused
 from trader.trading.command_coordinator import (
+    BREAKER_RESET_ACTION,
     OPERATOR_SETTLEABLE_ACTIONS,
     REGISTRATION_NOT_COMMITTED,
     SETTLE_ACTION,
@@ -1895,7 +1896,6 @@ def register_settle_authority(registry: TypedRpcRegistry, command_stack: Any, *,
                       _list_unresolved_commands_handler(command_stack.ledger, account_id))
 
 
-BREAKER_RESET_ACTION = "reset_circuit_breaker"
 _BREAKER_RESET_PRINCIPAL = "cli"
 
 

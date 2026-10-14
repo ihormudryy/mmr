@@ -95,6 +95,11 @@ class CircuitBreakerStore:
             raise RuntimeError(f"automation breaker not seeded for {self.account_id}")
         return _state(row)
 
+    def committed_outcome(self, command_id: str) -> Optional[dict[str, Any]]:
+        """The breaker state a reset wrote with ``command_id``, or None when no such reset committed (#182)."""
+        state = self.get()
+        return state.to_payload() if state.reset_command_id == command_id else None
+
     @staticmethod
     def incident_id(account_id: str, kind: str, occurred_at: dt.datetime, key: str) -> str:
         raw = f"{account_id}|{kind}|{key or occurred_at.isoformat()}".encode()

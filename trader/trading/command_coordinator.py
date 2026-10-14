@@ -2611,6 +2611,9 @@ WITHDRAWAL_NOT_COMMITTED = "WITHDRAWAL_NOT_COMMITTED"
 EXPERIMENT_COMMAND_ACTIONS = frozenset({"start_experiment", "pause_experiment", "resume_experiment",
                                         "stop_experiment"})
 EXPERIMENT_COMMAND_NOT_COMMITTED = "EXPERIMENT_COMMAND_NOT_COMMITTED"
+BREAKER_RESET_ACTION = "reset_circuit_breaker"
+# A breaker reset whose one store transaction never committed (#182): the operator sends it again.
+BREAKER_RESET_NOT_COMMITTED = "BREAKER_RESET_NOT_COMMITTED"
 
 # Issue #121: the operator settles an OUTCOME_UNKNOWN row that no evidence can settle. Only actions that write
 # the trader's own journal, config or arm state and never a broker order, and whose reconciler cannot prove
@@ -2622,8 +2625,6 @@ OPERATOR_SETTLEABLE_ACTIONS = frozenset({
     "activate_live_canary", "deactivate_live_canary", "activate_allocation", "suspend_allocation",
     "activate_paper_automation", "deactivate_paper_automation",
     "register_discretionary_deployment", "acceptance_mark_start",
-    # Issue #181: no broker side effect; check `breaker status` (reset_command_id) before settling it.
-    "reset_circuit_breaker",
 })
 OPERATOR_SETTLED = "OPERATOR_SETTLED"
 # A settle command whose own transaction on its target never committed (it crashed before).
@@ -2644,6 +2645,12 @@ class WithdrawalEvidencePort(Protocol):
 
 class PolicyEvidencePort(Protocol):
     """The trader's own journal: the receipt of the risk-policy revision a command wrote, or None."""
+
+    def committed_outcome(self, command_id: str) -> Optional[dict[str, Any]]: ...
+
+
+class BreakerResetEvidencePort(Protocol):
+    """The trader's own journal: the breaker state a reset wrote with its command id, or None (#182)."""
 
     def committed_outcome(self, command_id: str) -> Optional[dict[str, Any]]: ...
 
@@ -2722,6 +2729,9 @@ class OutcomeReconciler:
     - ``experiments``: ``ExperimentEvidencePort`` -- the same for the four
       experiment commands, from the transition row each writes (issue #121).
       Optional: unwired (live account) they stay unknown.
+    - ``breaker_resets``: ``BreakerResetEvidencePort`` -- the same for a
+      ``reset_circuit_breaker``, from the breaker row its transaction wrote
+      (issue #182). Optional: unwired it stays unknown.
 
     Command-type awareness ([M1-F3] Task 9 HIGH-1, verbatim): ``reconcile_once``
     discriminates by the command's ACTION, not by ``target_type`` alone --
@@ -2750,6 +2760,7 @@ class OutcomeReconciler:
         withdrawals: Optional[WithdrawalEvidencePort] = None,
         policies: Optional[PolicyEvidencePort] = None,
         experiments: Optional[ExperimentEvidencePort] = None,
+        breaker_resets: Optional[BreakerResetEvidencePort] = None,
         received_at_start: Optional[list[LedgerRow]] = None,
     ):
         self._journal = journal
@@ -2765,6 +2776,7 @@ class OutcomeReconciler:
         self._withdrawals = withdrawals
         self._policies = policies
         self._experiments = experiments
+        self._breaker_resets = breaker_resets
         self._unreadable_evidence: set[str] = set()   # command ids logged once; the 15-minute alert follows
         self._unreadable_sagas: set[str] = set()      # logged once; the 15-minute alert follows
         self._child_collisions: set[str] = set()      # cancel_orders roots whose child-id clash was logged
@@ -2957,6 +2969,8 @@ class OutcomeReconciler:
             return self._reconcile_experiment(row, now)
         if action == SETTLE_ACTION:
             return self._reconcile_settle(row, now)
+        if action == BREAKER_RESET_ACTION:
+            return self._reconcile_breaker_reset(row, now)
         # Unmapped action: cannot positively determine an outcome -> stay
         # OUTCOME_UNKNOWN (fail-safe), never rubber-stamp RESOLVED.
         return False
@@ -2992,6 +3006,11 @@ class OutcomeReconciler:
         is written before it while the row is RECEIVED."""
         evidence = None if self._policies is None else self._policies.committed_outcome
         return self._settle_from_own_commit(row, now, evidence, POLICY_NOT_COMMITTED, {"published": False})
+
+    def _reconcile_breaker_reset(self, row: LedgerRow, now: dt.datetime) -> bool:
+        """A reset writes its command id on the breaker row in one store transaction (#182)."""
+        evidence = None if self._breaker_resets is None else self._breaker_resets.committed_outcome
+        return self._settle_from_own_commit(row, now, evidence, BREAKER_RESET_NOT_COMMITTED, {"reset": False})
 
     def _reconcile_experiment(self, row: LedgerRow, now: dt.datetime) -> bool:
         """An experiment command is one store transaction that writes the command id with the transition.

@@ -154,3 +154,48 @@ def test_another_unresolved_command_still_refuses_the_reset(ledger_world):
     receipt = coordinator.execute(_request())
     assert (receipt.state, receipt.error_code) == ("REJECTED", "BREAKER_RESET_REFUSED")
     assert store.get().state == "TRIPPED"
+
+
+# -- a reset left RECEIVED by a crash settles from the breaker row it wrote (#182) --------------------------
+
+def _crashed_reset_world(ledger_world):
+    from tests.test_unknown_command_settle import Alerts, NoOrders, NoStrategy
+    from trader.trading.command_coordinator import RECEIVED_AT_RESTART, OutcomeReconciler
+
+    _coordinator, ledger, store = ledger_world
+    ledger.insert_for_test("reset-1", state="OUTCOME_UNKNOWN", updated_at=T0, created_at=T0, account_id=ACCOUNT,
+                           action=BREAKER_RESET_ACTION, target_type="account", target_id=ACCOUNT, outcome=None,
+                           error_code=RECEIVED_AT_RESTART)
+
+    def reconciler(evidence=store):
+        return OutcomeReconciler(journal=store.journal, ledger=ledger, orders=NoOrders(), strategy=NoStrategy(),
+                                 alerts=Alerts(), now=lambda: T0, breaker_resets=evidence)
+    return ledger, store, reconciler
+
+
+def test_a_crashed_reset_that_committed_resolves_from_the_breaker_row(ledger_world):
+    ledger, store, reconciler = _crashed_reset_world(ledger_world)
+    store.reset("reset-1", "reviewed", T0)                         # the handler committed, then the process died
+    assert reconciler().reconcile_once("reset-1", T0).resolved is True
+    row = ledger.get("reset-1")
+    assert (row.state, row.error_code) == ("RESOLVED", None)
+    assert row.outcome["reset_command_id"] == "reset-1"
+
+
+def test_a_crashed_reset_that_never_committed_is_rejected_so_it_can_be_sent_again(ledger_world):
+    from trader.trading.command_coordinator import BREAKER_RESET_NOT_COMMITTED
+    ledger, store, reconciler = _crashed_reset_world(ledger_world)
+    assert reconciler().reconcile_once("reset-1", T0).resolved is True
+    row = ledger.get("reset-1")
+    assert (row.state, row.error_code) == ("REJECTED", BREAKER_RESET_NOT_COMMITTED)
+    assert store.get().state == "TRIPPED"
+
+
+def test_unreadable_breaker_evidence_keeps_the_reset_unknown(ledger_world):
+    class Broken:
+        def committed_outcome(self, command_id):
+            raise OSError("journal unreadable")
+
+    ledger, _store, reconciler = _crashed_reset_world(ledger_world)
+    assert reconciler(Broken()).reconcile_once("reset-1", T0).resolved is False
+    assert ledger.get("reset-1").state == "OUTCOME_UNKNOWN"

@@ -50,7 +50,7 @@ class CircuitBreaker:
         *,
         now: Callable[[], dt.datetime],
         reset_ready: Callable[[], bool],
-        reconciliation_complete: Callable[[], bool],
+        reconciliation_complete: Callable[[str], bool],   # True when no command but this one is unresolved
         session_key: Callable[[dt.datetime], str],
         disconnect_grace: dt.timedelta = dt.timedelta(seconds=30),
         on_trip: Optional[Callable[[BreakerState], None]] = None,
@@ -113,6 +113,6 @@ class CircuitBreaker:
             raise BreakerResetRefused("daily-loss breaker may reset only in the next session")
         if not self._reset_ready():
             raise BreakerResetRefused("semantic readiness preconditions are not satisfied")
-        if not self._reconciliation_complete():
+        if not self._reconciliation_complete(command_id):
             raise BreakerResetRefused("reconciliation is incomplete")
         return self.store.reset(command_id, reason.strip(), now)

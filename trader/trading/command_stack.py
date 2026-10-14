@@ -1573,7 +1573,7 @@ def build_command_stack(
         breaker_store,
         now=now,
         reset_ready=reset_ready,
-        reconciliation_complete=reconciliation_safe,
+        reconciliation_complete=reconciliation_complete,   # leaves out the reset's own row (#181)
         session_key=xnys_session_key,
         on_trip=lambda state: react_to_breaker_trip(
             allocation_authority_store,

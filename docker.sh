@@ -870,7 +870,7 @@ backup() {
     $RUNTIME run --rm \
         -v "$vol":/src:ro \
         -v "$dest_host":/dst \
-        alpine sh -c 'cp -v /src/*.duckdb /dst/ 2>&1; ls -lh /dst/'
+        alpine sh -c 'for f in /src/*.duckdb /src/*.journal /src/*.wal; do [ -e "$f" ] && cp -v "$f" /dst/; done 2>&1; ls -lh /dst/'
     echo "Backup complete: $dest_host/"
 }
 

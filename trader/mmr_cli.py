@@ -6527,7 +6527,8 @@ def _handle_research_attest_verify(args: argparse.Namespace):
 def _journal_duckdb_path() -> str:
     """Resolve the trader's operational journal DB path -- same file the
     running trader_service reads/writes via ``command_stack.py``. Env
-    override wins; otherwise config, then the documented default.
+    override wins; otherwise the path the config resolved (#174), never a
+    default of its own.
 
     ``research canary prepare`` opens this file to read the strategy's
     CURRENT stage + evidence window -- deliberately the trader's own durable
@@ -6538,13 +6539,8 @@ def _journal_duckdb_path() -> str:
     from pathlib import Path
     path = os.environ.get('MMR_JOURNAL_DUCKDB')
     if not path:
-        try:
-            from trader.container import Container
-            cfg = Container.instance().config()
-            path = cfg.get('journal_duckdb_path')
-        except Exception:
-            path = None
-        path = path or '~/.local/share/mmr/data/mmr_journal.duckdb'
+        from trader.container import Container
+        path = Container.instance().config()['journal_duckdb_path']
     p = Path(path).expanduser()
     p.parent.mkdir(parents=True, exist_ok=True)
     return str(p)
@@ -9849,6 +9845,17 @@ def _completed_us_sessions(ranges, *, today) -> list:
     return sessions
 
 
+def _journal_not_in_backup(journal_path: str, summary: dict) -> list:
+    """The journal is held open by trader_service, so an in-DB snapshot cannot copy it; say so instead of leaving
+    it out silently (#174)."""
+    import os
+    name = os.path.basename(journal_path)
+    if not os.path.exists(journal_path) or any(row.get('db') == name for row in summary.get('databases', [])):
+        return []
+    return [{'db': name, 'reason': 'held open by trader_service; back it up with the stack stopped: '
+                                   './docker.sh -d, then ./docker.sh -B NAME'}]
+
+
 def _handle_data_backup(args: argparse.Namespace):
     """Clean, consistent snapshot of the DuckDB files to the host-mounted backups
     dir. `data/` is a Docker named volume (not host-visible), but `backups/` is a
@@ -9870,6 +9877,7 @@ def _handle_data_backup(args: argparse.Namespace):
     name = getattr(args, 'name', None)
 
     summary = run_backup(data_dir, backup_dir, keep=keep, name=name)
+    summary['not_included'] = _journal_not_in_backup(cfg['journal_duckdb_path'], summary)
 
     if _json_mode:
         print(json.dumps({'data': summary, 'title': 'DB Backup'}))
@@ -9886,6 +9894,8 @@ def _handle_data_backup(args: argparse.Namespace):
             console.print(f'  [green]✓[/green] {d["db"]:>22}  {d["bytes"]/1e6:.0f} MB')
         else:
             console.print(f'  [red]✗ {d["db"]:>22}  {d.get("error")}[/red]')
+    for skipped in summary['not_included']:
+        console.print(f'  [yellow]- {skipped["db"]:>22}  not included: {skipped["reason"]}[/yellow]')
     if summary['pruned']:
         console.print(f'\n[dim]pruned {len(summary["pruned"])} old snapshot(s), keeping newest {keep}[/dim]')
     console.print(f'[dim]latest → {backup_dir}/latest[/dim]')

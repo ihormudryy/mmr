@@ -7,7 +7,7 @@ Update the date + relevant sections when the running config changes.
 How to arm unattended paper automation from scratch:
 [`PAPER_AUTOMATION_SETUP.md`](PAPER_AUTOMATION_SETUP.md).
 
-**Last updated: 2026-10-04 (Sun) — paper trading, command-center stack.**
+**Last updated: 2026-10-14 (Wed) — paper; the stack is stopped (since 2026-10-12) until the SP2 deploy (#105).**
 
 ---
 
@@ -27,7 +27,8 @@ Current model:
 Config (host, not git): `~/.config/mmr/trader.yaml` + `strategy_runtime.yaml`.
 
 - `command_authority.enabled: true`, `live_enabled: false`
-- `automation.enabled: true`, `strategy_name: momentum`
+- `automation.enabled: false` (`strategy_name: momentum`). One-strategy automation stays off
+  during the SP2 soak (owner ruling 2026-10-11); an armed experiment and it never run together.
 - `momentum` must **not** also have `auto_execute: propose` (rule R1)
 
 Dashboard: Scaling tab → `lifecycle=armed` for momentum. Trading tab Strategies
@@ -59,27 +60,14 @@ is refused: no long-lived container holds the `cli` key. Trader ports
 > stops after this ships. Phase B is implemented: `research evaluate`
 > computes the liquidity, benchmark and regime evidence from SPY daily bars, so
 > eligibility now depends on the data (SPY bars are required; download them
-> first). The soak stays blocked by the automated-exit fix (and the split-Docker evidence gap below). Run strategies
+> first). The automated-exit fix is merged (safe close, PR #46). A one-strategy soak
+> still needs the host workaround for the split-Docker evidence gap below. Run strategies
 > with `auto_execute: propose` meanwhile.
 
 ### Known blockers (paper automation)
 
-Armed paper automation cannot exit safely yet, and the evidence step has a gap in split Docker.
+The evidence step has a gap in split Docker, and the kill line is too slow for live.
 
-- **Automated exits are not safe.**
-  - A SELL without a quantity is rejected at approval (`QUANTITY_REQUIRED` in
-    `trader/automation/production_evidence.py`), before `session_risk` could
-    size it to the held position. An exit signal without a size therefore does
-    not close an automated position; the entry's protective stop or a manual
-    close does.
-  - A SELL with a quantity goes through `build_bracket_plan`
-    (`trader/automation/protective_order_saga.py`), which attaches a reverse BUY
-    stop. The entry bracket's protective SELL stop also stays working, because
-    `reducible_quantity` (`trader/data/broker_state.py`) sums positions and
-    ignores working orders; approval's `LONG_ONLY` check (sell ≤ held) does not
-    cancel it. A full close could later re-open a long or leave the paper account
-    short. The fix needs a plain close order that cancels the entry's protective
-    stop, and a quantity for an unsized SELL from the fenced position.
 - **Live blocker: the experiment kill line reads IB account updates (about 3
   minutes).** `trader/automation/kill_monitor.py` evaluates every fenced broker
   capture every 5 s, but `NetLiquidation` arrives with IB's account-update
@@ -128,6 +116,14 @@ Armed paper automation cannot exit safely yet, and the evidence step has a gap i
   evidence decides. `liquidate_account` is parked too: with no close root its claim
   never committed (`LIQUIDATION_NOT_STARTED`); with one it settles from that
   root.
+
+Resolved: automated exits (PR #46, 2026-10-07). A one-strategy SELL never goes
+through `build_bracket_plan`, so it adds no reverse stop. It is a broker-proven
+safe close (`trader/automation/reduction_close.py`): the trader checks on a fresh
+fenced snapshot that the SELL reduces the held long, the close cancels the
+conid's working orders (the entry's protective stop) before it reduces, and a SELL
+without a quantity closes the whole position at the broker quantity at reduce
+time. The ai_paper `CLOSE` / `PARTIAL_CLOSE` decisions use the same path.
 
 Resolved: the production approval no longer builds an empty broker snapshot.
 `production_evidence.py` (2026-10-04) captures the fenced broker snapshot, a live
@@ -181,7 +177,7 @@ account never calls Alpaca, even with the setting on.
 
 | Strategy | Role | Notes |
 |---|---|---|
-| **momentum** | Single auto slot | Armed with the old fixture bundle, which no longer passes the provenance or binding check (see the 2026-10 note). `auto_execute` off. Enable it before a soak (`INSTALLED` ≠ dispatchable). |
+| **momentum** | Single auto slot | Off: `automation.enabled: false` for the SP2 soak. Its old fixture bundle no longer passes the provenance or binding check (see the 2026-10 note); a new arm needs a bundle from `research evaluate`. |
 | orb_* / ensemble | Optional propose | Human review on `/cc` if `auto_execute: propose`. |
 | global | Always present | Enable/Disable/Undeploy hidden by design. |
 | `ai` service (SP2) | AI paper decision loop | Not started. Needs model ids and prices in `ai.yaml` and the discretionary digest (see "Starting the AI paper decision loop"); strategy BUYs come only from ACTIVE judged versions. |
@@ -676,9 +672,9 @@ first deploy of this build:
 
 The service never publishes or loosens policy. A role whose provider rejects its model is paused for 5 minutes at a time: Jev down blocks every ENTER, orchestrator down stops discovery and model closes; SP1's stops, targets and the 15:45 flatten are unaffected.
 
-The automation soak below is blocked until the exit fix
-and the split-Docker evidence gap are resolved (see Known blockers). Until then, run strategies with `auto_execute: propose`
-and approve on `/cc`.
+One-strategy automation stays off during the SP2 soak (owner ruling 2026-10-11). The exit fix is merged (PR #46);
+the steps below also need a bundle from `research evaluate`, which runs only on the host for now (split-Docker
+evidence gap in Known blockers). Until then, run strategies with `auto_execute: propose` and approve on `/cc`.
 
 1. `./docker.sh -b -u` after this polish (baked dashboard image).
 2. Confirm `mmr status` → IB upstream connected.

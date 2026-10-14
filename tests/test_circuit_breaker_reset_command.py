@@ -97,3 +97,60 @@ def test_the_status_read_shows_the_trip_reason(breaker_parts):
     assert status["state"] == "TRIPPED"
     assert status["reason_code"] == "LIQUIDATION_FAILED"
     assert status["account_id"] == ACCOUNT
+
+
+# -- through a real coordinator and ledger: the reset's own row is in flight while it runs ----------------
+
+class _NoNonces:
+    def consume_in_tx(self, conn, nonce, request):
+        return True
+
+
+@pytest.fixture()
+def ledger_world(tmp_path):
+    from trader.data.circuit_breaker_store import CircuitBreakerStore, apply_circuit_breaker_migration
+    from trader.data.domain_journal import DomainJournal
+    from trader.data.duckdb_store import DuckDBConnection
+    from trader.data.schema_migrations import SchemaMigrator
+    from trader.trading.command_coordinator import (
+        CommandAudit, CommandLedger, TradingCommandCoordinator, apply_command_ledger_migration,
+    )
+    from trader.trading.circuit_breaker import CircuitBreaker
+
+    db = DuckDBConnection.get_instance(str(tmp_path / "journal.duckdb"))
+    migrator = SchemaMigrator(db)
+    journal = DomainJournal(db)
+    journal.migrate(migrator)
+    apply_command_ledger_migration(migrator)
+    apply_circuit_breaker_migration(migrator)
+    ledger = CommandLedger(journal)
+    store = CircuitBreakerStore(journal, ACCOUNT)
+    store.seed(T0)
+    now = T0 + dt.timedelta(hours=1)
+    breaker = CircuitBreaker(
+        store, now=lambda: now, reset_ready=lambda: True, session_key=lambda value: value.date().isoformat(),
+        reconciliation_complete=lambda exclude: not ledger.unresolved_for_account(ACCOUNT, exclude_command_id=exclude),
+    )
+    breaker.record(BreakerSignal("LIQUIDATION_FAILED", T0, "account owner claimed", "k1"))
+    coordinator = TradingCommandCoordinator(journal=journal, ledger=ledger, audit=CommandAudit(journal),
+                                            nonces=_NoNonces(), now=lambda: now)
+    coordinator.register_action(BREAKER_RESET_ACTION, _reset_circuit_breaker_action(breaker),
+                                requires_preflight=False)
+    return coordinator, ledger, store
+
+
+def test_the_reset_is_not_blocked_by_its_own_ledger_row(ledger_world):
+    coordinator, _ledger, store = ledger_world
+    receipt = coordinator.execute(_request())
+    assert (receipt.state, receipt.error_code) == ("RESOLVED", None)
+    assert store.get().state == "CLEAR"
+    assert store.get().reset_command_id == "reset-1"
+
+
+def test_another_unresolved_command_still_refuses_the_reset(ledger_world):
+    coordinator, ledger, store = ledger_world
+    ledger.insert_for_test("pause-9", state="OUTCOME_UNKNOWN", updated_at=T0, created_at=T0, account_id=ACCOUNT,
+                           action="pause_trading", target_type="account", target_id=ACCOUNT, outcome=None)
+    receipt = coordinator.execute(_request())
+    assert (receipt.state, receipt.error_code) == ("REJECTED", "BREAKER_RESET_REFUSED")
+    assert store.get().state == "TRIPPED"

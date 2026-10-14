@@ -37,7 +37,7 @@ def _breaker(store, now, *, ready=True, reconciled=True):
         store,
         now=lambda: now[0],
         reset_ready=lambda: ready,
-        reconciliation_complete=lambda: reconciled,
+        reconciliation_complete=lambda _command_id: reconciled,
         session_key=lambda value: value.date().isoformat(),
     )
 

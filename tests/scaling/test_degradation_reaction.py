@@ -111,7 +111,7 @@ def test_circuit_breaker_on_trip_wires_allocation_suspend(tmp_path):
         breaker_store,
         now=lambda: clock[0],
         reset_ready=lambda: True,
-        reconciliation_complete=lambda: True,
+        reconciliation_complete=lambda _command_id: True,
         session_key=lambda value: value.date().isoformat(),
         on_trip=lambda state: react_to_breaker_trip(
             alloc, account_id=ACCOUNT, breaker_state=state, now=clock[0],

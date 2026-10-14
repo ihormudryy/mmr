@@ -102,7 +102,7 @@ def _controller(journal: DomainJournal) -> CanaryRiskController:
         breaker_store,
         now=lambda: NOW,
         reset_ready=lambda: True,
-        reconciliation_complete=lambda: True,
+        reconciliation_complete=lambda _command_id: True,
         session_key=session_key,
     )
     return CanaryRiskController(store=store, breaker=breaker, strategy_id=STRATEGY)
@@ -292,7 +292,7 @@ class TestBreakerResetPolicy:
             breaker_store,
             now=lambda: NOW,
             reset_ready=lambda: True,
-            reconciliation_complete=lambda: True,
+            reconciliation_complete=lambda _command_id: True,
             session_key=session_key,
         )
         ctrl = CanaryRiskController(store=store, breaker=breaker, strategy_id=STRATEGY)

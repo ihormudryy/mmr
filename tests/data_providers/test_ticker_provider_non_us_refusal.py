@@ -159,9 +159,12 @@ def test_an_unresolved_numeric_target_never_stores_bars_a_later_conid_would_read
 
 
 @pytest.mark.parametrize('source', REST_SOURCES)
-def test_an_unresolved_ticker_is_still_fetched_under_its_own_name(tmp_path, source):
+def test_an_unresolved_ticker_is_fetched_under_its_own_name_only_with_ticker_key(tmp_path, source):   # #178
     db, history = str(tmp_path / 'mmr.duckdb'), _FakeHistory()
     args = argparse.Namespace(symbols=['ZZZZ'], source=source, bar_size='15 mins', days=5, force=False)
+    summary = _run(db, history, lambda mmr_cli: mmr_cli._handle_data_download(args))
+    assert summary['failed'] == 1 and history.tickers == []
+    args.ticker_key = True
     summary = _run(db, history, lambda mmr_cli: mmr_cli._handle_data_download(args))
     assert summary['failed'] == 0 and set(history.tickers) == {'ZZZZ'}
 

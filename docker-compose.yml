@@ -830,6 +830,8 @@ services:
           size: 4096
           mode: 0700
       - ${HOME}/.local/share/mmr/logs:/home/trader/.local/share/mmr/logs
+      # The operator's universe and download commands need the trader (conId resolution) and the DB (#178).
+      - mmr_db_data:/home/trader/.local/share/mmr/data
 
   # ── keygen: one-shot RPC key management (owner answer 2) ─────────────────
   # `./docker.sh -k [--rotate P | --backup | --restore FILE]` runs

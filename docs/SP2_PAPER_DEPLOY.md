@@ -117,14 +117,26 @@ Config templates are copied only when a file is missing, so your old files lack 
    - Leave `decisions.discretionary_deployment_digest: null` for now (step 8).
 3. Bars for research. Every research conid and SPY need history, and the daily bars must be refreshed every day.
    Without them the evaluation stops ("download them before evaluating") or an ENTER is refused `HISTORY_INVALID`.
-   Run inside the scheduler container, because the bars live in a Docker volume, not on your Mac:
+   Bars are stored by conId, so each symbol must resolve first (#178). The trader runs since step 4.2. Put every
+   research symbol and SPY in the `downloads` universe through the `cli` service (it holds the RPC key and the data
+   volume). `--currency USD` picks the US listing; most US stocks also have listings abroad (#179):
+   ```bash
+   docker compose --profile tools run --rm cli universe add downloads SPY AAPL MSFT <more symbols> --currency USD
+   docker compose --profile tools run --rm cli universe show downloads
+   ```
+   - check: one row per symbol, each with a US `primaryExchange` (NASDAQ, NYSE, ARCA) and the conId you put in
+     `research.universes`. A symbol with several listings is refused and every listing is named: pick one.
+   Then download inside the scheduler container (the bars live in a Docker volume, not on your Mac). It finds each
+   symbol in `downloads`, so the bars are stored under its conId:
    ```bash
    docker compose run --rm scheduler mmr data download SPY --bar-size "1 day" --days 1400
    docker compose run --rm scheduler mmr data download AAPL MSFT <more symbols> --bar-size "1 day" --days 1050
-   docker compose run --rm scheduler mmr data download AAPL MSFT <more symbols> --bar-size "15 mins" --days 1050
+   docker compose run --rm scheduler mmr data download AAPL MSFT <more symbols> --bar-size "1 min" --days 1050
    ```
+   - check: each command exits 0. A symbol that is not in `downloads` is refused (`did not resolve to a conId`) and
+     nothing is stored for it (#177: any failed symbol exits 1).
    - The evaluation reads about 690 sessions of each `bar_size`; SPY needs 220 more daily sessions. Both day counts are my estimate.
-   - `mmr data download` puts the symbols in the `downloads` universe. The scheduler refreshes it daily at 20:30 ET (`us_top20_daily`).
+   - The scheduler refreshes the `downloads` universe daily at 20:30 ET (`us_top20_daily`).
    - Only `1 day` (365 days) and `1 min` (90 days) have refresh jobs (ticket #111 tracks research bar sizes). For another bar size, add a job to `~/.config/mmr/data_refresh.yaml` and its name to
      `data_refresh_us` in `~/.config/mmr/pycron.yaml`.
    - check: `docker compose run --rm scheduler mmr data status` shows a recent last bar date for every universe.

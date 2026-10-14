@@ -2113,6 +2113,11 @@ def build_parser() -> argparse.ArgumentParser:
              'Use `ib` for international exchanges (ASX, SEHK, TSE, EU) — requires trader_service / IB Gateway.',
     )
     data_dl_p.add_argument(
+        '--ticker-key', action='store_true',
+        help='Store a ticker that resolves to no conId under the ticker itself. Research and the strategies '
+             'read bars by conId only, so such bars are for ad-hoc use.',
+    )
+    data_dl_p.add_argument(
         '--force', '-f',
         action='store_true',
         help=('Bypass the freshness guard and fetch the full requested window. '
@@ -9475,14 +9480,23 @@ def _trader_for_symbol_resolution(cfg):
         return None
 
 
-def _refuse_unresolved_numeric_target(symbol: str, sec_def) -> None:
-    """An unresolved target is stored under its own name, and a numeric name is the storage key of that conId.
+def _refuse_unresolved_target(symbol: str, sec_def, *, ticker_key: bool) -> None:
+    """A target that resolved to no conId is refused: research and the strategies read bars by conId (#178).
 
-    Bars fetched by the ticker "3002" would later read as conId 3002's history, so they are never stored (#137)."""
-    if sec_def is None and symbol.strip().isdigit():
+    A numeric name is always refused, because it is the storage key of that conId (#137). ``--ticker-key``
+    stores any other unresolved ticker under its own name, on purpose."""
+    if sec_def is not None:
+        return
+    if symbol.strip().isdigit():
         raise DownloadTargetError(
             f'{symbol} did not resolve to a contract; a numeric target is a conId and its bars would be stored '
             f'under that conId. Add it to a universe or start the trader so it resolves, then download again')
+    if not ticker_key:
+        raise DownloadTargetError(
+            f'{symbol} did not resolve to a conId: it is in no local universe and the trader did not answer. '
+            f'Bars stored under the ticker are never read by research or the strategies. Add it first: '
+            f'mmr universe add downloads {symbol} --currency USD (split Docker: docker compose --profile tools '
+            f'run --rm cli universe add downloads {symbol} --currency USD), or pass --ticker-key')
 
 
 def _resolve_download_symbol(accessor, rpc_mmr, symbol: str):
@@ -9539,7 +9553,7 @@ def _handle_data_download(args: argparse.Namespace):
     Incremental by default: uses TickData.missing() to skip date ranges
     already present in storage. If the symbol can't be resolved to a
     SecurityDefinition (no local universe entry and trader_service down),
-    falls back to a full-range download keyed by the ticker string.
+    it is refused, unless ``--ticker-key`` stores it under the ticker string.
     """
     import datetime as dt
     from trader.container import Container
@@ -9634,7 +9648,7 @@ def _handle_data_download(args: argparse.Namespace):
         try:
             if sec_def is None:
                 sec_def = _resolve_download_symbol(accessor, rpc_mmr, symbol)
-                _refuse_unresolved_numeric_target(symbol, sec_def)
+                _refuse_unresolved_target(symbol, sec_def, ticker_key=getattr(args, 'ticker_key', False))
             elif not sec_def.conId:
                 raise DownloadTargetError(f'{symbol}: the universe entry has no conId')
             if source != 'ib' and sec_def is not None:

@@ -155,7 +155,7 @@ def signing_key_problems(service: str, private_dir: Path) -> list[str]:
     """The research signing key is visible in its holder only (SP2c spec 5.1), and loads there as at startup."""
     key = Path(private_dir) / SIGNING_KEY_NAME
     if service not in SIGNING_KEY_HOLDERS:
-        return [f"unexpected {key}"] if key.exists() else []
+        return [f"unexpected {key}"] if _visible(key) else []
     if not key.is_file():
         return [f"missing {key}"]
     try:
@@ -163,6 +163,14 @@ def signing_key_problems(service: str, private_dir: Path) -> list[str]:
     except (InsecureKeyFile, InvalidKeyType, MalformedKey, OSError) as exc:
         return [f"{key} does not load ({type(exc).__name__})"]      # the class only: never key material
     return []
+
+
+def _visible(path: Path) -> bool:
+    """Compose hides keys/private from non-holders with a root-owned 0700 tmpfs; this uid cannot even stat there (#173)."""
+    try:
+        return path.exists()
+    except PermissionError:
+        return False
 
 
 def _mount_problems(service: str, keys_dir: Path, hmac_file: Path) -> list[str]:

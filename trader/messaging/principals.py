@@ -177,6 +177,9 @@ TRADER_ACL: Mapping[tuple[str, str], frozenset[str]] = {
     # Issue #121: the operator settles an OUTCOME_UNKNOWN command by hand; never an AI or the dashboard.
     ("command", "settle_unknown_command"): frozenset({"cli"}),
     ("query", "list_unresolved_commands"): HUMAN,
+    # Issue #181: the operator clears a reviewed breaker trip; never an AI or the dashboard.
+    ("command", "reset_circuit_breaker"): frozenset({"cli"}),
+    ("query", "get_circuit_breaker"): HUMAN,
 }
 
 STRATEGY_ACL: Mapping[tuple[str, str], frozenset[str]] = {

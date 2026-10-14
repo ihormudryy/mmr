@@ -1585,6 +1585,18 @@ def build_parser() -> argparse.ArgumentParser:
     settle_p.add_argument('--outcome', required=True, choices=('resolved', 'rejected'))
     settle_p.add_argument('--reason', required=True, help='Why, and what you checked (1-200 characters)')
 
+    breaker_p = sub.add_parser(
+        'breaker', help='Show the automation circuit breaker, or clear a reviewed trip (operator, audited)',
+        epilog='Examples:\n'
+               '  breaker status\n'
+               '  breaker reset --reason "oct 7 flatten reached FLAT; no unknown command; account flat"',
+        formatter_class=fmt)
+    breaker_sub = breaker_p.add_subparsers(dest='breaker_action', required=True)
+    breaker_sub.add_parser('status', help='State, trip reason and last reset')
+    breaker_reset_p = breaker_sub.add_parser(
+        'reset', help='Clear a tripped breaker (needs reconciliation complete, an open session, ready quotes)')
+    breaker_reset_p.add_argument('--reason', required=True, help='Why, and what you checked (1-200 characters)')
+
     # portfolio-snapshot (compact JSON for LLM loop)
     sub.add_parser('portfolio-snapshot', aliases=['psnap'], help='Compact portfolio snapshot (JSON)')
 
@@ -2739,6 +2751,9 @@ def dispatch(mmr: MMR, args: argparse.Namespace) -> bool:
         elif cmd == 'reconcile':
             _handle_reconcile(mmr, args)
 
+        elif cmd == 'breaker':
+            _handle_breaker(mmr, args)
+
         elif cmd in ('portfolio-snapshot', 'psnap'):
             print_dict(mmr.portfolio_snapshot(), title='Portfolio Snapshot')
 
@@ -3875,6 +3890,17 @@ def _handle_settle_command(mmr: MMR, args: argparse.Namespace):
     else:
         error = str(result.error or result.exception or 'Unknown error')
         print_status(f'reconcile settle failed: {error}', success=False)
+
+
+def _handle_breaker(mmr: MMR, args: argparse.Namespace):
+    if args.breaker_action == 'status':
+        print_dict(mmr.circuit_breaker(), title='Circuit breaker')
+        return
+    result = mmr.reset_circuit_breaker(args.reason)
+    if result.is_success():
+        print_json_result(result.obj or {}, title='Circuit breaker reset')
+    else:
+        print_status(f'breaker reset failed: {result.error or result.exception or "Unknown error"}', success=False)
 
 
 def _handle_portfolio_risk(mmr: MMR, args: argparse.Namespace):

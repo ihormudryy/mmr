@@ -157,6 +157,10 @@ Config templates are copied only when a file is missing, so your old files lack 
    - check: the list contains 90, 95, 96, 100, 110, 111, 115, 116, 120, 125.
 5. `docker compose --profile ai logs --tail 50 ai research` has no ERROR lines.
    - `ai.duckdb` has migrations 1-5, 10-18, 20-22, 30-34, 40 and the research DB 1-11, 20-22. No `mmr` command lists them.
+6. `mmr --json breaker status`
+   - check: `state` is `CLEAR`. A `TRIPPED` breaker refuses `experiment start` in step 7 (`BREAKER_TRIPPED`). Review the
+     trip reason with `mmr reconcile unknown`, `mmr --json portfolio` and `mmr --json orders`, then, during the
+     session (09:30 to 16:00 ET), `mmr breaker reset --reason "<what you checked>"` (issue #181).
 
 ## 7. SP1 paper acceptance (OWNER ONLY, places IB orders)
 

@@ -125,6 +125,7 @@ from trader.messaging.typed_rpc import (
     _DispatchProblem,
 )
 from trader.strategy.strategy_revisions import StrategyCommandReceipt
+from trader.trading.circuit_breaker import BreakerResetRefused
 from trader.trading.command_coordinator import (
     OPERATOR_SETTLEABLE_ACTIONS,
     REGISTRATION_NOT_COMMITTED,
@@ -860,6 +861,23 @@ class SettleUnknownCommandRequest(BaseModel):
 
 
 class ListUnresolvedCommandsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class ResetCircuitBreakerRequest(BaseModel):
+    """Issue #181: ``command_id`` is this reset's own id; the trader records it on the cleared breaker."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    command_id: str
+    reason: Annotated[str, Field(min_length=1, max_length=200)]
+
+    @field_validator("command_id")
+    @classmethod
+    def _command_id_has_no_colon(cls, value: str) -> str:
+        return _reject_colon_in_command_id(value)
+
+
+class GetCircuitBreakerRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
 
@@ -1875,6 +1893,63 @@ def register_settle_authority(registry: TypedRpcRegistry, command_stack: Any, *,
                       _settle_unknown_command_rpc_handler(command_stack.coordinator, account_id), with_caller=True)
     registry.register("query", "list_unresolved_commands", ListUnresolvedCommandsRequest, dict,
                       _list_unresolved_commands_handler(command_stack.ledger, account_id))
+
+
+BREAKER_RESET_ACTION = "reset_circuit_breaker"
+_BREAKER_RESET_PRINCIPAL = "cli"
+
+
+def _is_breaker_reset_body(body: Any) -> bool:
+    return (isinstance(body, dict) and set(body) == {"reason"} and isinstance(body["reason"], str)
+            and 1 <= len(body["reason"].strip()) and len(body["reason"]) <= 200)
+
+
+def _reset_circuit_breaker_action(circuit_breaker: Any):
+    """Issue #181: the coordinator action. ``CircuitBreaker.reset`` holds every reset rule; the principal and the
+    body are checked again behind the RPC layer. It never touches the broker."""
+    def _action(command: CommandRequest) -> Dict[str, Any]:
+        if command.principal != _BREAKER_RESET_PRINCIPAL:
+            raise CommandValidationError("PRINCIPAL_FORBIDDEN", "only the cli operator resets the circuit breaker")
+        if not _is_breaker_reset_body(command.body):
+            raise CommandValidationError("BREAKER_RESET_REQUEST_INVALID",
+                                         "body must be exactly {reason} with 1-200 characters")
+        try:
+            state = circuit_breaker.reset(command.command_id, command.body["reason"], command.principal)
+        except BreakerResetRefused as refused:
+            raise CommandValidationError("BREAKER_RESET_REFUSED", str(refused)) from None
+        return state.to_payload()
+    return _action
+
+
+def _reset_circuit_breaker_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
+    def _handler(parsed: ResetCircuitBreakerRequest, caller: RpcCaller) -> Dict[str, Any]:
+        request = CommandRequest(
+            command_id=parsed.command_id, action=BREAKER_RESET_ACTION, account_id=account_id,
+            target_type="account", target_id=str(account_id), expected_version=None,
+            body={"reason": parsed.reason}, source=caller.principal, principal=caller.principal,
+        )
+        return _receipt_to_dict(coordinator.execute(request))
+    return _handler
+
+
+def _circuit_breaker_status_handler(circuit_breaker: Any):
+    def _handler(_parsed: Optional[GetCircuitBreakerRequest]) -> Dict[str, Any]:
+        return circuit_breaker.store.get().to_payload()
+    return _handler
+
+
+def register_breaker_authority(registry: TypedRpcRegistry, command_stack: Any, *,
+                               account_id: Optional[str]) -> None:
+    """Issue #181: show the automation circuit breaker, and let the operator clear a reviewed trip.
+
+    No preflight: the preflight needs a clear breaker, and the reset checks readiness and reconciliation itself."""
+    breaker = command_stack.circuit_breaker
+    command_stack.coordinator.register_action(
+        BREAKER_RESET_ACTION, _reset_circuit_breaker_action(breaker), requires_preflight=False)
+    registry.register("command", BREAKER_RESET_ACTION, ResetCircuitBreakerRequest, dict,
+                      _reset_circuit_breaker_rpc_handler(command_stack.coordinator, account_id), with_caller=True)
+    registry.register("query", "get_circuit_breaker", GetCircuitBreakerRequest, dict,
+                      _circuit_breaker_status_handler(breaker))
 
 
 def _cancel_order_rpc_handler(coordinator: TradingCommandCoordinator, account_id: Optional[str]):
@@ -2962,6 +3037,7 @@ def build_production_registry(
             strategy_control_service=command_stack.strategy_control_service,
         )
         register_settle_authority(registry, command_stack, account_id=getattr(trader, 'ib_account', None))
+        register_breaker_authority(registry, command_stack, account_id=getattr(trader, 'ib_account', None))
         # record_state_acknowledged is registered by register_command_authority
         # when strategy_control_service is wired; otherwise keep the minimal
         # ingest-only handler so strategy announce/drain still works.

@@ -65,9 +65,9 @@ def test_the_in_db_backup_names_the_journal_it_cannot_copy(tmp_path):
         with duckdb.connect(str(data / name)) as conn:
             conn.execute("CREATE TABLE t (x INTEGER)")
     summary = run_backup(data, backups, name="b1")
-    missing = mmr_cli._journal_not_in_backup(str(data / "mmr.duckdb.journal"), summary)
-    assert [row["db"] for row in missing] == ["mmr.duckdb.journal"]
-    assert "./docker.sh -B" in missing[0]["reason"]
+    note = mmr_cli._journal_backup_note(str(data / "mmr.duckdb.journal"), summary)
+    assert (note["db"], note["included_as"]) == ("mmr.duckdb.journal", None)     # no trader snapshot yet (#189)
+    assert "./docker.sh -B" in note["warning"]
 
 
 def test_the_plain_copy_backup_takes_the_journal_and_wal_files():

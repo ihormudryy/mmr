@@ -456,6 +456,28 @@ async def _orphan_reservation_loop(
         interval=interval, stuck_after=stuck_after)
 
 
+# How often the trader copies the journal it holds open, for the backups (#189).
+_JOURNAL_SNAPSHOT_INTERVAL_SECONDS = 3600.0
+
+
+async def _journal_snapshot_loop(
+    journal_path: str, *, interval: float = _JOURNAL_SNAPSHOT_INTERVAL_SECONDS,
+    stuck_after: float = _WORKER_STUCK_AFTER_SECONDS,
+) -> None:
+    from trader.data.journal_snapshot import write_journal_snapshot
+    await _watched_ticks('journal snapshot', lambda: asyncio.to_thread(write_journal_snapshot, journal_path),
+                         interval=interval, stuck_after=stuck_after)
+
+
+def _maybe_start_journal_snapshot(
+    trader: Trader, loop: AbstractEventLoop, stopping: Callable[[], bool] = _never_stopping,
+) -> None:
+    journal_path = getattr(trader, 'journal_duckdb_path', None)
+    if not journal_path or stopping():
+        return
+    loop.create_task(_journal_snapshot_loop(journal_path))
+
+
 # How often the dashboard's risk view is recomputed (#169). An unchanged view is not journaled again.
 _RISK_PROJECTION_INTERVAL_SECONDS = 15.0
 
@@ -640,6 +662,7 @@ def main(simulation: bool,
         _maybe_start_scoreboard(trader, loop, stopping)
         _maybe_start_orphan_reservation_sweep(trader, loop, liquidation_worker, stopping)
         _maybe_start_risk_projection(trader, loop, stopping)
+        _maybe_start_journal_snapshot(trader, loop, stopping)
         if stopping():
             _finish_startup_shutdown(loop, shutdown)
             logging.info('shutdown requested during startup recovery; not starting the trader loop')

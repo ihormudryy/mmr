@@ -9845,15 +9845,30 @@ def _completed_us_sessions(ranges, *, today) -> list:
     return sessions
 
 
-def _journal_not_in_backup(journal_path: str, summary: dict) -> list:
-    """The journal is held open by trader_service, so an in-DB snapshot cannot copy it; say so instead of leaving
-    it out silently (#174)."""
+_JOURNAL_SNAPSHOT_STALE_MINUTES = 120
+
+
+def _journal_backup_note(journal_path: str, summary: dict, *, now=None) -> dict:
+    """How the backup holds the journal: through the hourly snapshot the trader writes (#189).
+
+    The journal itself is held open by trader_service, so no in-DB snapshot can copy it."""
+    import datetime as dt
     import os
-    name = os.path.basename(journal_path)
-    if not os.path.exists(journal_path) or any(row.get('db') == name for row in summary.get('databases', [])):
-        return []
-    return [{'db': name, 'reason': 'held open by trader_service; back it up with the stack stopped: '
-                                   './docker.sh -d, then ./docker.sh -B NAME'}]
+    from trader.data.journal_snapshot import snapshot_path
+    name = os.path.basename(snapshot_path(journal_path))
+    copied = any(row.get('db') == name and row.get('ok') for row in summary.get('databases', []))
+    if not copied:
+        return {'db': os.path.basename(journal_path), 'included_as': None,
+                'warning': 'no journal snapshot to copy (the trader writes one every hour); back up the journal '
+                           'itself with the stack stopped: ./docker.sh -d, then ./docker.sh -B NAME'}
+    now = now or dt.datetime.now(dt.timezone.utc)
+    taken = dt.datetime.fromtimestamp(os.path.getmtime(snapshot_path(journal_path)), dt.timezone.utc)
+    age = int((now - taken).total_seconds() // 60)
+    note = {'db': os.path.basename(journal_path), 'included_as': name, 'snapshot_age_minutes': age}
+    if age > _JOURNAL_SNAPSHOT_STALE_MINUTES:
+        note['warning'] = (f'the journal snapshot is {age} minutes old, older than {_JOURNAL_SNAPSHOT_STALE_MINUTES}: '
+                           'check the trader log for "journal snapshot tick failed"')
+    return note
 
 
 def _handle_data_backup(args: argparse.Namespace):
@@ -9877,7 +9892,7 @@ def _handle_data_backup(args: argparse.Namespace):
     name = getattr(args, 'name', None)
 
     summary = run_backup(data_dir, backup_dir, keep=keep, name=name)
-    summary['not_included'] = _journal_not_in_backup(cfg['journal_duckdb_path'], summary)
+    summary['journal'] = _journal_backup_note(cfg['journal_duckdb_path'], summary)
 
     if _json_mode:
         print(json.dumps({'data': summary, 'title': 'DB Backup'}))
@@ -9894,8 +9909,11 @@ def _handle_data_backup(args: argparse.Namespace):
             console.print(f'  [green]✓[/green] {d["db"]:>22}  {d["bytes"]/1e6:.0f} MB')
         else:
             console.print(f'  [red]✗ {d["db"]:>22}  {d.get("error")}[/red]')
-    for skipped in summary['not_included']:
-        console.print(f'  [yellow]- {skipped["db"]:>22}  not included: {skipped["reason"]}[/yellow]')
+    journal = summary['journal']
+    if journal['included_as']:
+        console.print(f'  [dim]  journal as {journal["included_as"]}, taken {journal["snapshot_age_minutes"]} min ago[/dim]')
+    if journal.get('warning'):
+        console.print(f'  [yellow]! {journal["db"]}: {journal["warning"]}[/yellow]')
     if summary['pruned']:
         console.print(f'\n[dim]pruned {len(summary["pruned"])} old snapshot(s), keeping newest {keep}[/dim]')
     console.print(f'[dim]latest → {backup_dir}/latest[/dim]')

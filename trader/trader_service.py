@@ -456,6 +456,24 @@ async def _orphan_reservation_loop(
         interval=interval, stuck_after=stuck_after)
 
 
+# How often the trader checks that the IB Gateway still answers (#198).
+_IB_PROBE_INTERVAL_SECONDS = 30.0
+
+
+async def _ib_probe_loop(trader, *, interval: float = _IB_PROBE_INTERVAL_SECONDS,
+                         stuck_after: float = _WORKER_STUCK_AFTER_SECONDS) -> None:
+    """On the trader loop, where ib_async lives; each probe is bounded, so a tick never sticks."""
+    await _watched_ticks('ib liveness probe', trader.probe_ib, interval=interval, stuck_after=stuck_after)
+
+
+def _maybe_start_ib_probe(
+    trader: Trader, loop: AbstractEventLoop, stopping: Callable[[], bool] = _never_stopping,
+) -> None:
+    if getattr(trader, 'probe_ib', None) is None or stopping():
+        return
+    loop.create_task(_ib_probe_loop(trader))
+
+
 # How often the trader copies the journal it holds open, for the backups (#189).
 _JOURNAL_SNAPSHOT_INTERVAL_SECONDS = 3600.0
 
@@ -663,6 +681,7 @@ def main(simulation: bool,
         _maybe_start_orphan_reservation_sweep(trader, loop, liquidation_worker, stopping)
         _maybe_start_risk_projection(trader, loop, stopping)
         _maybe_start_journal_snapshot(trader, loop, stopping)
+        _maybe_start_ib_probe(trader, loop, stopping)
         if stopping():
             _finish_startup_shutdown(loop, shutdown)
             logging.info('shutdown requested during startup recovery; not starting the trader loop')

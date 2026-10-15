@@ -1516,6 +1516,7 @@ def build_command_stack(
         withdrawals=None if ai_paper_parts is None else ai_paper_parts.versions,
         policies=None if ai_paper_parts is None else ai_paper_parts.policy,
         experiments=_experiment_evidence(trader, experiment_parts),
+        breaker_resets=breaker_store,
         received_at_start=_received_at_process_start(trader, ledger),
     )
     strategy_control_service = None

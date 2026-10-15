@@ -183,7 +183,7 @@ def _audited(world, command_id):
         "SELECT action, target_id FROM command_audit WHERE command_id = ?", [command_id]).fetchall()
 
 
-@pytest.mark.parametrize("action", ["pause_trading", "reset_circuit_breaker"])      # reset: issue #181
+@pytest.mark.parametrize("action", ["pause_trading"])
 @pytest.mark.parametrize("outcome,state,error_code", [("resolved", "RESOLVED", None),
                                                        ("rejected", "REJECTED", OPERATOR_SETTLED)])
 def test_the_operator_settles_an_unknown_row_and_reconciliation_is_safe_again(world, outcome, state, error_code,
@@ -275,6 +275,7 @@ NEVER_SETTLED_BY_HAND = {
     "submit_ai_paper_decision", "liquidate_account", "acceptance_shrink_probe", "register_ai_deployment",
     "withdraw_ai_deployment", "publish_ai_risk_policy", "start_experiment", "pause_experiment", "resume_experiment", "stop_experiment",
     "enable_strategy", "disable_strategy", "update_strategy_params", SETTLE_ACTION,
+    "reset_circuit_breaker",   # settles from the breaker row it wrote (#182)
 }
 
 

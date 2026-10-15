@@ -9247,7 +9247,8 @@ def _handle_data(args: argparse.Namespace):
     elif action == 'query':
         _handle_data_query(args)
     elif action == 'download':
-        _handle_data_download(args)
+        if _download_failed(_handle_data_download(args)):
+            sys.exit(1)
     elif action == 'migrate-symbols':
         _handle_data_migrate_symbols(args)
     elif action == 'migrate-timezone':
@@ -9257,7 +9258,8 @@ def _handle_data(args: argparse.Namespace):
     elif action == 'backup':
         _handle_data_backup(args)
     elif action == 'refresh':
-        _handle_data_refresh(args)
+        if not _handle_data_refresh(args):
+            sys.exit(1)
     elif action == 'status':
         _handle_data_status()
     else:
@@ -9737,9 +9739,15 @@ def _handle_data_download(args: argparse.Namespace):
         elif symbol_failed:
             failed += 1
         else:
-            # No rows and no failure: upstream returned empty for every range.
-            # That's legitimate (e.g. weekend-only window) — don't mark failed.
-            if not _json_mode:
+            # A US REST source has bars for every completed XNYS session; an empty answer there means a bad
+            # ticker or a provider gap (#177). A weekend, a holiday or today alone may be empty.
+            missed = [] if source == 'ib' else _completed_us_sessions(fetch_ranges, today=dt.date.today())
+            if missed:
+                failed += 1
+                if not _json_mode:
+                    console.print(f'[red]  No data returned for {symbol} although the range holds '
+                                  f'{len(missed)} completed XNYS sessions ({missed[0]} to {missed[-1]})[/red]')
+            elif not _json_mode:
                 console.print(f'[yellow]  No data returned for {symbol}[/yellow]')
 
     if rpc_mmr is not None:
@@ -9784,6 +9792,26 @@ def _handle_data_download(args: argparse.Namespace):
         'rows_written': total_rows_written,
         'refused_targets': refused_targets,
     }
+
+
+def _download_failed(summary) -> bool:
+    return not summary or int(summary.get('failed', 0)) > 0
+
+
+def _completed_us_sessions(ranges, *, today) -> list:
+    """The XNYS sessions inside ``ranges`` that ended before ``today``."""
+    import datetime as dt
+    from trader.automation.calendar_policy import XNYSCalendarPolicy
+
+    def as_date(value):
+        return value.date() if isinstance(value, dt.datetime) else value
+
+    calendar = XNYSCalendarPolicy()
+    sessions = []
+    for date_range in ranges:
+        last_completed = min(as_date(date_range.end), today - dt.timedelta(days=1))
+        sessions += calendar.sessions_in_range(as_date(date_range.start), last_completed)
+    return sessions
 
 
 def _handle_data_backup(args: argparse.Namespace):
@@ -10202,7 +10230,7 @@ def _handle_data_refresh(args: argparse.Namespace):
         cfg = _load_data_refresh_yaml()
     except (FileNotFoundError, ValueError) as ex:
         print_status(str(ex), success=False)
-        return
+        return False
 
     all_jobs = cfg['jobs']
     requested = list(getattr(args, 'jobs', []) or [])
@@ -10211,13 +10239,13 @@ def _handle_data_refresh(args: argparse.Namespace):
     if not requested:
         print_status('No jobs requested. Pass job names or --all. '
                      f'Available: {sorted(all_jobs.keys())}', success=False)
-        return
+        return False
 
     unknown = [j for j in requested if j not in all_jobs]
     if unknown:
         print_status(f'Unknown jobs: {unknown}. Available: {sorted(all_jobs.keys())}',
                      success=False)
-        return
+        return False
 
     from trader.container import Container
     from trader.data.universe import UniverseAccessor
@@ -10311,6 +10339,7 @@ def _handle_data_refresh(args: argparse.Namespace):
             console.print(f'  {mark} {r["job"]}: {detail}')
         console.print(f'[bold]{ok}/{len(results)} jobs ok[/]'
                       + (f', {fail} failed' if fail else ''))
+    return fail == 0
 
 
 def _handle_data_status():

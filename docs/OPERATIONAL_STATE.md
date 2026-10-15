@@ -235,6 +235,11 @@ orb_rio, orb_fmg, orb_csl, orb_gld (losing), orb_xlk (too much drawdown).
 - **US 1-min:** deep history for the historically deployed names.
 - DuckDB lives in named volume `mmr_db_data`. Backup: `./docker.sh -B` /
   `mmr data backup`. Nightly pycron `db_backup`.
+- The command journal (`journal_duckdb_path`, default `<duckdb_path>.journal`) is held open by
+  trader_service, so backups copy the snapshot the trader writes every hour,
+  `<journal>.snapshot.duckdb` (#189). `mmr data backup` shows its age and warns when it is older than
+  120 minutes or missing. Restore the journal: `./docker.sh -d`, copy the snapshot over the journal file in
+  the data volume, remove the journal's `.wal`, start again.
 
 ---
 

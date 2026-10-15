@@ -9455,6 +9455,24 @@ class DownloadTargetError(ValueError):
     """One download target cannot be bound to exactly one conId; nothing is fetched for it."""
 
 
+class AmbiguousListingError(ValueError):
+    """A ticker resolved to several IB listings (#179)."""
+
+
+def _single_listing(symbol: str, definitions):
+    """The one listing of ``symbol``. Several conIds are refused with each one named, never the first taken (#179)."""
+    by_conid = {definition.conId: definition for definition in definitions}
+    if len(by_conid) == 1:
+        return next(iter(by_conid.values()))
+    listed = ', '.join(f'{d.conId} {d.primaryExchange or d.exchange} {d.currency}' for d in by_conid.values())
+    usd = [d for d in by_conid.values() if d.currency == 'USD']
+    example = (f'--exchange {usd[0].primaryExchange or usd[0].exchange} --currency USD' if len(usd) == 1
+               else '--exchange X --currency Y')
+    raise AmbiguousListingError(
+        f'{symbol} has {len(by_conid)} IB listings ({listed}); name one with --exchange and --currency, '
+        f'for example: mmr universe add NAME {symbol} {example}')
+
+
 def _trader_for_symbol_resolution(cfg):
     """The trader, when it answers within 1 s, so tickers missing from every local universe still end up
     conId-keyed. None when it is down: those tickers are then stored under their string."""
@@ -9510,7 +9528,10 @@ def _resolve_download_symbol(accessor, rpc_mmr, symbol: str):
         return None
     if not resolved:
         return None
-    sec_def = resolved[0]
+    try:
+        sec_def = _single_listing(symbol, resolved)
+    except AmbiguousListingError as ambiguous:
+        raise DownloadTargetError(str(ambiguous)) from None
     try:
         _register_in_downloads_universe(accessor, sec_def)
         if not _json_mode:
@@ -10123,7 +10144,13 @@ def _handle_data_migrate_symbols(args: argparse.Namespace):
                         console.print(f'[yellow]  {symbol}: could not resolve via IB — skipping[/yellow]')
                     skipped += 1
                     continue
-                sec_def = resolved[0]
+                try:
+                    sec_def = _single_listing(symbol, resolved)
+                except AmbiguousListingError as ambiguous:
+                    if not _json_mode:
+                        console.print(f'[yellow]  {ambiguous} — skipping[/yellow]')
+                    skipped += 1
+                    continue
                 conid = str(sec_def.conId)
 
                 # Register in universe
@@ -12164,12 +12191,15 @@ def _handle_universe(mmr: MMR, args: argparse.Namespace):
                                 'if this is an Australian listing)')
                     console.print(f'[yellow]Could not resolve: {symbol}{hint}[/yellow]')
                     continue
-                accessor.insert(args.name, defs[0])
+                definition = _single_listing(symbol, defs)
+                accessor.insert(args.name, definition)
                 console.print(
-                    f'[green]Added {defs[0].symbol} '
-                    f'(conId={defs[0].conId}, exchange={defs[0].primaryExchange or defs[0].exchange}) '
+                    f'[green]Added {definition.symbol} '
+                    f'(conId={definition.conId}, exchange={definition.primaryExchange or definition.exchange}) '
                     f'to {args.name}[/green]'
                 )
+            except AmbiguousListingError as ambiguous:
+                console.print(f'[red]Not added: {ambiguous}[/red]')
             except ConnectionError:
                 console.print('[red]Cannot resolve symbols: trader_service not connected[/red]')
                 return

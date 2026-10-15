@@ -51,21 +51,25 @@ Owner rule: no legacy data, no upgrade. Drop them and let the migrations create 
    ```bash
    docker compose run --rm --no-deps --entrypoint python scheduler -c "
    import duckdb, os
-   d = '/home/trader/.local/share/mmr/data/'
-   if os.path.exists(d + 'mmr_journal.duckdb'):
-       j = duckdb.connect(d + 'mmr_journal.duckdb')
-       for t in ('ai_paper_decisions', 'ai_deployments', 'ai_costs', 'simulated_books'):  # simulated_books: a v0.2.0 table SP2 no longer creates; its replacements simulated_decisions/outcomes (95, 96) are new and never edited
-           j.execute('DROP TABLE IF EXISTS ' + t)
-       j.execute('DELETE FROM schema_migrations WHERE version IN (55, 56, 63)')
-       j.close()
-   if os.path.exists(d + 'mmr.duckdb'):
-       m = duckdb.connect(d + 'mmr.duckdb')
-       for t in ('strategy_signal_record', 'strategy_signal_record_state', 'strategy_signal_record_generation'):
-           m.execute('DROP TABLE IF EXISTS ' + t)
-       m.close()"
+   from trader.config import MMRConfig
+   storage = MMRConfig.from_yaml(os.path.expanduser('~/.config/mmr/trader.yaml')).storage
+   print('journal:', storage.journal_duckdb_path, '| main:', storage.duckdb_path)
+   for path in (storage.journal_duckdb_path, storage.duckdb_path):
+       assert os.path.exists(path), path + ' is missing: check trader.yaml before dropping anything'
+   j = duckdb.connect(storage.journal_duckdb_path)
+   for t in ('ai_paper_decisions', 'ai_deployments', 'ai_costs', 'simulated_books'):  # simulated_books: a v0.2.0 table SP2 no longer creates; its replacements simulated_decisions/outcomes (95, 96) are new and never edited
+       j.execute('DROP TABLE IF EXISTS ' + t)
+   j.execute('DELETE FROM schema_migrations WHERE version IN (55, 56, 63)')
+   j.close()
+   m = duckdb.connect(storage.duckdb_path)
+   for t in ('strategy_signal_record', 'strategy_signal_record_state', 'strategy_signal_record_generation'):
+       m.execute('DROP TABLE IF EXISTS ' + t)
+   m.close()"
    ```
-   - check: no Python error. If it says the file is locked, step 1 was not complete: repeat step 1.
-   - Paths are the `trader.yaml` defaults. Use yours if you changed `duckdb_path` or `journal_duckdb_path`.
+   - check: no Python error, and the printed `journal:` path is the file your trader uses. If it says the file is
+     locked, step 1 was not complete: repeat step 1.
+   - Without `journal_duckdb_path` in `trader.yaml` the journal is `<duckdb_path>.journal` (#174). If both that file
+     and `mmr_journal.duckdb` exist, the config refuses to load until you set `journal_duckdb_path` to the right one.
 2. Delete the old ai volume. Skip if `docker volume ls | grep mmr_ai_data` shows nothing:
    `docker volume rm mmr_mmr_ai_data`
    - check: no error. "volume in use" means a container still exists: repeat step 1.2.

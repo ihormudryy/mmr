@@ -108,6 +108,7 @@ class Container():
         # Sync auto-resolved values back to the raw config dict so that
         # Container.resolve() picks them up (it reads from self.configuration).
         self.configuration['ib_account'] = self.mmr_config.ib.account
+        self.configuration['journal_duckdb_path'] = self.mmr_config.storage.journal_duckdb_path
         self.configuration['ib_server_port'] = self.mmr_config.ib.server_port
         self.configuration['ib_paper_port'] = self.mmr_config.ib.paper_port
         self.configuration['ib_live_port'] = self.mmr_config.ib.live_port

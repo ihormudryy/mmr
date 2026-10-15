@@ -43,7 +43,8 @@ class StorageConfig:
     # cross-process lock and make every CLI `connect()` fail (verified
     # against DuckDB 1.4.4). Owned exclusively by trader_service -- no other
     # process should open this file. See trader/data/domain_journal.py.
-    journal_duckdb_path: str = '~/.local/share/mmr/data/mmr_journal.duckdb'
+    # Unset in trader.yaml: <duckdb_path>.journal, the file the trader has always opened (#174).
+    journal_duckdb_path: str = '~/.local/share/mmr/data/mmr.duckdb.journal'
     # Offline research evidence store (P2). NEVER opened by trader_service or
     # strategy_service -- the research CLI/process owns it exclusively, and it
     # is a distinct file so research writes can never contend with the trader's
@@ -121,6 +122,19 @@ class TypedRpcConfig:
 
 RETIRED_HMAC_YAML_KEY = 'service_hmac_key_file'
 RETIRED_HMAC_ENV_VAR = 'MMR_SERVICE_HMAC_KEY_FILE'
+
+
+def default_journal_path(duckdb_path: str) -> str:
+    """The journal when trader.yaml names none: ``<duckdb_path>.journal`` (#174).
+
+    A ``mmr_journal.duckdb`` next to it as well is refused: two journals, and nothing says which one holds the
+    command ledger."""
+    legacy = f"{duckdb_path}.journal"
+    other = os.path.join(os.path.dirname(duckdb_path), 'mmr_journal.duckdb')
+    if os.path.exists(legacy) and os.path.exists(other):
+        raise ValueError(f'two journal files exist ({legacy} and {other}) and trader.yaml sets no '
+                         f'journal_duckdb_path: set it to the one that holds the command ledger')
+    return legacy
 
 
 def warn_if_retired_hmac_config(raw: Dict[str, Any], env=os.environ) -> None:
@@ -384,6 +398,9 @@ class MMRConfig:
                 if not os.path.isabs(val):
                     val = str(mmr_root() / val)
                 setattr(config.storage, attr, val)
+
+        if 'journal_duckdb_path' not in raw and not os.getenv('JOURNAL_DUCKDB_PATH'):
+            config.storage.journal_duckdb_path = default_journal_path(config.storage.duckdb_path)
 
         # The research DB is a SEPARATE offline store; sharing a file with an
         # operational / journal / history DB would let research writes contend

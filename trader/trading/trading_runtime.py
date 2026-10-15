@@ -57,6 +57,24 @@ logging = setup_logging(module_name='trading_runtime')
 # talks about trades/orders being tied to clientId, which means we'll need to always have a consistent clientid
 
 
+
+# #197: an IB request that never answers must not hang its caller for ever (a gateway can stay connected and
+# answer nothing). Below the typed RPC query deadline, so the caller gets this error, not a handler timeout.
+IB_REQUEST_TIMEOUT_SECONDS = 15.0
+
+
+class IbRequestTimeout(TimeoutError):
+    """IB did not answer a request in time."""
+
+
+async def _bounded_ib_request(awaitable, what: str):
+    try:
+        return await asyncio.wait_for(awaitable, IB_REQUEST_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        raise IbRequestTimeout(f"IB did not answer the {what} request within {IB_REQUEST_TIMEOUT_SECONDS:g} s; "
+                               f"check that the gateway responds (./docker.sh -r restarts it)") from None
+
+
 class AccountNotPinnedError(Exception):
     """The trader is not pinned to a valid, mode-matched IB account.
 
@@ -1100,7 +1118,8 @@ class Trader():
     @log_method
     async def resolve_contract(self, contract: Contract) -> List[SecurityDefinition]:
         """Resolve a partial Contract (e.g. with strike/expiry/right) to full SecurityDefinitions via IB."""
-        contract_details = await self.client.ib.reqContractDetailsAsync(contract)
+        contract_details = await _bounded_ib_request(self.client.ib.reqContractDetailsAsync(contract),
+                                                     "contract details")
         if contract_details:
             return [SecurityDefinition.from_contract_details(cd) for cd in contract_details]
         return []
@@ -2509,6 +2528,7 @@ def _finite_number(value, label: str) -> float:
     if not math.isfinite(number):
         raise ValueError(f'{label} {value!r} is not finite')
     return number
+
 
 
 class TradingRuntimeOrderDispatch:

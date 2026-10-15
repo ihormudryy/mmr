@@ -734,7 +734,7 @@ class SessionController:
     ) -> SessionControllerState:
         cause = self.flatten_command_id(self._account_id, state.session_date)
         deadline = state.flat_deadline_utc or (now_utc + dt.timedelta(minutes=10))
-        root = self._start_account_flatten(cause, deadline)
+        root = self._start_account_flatten(cause, deadline, routine=True)
         state = self._evolve(
             state,
             state="FLATTENING",
@@ -752,11 +752,11 @@ class SessionController:
         The experiment kill uses this (SP1 Plan 4 K2). It never changes the
         session state, so the end-of-day flatten still runs on its schedule.
         """
-        return self._start_account_flatten(cause_command_id, deadline)
+        return self._start_account_flatten(cause_command_id, deadline, routine=False)
 
-    def _start_account_flatten(self, cause: str, deadline: dt.datetime) -> str:
+    def _start_account_flatten(self, cause: str, deadline: dt.datetime, *, routine: bool) -> str:
         try:
-            receipt = self._liquidation.start(self._account_id, cause, deadline)
+            receipt = self._liquidation.start(self._account_id, cause, deadline, routine=routine)
             # R10: persist and poll the root we got back; it is another root after a join.
             root = getattr(receipt, "cause_command_id", None)
         except LiquidationBusy:

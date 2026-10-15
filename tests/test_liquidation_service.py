@@ -2678,3 +2678,53 @@ def test_reprotect_goal_takes_no_quantity_and_goals_are_closed_set(tmp_path, kwa
     goal = kwargs.pop("goal", "reprotect")
     with pytest.raises(ValueError):
         s.service.start(ACCOUNT, "r-1", DEADLINE, scope="conid", conid=1, goal=goal, **kwargs)
+
+
+# -- #193: the planned session flatten trips the breaker only when it fails -----------------------------
+
+def test_a_routine_flatten_of_a_flat_account_never_trips_the_breaker(tmp_path):
+    s = _stack(tmp_path, [_snapshot(1, []), _snapshot(2, []), _snapshot(3, [])])
+    receipt = s.service.start(ACCOUNT, "session-1", DEADLINE, routine=True)
+    for _ in range(3):
+        if receipt.state == "FLAT":
+            break
+        receipt = s.service.rescan()
+    assert receipt.state == "FLAT"
+    assert s.breaker.calls == []
+
+
+def test_a_routine_flatten_that_closes_a_position_never_trips_the_breaker(tmp_path):
+    s = _stack(tmp_path, [_snapshot(1, [_position()]), _snapshot(2, []), _snapshot(3, [])])
+    assert s.service.start(ACCOUNT, "session-1", NOW + dt.timedelta(minutes=1), routine=True).state == "VERIFYING"
+    s.dispatch.rows["session-1-reduce-1-1"] = [_row("Filled", filled=10.0)]
+    s.service.rescan()
+    assert s.service.rescan().state == "FLAT"
+    assert s.breaker.calls == []
+
+
+def test_a_routine_flatten_that_fails_safe_trips_the_breaker(tmp_path):
+    s = _stack(tmp_path, [_snapshot(1, [_position()])])
+    assert s.service.start(ACCOUNT, "session-1", NOW, routine=True).state == "FAILED_SAFE"
+    assert s.breaker.calls and s.breaker.calls[0][0] == "session-1"
+
+
+def test_a_kill_that_joins_the_routine_flatten_trips_the_breaker_at_once(tmp_path):
+    s = _stack(tmp_path, [_snapshot(1, [_position()])])
+    s.service.start(ACCOUNT, "session-1", DEADLINE, routine=True)
+    assert s.breaker.calls == []
+    joined = s.service.start(ACCOUNT, "kill-1", DEADLINE)
+    assert joined.cause_command_id == "session-1"
+    assert s.breaker.calls and s.breaker.calls[-1][0] == "session-1"
+    assert s.service.receipt_for("session-1").routine is False
+
+
+def test_the_routine_mark_survives_a_restart(tmp_path):
+    s = _stack(tmp_path, [_snapshot(1, [_position()])])
+    s.service.start(ACCOUNT, "session-1", DEADLINE, routine=True)
+    assert s.restart().receipt_for("session-1").routine is True
+
+
+def test_only_an_account_flatten_can_be_routine(tmp_path):
+    s = _stack(tmp_path, [_snapshot(1, [_position()])])
+    with pytest.raises(ValueError, match="routine"):
+        s.service.start(ACCOUNT, "close-1", DEADLINE, scope="conid", conid=1, routine=True)

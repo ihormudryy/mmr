@@ -426,6 +426,7 @@ def test_flatten_at_flatten_deadline_uses_liquidation(tmp_path):
     assert cause_id == state.flatten_command_id
     assert cause_id.startswith("session-flatten-")
     assert deadline == state.flat_deadline_utc
+    assert liquidation.kwargs == [{"routine": True}]      # the planned flatten trips the breaker only on failure (#193)
 
 
 def test_flatten_command_id_is_deterministic(tmp_path):
@@ -515,7 +516,7 @@ def test_missed_flat_deadline_records_incident_when_rescan_finds_no_advanceable_
 
 class _LockAlwaysBusy(FakeLiquidation):
     """start() raises LiquidationBusy, as the real service does when the lock stays held."""
-    def start(self, account_id, cause_command_id, deadline):
+    def start(self, account_id, cause_command_id, deadline, **kwargs):
         from trader.trading.liquidation_service import LiquidationBusy
 
         self.starts.append((account_id, cause_command_id, deadline))
@@ -1033,7 +1034,7 @@ def test_flatten_account_now_starts_an_account_flatten_and_keeps_the_schedule(tm
     root = controller.flatten_account_now("experiment-kill-exp-1-1-0", deadline)
     assert root == "experiment-kill-exp-1-1-0"
     assert liquidation.starts == [(ACCOUNT, "experiment-kill-exp-1-1-0", deadline)]
-    assert liquidation.kwargs == [{}]                                    # account scope
+    assert liquidation.kwargs == [{"routine": False}]                    # a kill trips the breaker at once (#193)
     assert controller.run_due(clock[0]).state == "OPEN"                 # schedule untouched (K2)
     assert controller.entries_allowed(clock[0]) is True
 

@@ -16,7 +16,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # `chown -R 1000:1000` those directories once (or rely on Docker Desktop's
 # UID passthrough, which usually already matches on macOS).
 RUN groupadd -g 1000 trader \
-    && useradd -u 1000 -g 1000 -m -d /home/trader -s /bin/bash -G sudo trader \
+    && useradd -u 1000 -g 1000 -m -d /home/trader -s /bin/bash trader \
     && mkdir -p /tmp
 
 # Sandbox child identities (SP3 Plan 2, spec 7.5): one uid per session slot, in a
@@ -32,7 +32,7 @@ RUN groupadd -g 20000 sbxchild \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     dialog apt-utils ca-certificates \
     git wget vim dpkg build-essential \
-    curl locales-all sudo unzip tmux \
+    curl locales-all unzip tmux \
     iproute2 net-tools rsync iputils-ping lnav jq \
     # age: encrypted RPC key backups (`./docker.sh -k --backup`, SP1 Plan 2)
     age \

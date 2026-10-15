@@ -113,6 +113,10 @@ x-mmr-hardening: &mmr-hardening
   restart: unless-stopped
   user: trader
   read_only: true
+  # No service needs a capability or a setuid binary (#176); the sandbox sets its own narrow set.
+  cap_drop: [ALL]
+  security_opt:
+    - "no-new-privileges:true"
   # /home/trader/.tmp and /home/trader/.cache are where TMPDIR and numba's/
   # pip's caches point (see Dockerfile ENV TMPDIR=$HOME/.tmp) -- tmpfs all
   # three so nothing under the read-only root needs a write and silently

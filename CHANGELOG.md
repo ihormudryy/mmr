@@ -4,6 +4,56 @@ All notable changes to MMR are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Until 1.0, minor versions may contain breaking changes.
 
+## [1.0.0] - 2026-10-15
+
+The AI paper bot: an autonomous decision loop (SP2a+b), a backtest judge for strategies (SP2c) and AI-written strategies in a sandbox (SP3). Paper only: live trading stays off (`automation.live_enabled: false`, live approvals need a human).
+
+Status at release: the stack is deployed on the paper account. SP1 paper acceptance (#35) and the 1–2 week paper soak (#106) have not run yet; treat their results as the proof this release still needs.
+
+### Breaking
+
+- **Fresh tables for SP2.** Several journal and main-DB tables changed in place; there is no upgrade path. Drop them as `docs/SP2_PAPER_DEPLOY.md` step 2 shows before the first start.
+- **New RPC principals and keys**: `research` and `ai_author` (`./docker.sh -k`, then `./docker.sh -K`), and the research signing key (`mmr keys init-signing`).
+- **One journal path.** Without `journal_duckdb_path` in `trader.yaml`, every process now uses `<duckdb_path>.journal`, the file the trader always opened. The config refuses to load when `mmr_journal.duckdb` also exists; set the key to the right file. (#190)
+- **`mmr data download` refuses a ticker that resolves to no conId** instead of storing its bars under the ticker; `--ticker-key` keeps the old behaviour. Add US symbols first with `universe add downloads SYMBOL --currency USD`. (#188)
+- **A ticker with several IB listings is refused** by `universe add`, the download auto-registration and `data migrate-symbols`, with every listing named. Most US stocks need `--currency USD`. (#187)
+- **`data download` and `data refresh` exit 1** when a symbol or a job failed, and an empty answer for completed XNYS sessions counts as a failure. (#186)
+- **Service containers drop all Linux capabilities** and set `no-new-privileges`; the image has no `sudo`. (#192)
+
+### Added
+
+- **SP2 AI paper controller** (`ai` service, compose profile `ai`): a deterministic decision loop with bounded model calls and budget, Jev judging every strategy BUY, 15-minute discovery under a discretionary scope rule, model closes, controller epochs, and follow-signal, fixed-rule, no-trade and matched-entry baselines in separate books. (#77, #78, #82, #83, #84, #86)
+- **SP2c research and backtest judge** (`research` service): nightly evaluation claims, cohort evaluations, signed cases, judged deployment versions that the strategy service must load byte for byte, renewal on forward evidence, and nightly shadow replay. (#93, #95, #97, #98, #100)
+- **SP3 AI-written strategies**: an authored-strategy API and static checker, a locked-down `sandbox` service (no network, one uid per session, its own seccomp profile), trader authority over authored files, a nightly author loop and `mmr ai-author prove-isolation`. Off unless `ai_paper.authored_strategies.enabled`. (#158, #159, #160, #161, #162, #168)
+- **Alpaca IEX quotes on paper** when IB has no live feed (`automation.quote_fallback: alpaca_iex`), labelled `iex_realtime`. (#76)
+- **Proposal exposure preview** on the command center: how approving a proposal moves the book (USD only). (#171)
+- **`mmr breaker status` and `mmr breaker reset --reason`**: clear a reviewed circuit-breaker trip (`cli` only, audited, runs every reset check). (#183, #184)
+- **Hourly journal snapshot** written by the trader (`<journal>.snapshot.duckdb`), so backups hold the command journal while the stack runs. (#195)
+- Deploy runbook `docs/SP2_PAPER_DEPLOY.md`, and the SP2, SP2c and SP3 designs and plans. (#75, #90, #91, #112, #149, #155)
+
+### Fixed
+
+- **The daily 15:45 session flatten no longer trips the circuit breaker** unless it fails; a kill, a protective failure or a manual flatten still trips it at once. (#194)
+- A crash-left breaker reset, risk-policy publish, registration, withdrawal, saga or experiment command settles from its own evidence instead of blocking reconciliation. (#116, #122, #123, #132, #133, #144, #191)
+- A pause stops every AI entry not yet being sent and names the rest. (#131)
+- AI paper entries reconcile only on the entry order itself. (#126)
+- Strategy history: IB backfill for AI deployment instances, the declared warm-up, startup history for the last completed sessions, and nightly research bar refresh. (#117, #120, #141, #153)
+- Signal freshness is judged from the bar close; held signals of a disabled or superseded strategy are settled. (#139, #145, #148)
+- Backtests hand `on_bar` only the bars up to the current one. (#151)
+- Non-US listings are refused in every ticker-keyed bar download. (#136, #143)
+- The trading calendar is rebuilt past its end. (#103)
+- `./docker.sh -K` no longer crashes on the hidden `keys/private` folder. (#175)
+- A fresh research volume is created for `trader`, so `research` starts. (#185)
+- The dashboard risk projection is published every 15 s. (#170)
+- A missing IB market-data subscription is reported in `snapshot`. (#138)
+- Discretionary baselines are sized like a real discretionary entry. (#87)
+
+### Changed
+
+- The one-shot `cli` service mounts the data volume, so `universe add` and `data download` resolve conIds through the trader in Docker. (#188)
+- `./docker.sh -B` (stack stopped) also copies `*.journal` and `*.wal` files. (#190)
+- CI runs the tests in eight shards, a hung test fails alone, and the release gate runs the same shards. (#102, #129, #154)
+
 ## [0.2.0] - 2026-10-07
 
 The foundation for the AI paper bot (SP1). All of it is paper only.

@@ -39,6 +39,7 @@ log = logging.getLogger(__name__)
 
 LIQUIDATION_MIGRATION_VERSION = 25
 LIQUIDATION_SAFE_CLOSE_MIGRATION_VERSION = 36
+LIQUIDATION_ROUTINE_MIGRATION_VERSION = 133   # #193: the planned session flatten
 
 RESCAN_TERMINAL = frozenset({"FLAT", "CLOSED", "DONE", "REDUCE_FAILED", "SUPERSEDED", "FAILED_SAFE"})
 SUCCESS_STATES = frozenset({"FLAT", "CLOSED", "DONE"})
@@ -77,7 +78,7 @@ LATE_FILL_WATCH = dt.timedelta(days=1)
 
 
 def apply_liquidation_migration(migrator: SchemaMigrator) -> None:
-    """Journal migrations 25 (runs) and 36 (scope, goal, children, joins).
+    """Journal migrations 25 (runs), 36 (scope, goal, children, joins) and 133 (routine, #193).
 
     Migration 36 also adopts runs that were open before the upgrade (D8): each
     run gets a join row; the oldest open run of an account becomes its ACTIVE
@@ -165,6 +166,9 @@ def apply_liquidation_migration(migrator: SchemaMigrator) -> None:
                                   AND o.kind = 'account_flatten' AND o.state = 'ACTIVE')
            WHERE cause_command_id IN (SELECT root_id FROM exit_owners WHERE state = 'SUPERSEDED')""",
         f"UPDATE liquidation_runs SET phase = 'legacy' WHERE {_OPEN_BEFORE_SP1} AND state <> 'SUPERSEDED'",
+    ))
+    migrator.apply(LIQUIDATION_ROUTINE_MIGRATION_VERSION, "liquidation_routine_flatten", (
+        "ALTER TABLE liquidation_runs ADD COLUMN IF NOT EXISTS routine BOOLEAN DEFAULT FALSE",
     ))
 
 
@@ -331,6 +335,8 @@ class LiquidationReceipt:
     escalated: bool = False
     superseded_by: Optional[str] = None
     cleanup_pending: bool = False
+    # The planned session flatten (#193): it trips the breaker only when it fails, not while it runs.
+    routine: bool = False
     children: tuple[ChildRef, ...] = ()
 
 
@@ -367,7 +373,7 @@ class _ChildOrder:
 _RUN_COLUMNS = (
     "cause_command_id", "account_id", "state", "deadline", "generation_id", "detail", "scope",
     "conid", "goal", "goal_quantity", "phase", "opened_generation", "stop_price", "target_price",
-    "remaining_quantity", "escalated", "superseded_by", "cleanup_pending",
+    "remaining_quantity", "escalated", "superseded_by", "cleanup_pending", "routine",
 )
 _CHILD_COLUMNS = (
     "child_id", "root_id", "owner_root_id", "account_id", "conid", "kind", "attempt", "state",
@@ -391,6 +397,7 @@ def _run_from_row(row) -> LiquidationReceipt:
         stop_price=values["stop_price"], target_price=values["target_price"],
         remaining_quantity=values["remaining_quantity"], escalated=bool(values["escalated"]),
         superseded_by=values["superseded_by"], cleanup_pending=bool(values["cleanup_pending"]),
+        routine=bool(values["routine"]),
     )
 
 
@@ -803,21 +810,27 @@ class LiquidationService:
     def start(self, account_id: str, cause_command_id: str, deadline: dt.datetime, *,
               scope: str = "account", conid: Optional[int] = None, quantity: Optional[float] = None,
               stop_price: Optional[float] = None, target_price: Optional[float] = None,
-              goal: Optional[str] = None) -> LiquidationReceipt:
+              goal: Optional[str] = None, routine: bool = False) -> LiquidationReceipt:
         """Claim, then create or join a root. Returns the receipt of the root the caller must poll.
 
         ``goal="reprotect"`` (scope conid, no quantity) cancels the conid's working orders and
         places an exit-only stop (and target) sized to the broker position, with no reduce (R26).
+        ``routine`` marks the planned session flatten (#193); any other account flatten that joins it ends
+        the mark, so a kill or a protective failure still trips the breaker at once.
         """
         if not account_id or not cause_command_id:
             raise ValueError("account_id and cause_command_id are required")
         if ":" in cause_command_id:
             raise ValueError("cause command id may not contain ':'")
+        if routine and scope != "account":
+            raise ValueError("only an account flatten can be routine")
         if scope == "account":
             if conid is not None or quantity is not None:
                 raise ValueError("account scope takes no conid or quantity")
             outcome, root = self._store.transaction(
-                lambda conn: self._claim_account_in_tx(conn, account_id, cause_command_id, deadline))
+                lambda conn: self._claim_account_in_tx(conn, account_id, cause_command_id, deadline, routine))
+            if outcome == JOINED_FLATTEN and not routine:
+                self._end_routine(root, joined_by=cause_command_id)
         elif scope == "conid" and goal == GOAL_REPROTECT:
             if quantity is not None:
                 raise ValueError("a re-protect takes no quantity: the broker position sizes it")
@@ -956,7 +969,19 @@ class LiquidationService:
             return ("JOINED_BEFORE", join.root_id)
         return ("EXISTING", cause)
 
-    def _claim_account_in_tx(self, conn, account_id, cause, deadline):
+    def _end_routine(self, root_id: str, *, joined_by: str) -> None:
+        """A non-routine flatten joined the planned one: from now on the root trips like any account flatten."""
+        def write(conn):
+            run = self._store.get_run_in_tx(conn, root_id)
+            if run is None or not run.routine:
+                return None
+            self._store.update_run_in_tx(conn, replace(run, routine=False), self._now())
+            return replace(run, routine=False)
+        receipt = self._store.transaction(write)
+        if receipt is not None and self._breaker is not None and self._trips_breaker(receipt, receipt.state):
+            self._breaker.trip_liquidation(root_id, f"{joined_by} joined the session flatten: {receipt.state}")
+
+    def _claim_account_in_tx(self, conn, account_id, cause, deadline, routine=False):
         existing = self._existing_in_tx(conn, account_id, cause, conid=None, goal="account", quantity=None)
         if existing is not None:
             return existing
@@ -966,7 +991,8 @@ class LiquidationService:
                                                     "account", None), now)
         if claim.outcome == JOINED_FLATTEN:
             return (JOINED_FLATTEN, claim.root_id)
-        self._store.insert_run_in_tx(conn, LiquidationReceipt(account_id, cause, "REQUESTED", deadline), now)
+        self._store.insert_run_in_tx(conn, LiquidationReceipt(account_id, cause, "REQUESTED", deadline,
+                                                              routine=routine), now)
         for root in claim.superseded:
             self._supersede_run_in_tx(conn, root, by_root_id=cause)
         self._store.inherit_children_in_tx(conn, account_id=account_id, conid=None, to_root_id=cause, now=now)
@@ -1317,6 +1343,8 @@ class LiquidationService:
     # -- writes -------------------------------------------------------------------------
 
     def _trips_breaker(self, receipt, state: str) -> bool:
+        if receipt.scope == "account" and receipt.routine:
+            return state in ("FAILED_SAFE", "OUTCOME_UNKNOWN")
         if receipt.scope == "account":
             return state != "FLAT"
         return state == "FAILED_SAFE"

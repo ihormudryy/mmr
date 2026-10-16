@@ -130,3 +130,20 @@ class TestContainerHardening:
             Container(str(malicious))
         Container._instance = None
 
+
+
+class TestIbAddressFromEnvironment:
+    """#215: the raw config dict carries the IB address the typed config resolved, env override included.
+
+    Compose sets IB_SERVER_ADDRESS=ib-gateway; trader.yaml holds the host address 127.0.0.1. The pycron health
+    check reads the dict, so without this it connected to 127.0.0.1 inside the scheduler container."""
+
+    def test_the_environment_address_reaches_the_config_dict(self, test_config_file, monkeypatch):
+        monkeypatch.setenv('IB_SERVER_ADDRESS', 'ib-gateway')
+        assert Container(test_config_file).config()['ib_server_address'] == 'ib-gateway'
+
+    def test_without_the_environment_the_yaml_address_stays(self, test_config_file, monkeypatch):
+        from trader.config import MMRConfig
+        monkeypatch.delenv('IB_SERVER_ADDRESS', raising=False)
+        assert Container(test_config_file).config()['ib_server_address'] == \
+            MMRConfig.from_yaml(test_config_file).ib.server_address

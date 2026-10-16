@@ -15,6 +15,9 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 logging = setup_logging(module_name='trader_check')
 
 
+_LOOKUP_TIMEOUT_SECONDS = 20
+
+
 def test_platform(ib_server_address: str,
                   ib_server_port: int,
                   ib_client_id: int,
@@ -22,7 +25,9 @@ def test_platform(ib_server_address: str,
     succeeded = True
     try:
         with (IBAIORx(ib_server_address, ib_server_port, ib_client_id)) as ibrx:
-            result = asyncio.run(ibrx.get_conid(['AMD']))
+            # On ib_async's own loop, where connect() opened the socket; asyncio.run() would start a new loop
+            # that never reads the reply, so the lookup always timed out (#215).
+            result = ibrx.ib.run(asyncio.wait_for(ibrx.get_conid(['AMD']), _LOOKUP_TIMEOUT_SECONDS))
             if not result:
                 raise Exception('cannot get AMD Contract details')
     except Exception as ex:

@@ -2894,7 +2894,7 @@ class MMR:
         accessor = UniverseAccessor(trading_db_path, universe_lib)
         conid_map: Dict[str, str] = {}
         try:
-            for u in accessor.get_all():
+            for u in accessor.get_all(include_hidden=True):
                 for d in u.security_definitions:
                     conid_map[str(d.conId)] = d.symbol
         except Exception as ex:

@@ -1,3 +1,20 @@
+# ---------------------------------------------------------------------------
+# `build` stage: compilers and headers for Python packages with C extensions stay here and never reach the
+# runtime image (#206). The runtime stage copies only the finished virtualenv (same base, same paths).
+FROM python:3.12.13-slim-bookworm AS build
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends build-essential libssl-dev libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN groupadd -g 1000 trader && useradd -u 1000 -g 1000 -m -d /home/trader -s /bin/bash trader
+USER trader
+ENV HOME=/home/trader
+RUN python3 -m venv $HOME/.venv
+COPY --chown=trader:trader requirements.txt /home/trader/requirements.txt
+RUN --mount=type=cache,target=/home/trader/.cache/pip \
+    $HOME/.venv/bin/pip3 install -r /home/trader/requirements.txt
+
+# ---------------------------------------------------------------------------
 FROM python:3.12.13-slim-bookworm AS runtime
 WORKDIR /home/trader/mmr
 ENV container=docker
@@ -28,17 +45,28 @@ RUN groupadd -g 20000 sbxchild \
        done
 
 # System packages (no TWS/VNC/X11 — IB Gateway runs in a separate container).
-# Python 3.12.13 is provided by the python:3.12.13-slim-bookworm base image.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    dialog apt-utils ca-certificates \
-    git wget vim dpkg build-essential \
-    curl locales-all unzip tmux \
-    iproute2 net-tools rsync iputils-ping lnav jq \
-    # age: encrypted RPC key backups (`./docker.sh -k --backup`, SP1 Plan 2)
-    age \
-    # required for native Python packages that compile C extensions
-    libssl-dev libffi-dev \
+# Python 3.12.13 is provided by the python:3.12.13-slim-bookworm base image. Runtime only: no compilers, and
+# no shell conveniences (vim, tmux, rsync, wget, ...) that nothing in the containers uses (#206).
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends \
+    ca-certificates git dpkg curl locales-all unzip iproute2 jq \
     && rm -rf /var/lib/apt/lists/*
+
+# age: encrypted RPC key backups (`./docker.sh -k --backup`, SP1 Plan 2). The official release, not Debian's
+# 1.1.1 built with Go 1.19.8 (7 critical, 43 high CVEs, #206). The sums are GitHub's release asset digests.
+ARG AGE_VERSION=1.3.2
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
+      amd64) sum=cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10 ;; \
+      arm64) sum=6b8dc4333c53a5a57c9e5834e3a48f92605d7154014cd07269ff3327db5d37f4 ;; \
+      *) echo "no pinned age build for architecture '${TARGETARCH}'" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL -o /tmp/age.tgz \
+       "https://github.com/FiloSottile/age/releases/download/v${AGE_VERSION}/age-v${AGE_VERSION}-linux-${TARGETARCH}.tar.gz" \
+    && echo "${sum}  /tmp/age.tgz" | sha256sum -c - \
+    && tar -xzf /tmp/age.tgz -C /tmp \
+    && install -m 0755 /tmp/age/age /tmp/age/age-keygen /usr/local/bin/ \
+    && rm -rf /tmp/age /tmp/age.tgz
 
 # set to New York timezone, can override with docker run -e TZ=Europe/London etc.
 ENV TZ=America/New_York
@@ -66,14 +94,8 @@ ENV PATH=$HOME/.venv/bin:$HOME/.local/bin:$PATH
 
 WORKDIR /home/trader/mmr
 
-RUN python3 -m venv $HOME/.venv
-
-# Copy ONLY requirements.txt first — this layer is cached unless deps change
-COPY --chown=trader:trader requirements.txt /home/trader/mmr/requirements.txt
-
-# pip install packages (cached unless requirements.txt changes)
-RUN --mount=type=cache,target=/home/trader/.cache/pip \
-    pip3 install -r /home/trader/mmr/requirements.txt
+# The virtualenv built in the `build` stage (cached unless requirements.txt changes).
+COPY --from=build --chown=trader:trader /home/trader/.venv /home/trader/.venv
 
 # NOW copy the rest of the source (this layer busts on every code change,
 # but everything above is cached)

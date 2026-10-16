@@ -65,8 +65,9 @@ class UniverseAccessor():
         # todo: fix this at the source: Universe shouldn't have a list of SecurityDefinitions
         self._resolver_cache: Dict[int, Tuple[Universe, SecurityDefinition]] = {}
 
-    def list_universes(self) -> List[str]:
-        result = [k for k in self.library.list_symbols() if not k.startswith('_')]
+    def list_universes(self, include_hidden: bool = False) -> List[str]:
+        """Universe names; a name starting with ``_`` (the trader's ``_instruments`` cache) is hidden unless asked."""
+        result = [k for k in self.library.list_symbols() if include_hidden or not k.startswith('_')]
         # move the portfolio universe to the front
         if 'portfolio' in result:
             result.remove('portfolio')
@@ -85,9 +86,9 @@ class UniverseAccessor():
             result[u.name] = len(u.security_definitions)
         return result
 
-    def get_all(self) -> List[Universe]:
+    def get_all(self, include_hidden: bool = False) -> List[Universe]:
         result: List[Universe] = []
-        for name in self.list_universes():
+        for name in self.list_universes(include_hidden=include_hidden):
             u = self.get(name)
             if u:
                 result.append(u)
@@ -157,7 +158,7 @@ class UniverseAccessor():
         if universe:
             universes.append(self.get(universe))
         else:
-            universes.extend(self.get_all())
+            universes.extend(self.get_all(include_hidden=True))   # the _instruments cache resolves too (#202)
 
         for u in universes:
             for definition in u.security_definitions:

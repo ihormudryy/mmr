@@ -819,6 +819,17 @@ def _coerce_response_value(value: Any, response_model: Any) -> Dict[str, Any]:
 # TypedRpcServer -- raw-JSON ROUTER socket
 # ---------------------------------------------------------------------------
 
+def _query_handler_timeout() -> float:
+    configured = os.getenv("TYPED_RPC_QUERY_HANDLER_TIMEOUT_SECONDS", "25")
+    try:
+        value = float(configured)
+    except ValueError:
+        raise ValueError("TYPED_RPC_QUERY_HANDLER_TIMEOUT_SECONDS must be a positive number of seconds") from None
+    if not value > 0:
+        raise ValueError("TYPED_RPC_QUERY_HANDLER_TIMEOUT_SECONDS must be a positive number of seconds")
+    return value
+
+
 class TypedRpcServer:
     """One ROUTER socket bound to a single ``socket_role``.
 
@@ -839,6 +850,7 @@ class TypedRpcServer:
         address: str = "tcp://127.0.0.1",
         port: int = 0,
         max_in_flight: Optional[int] = None,
+        handler_timeout: Optional[float] = None,
     ):
         if socket_role not in VALID_SOCKET_ROLES:
             raise ValueError(
@@ -863,6 +875,11 @@ class TypedRpcServer:
             raise ValueError("max_in_flight must be a positive integer") from exc
         if self.max_in_flight <= 0:
             raise ValueError("max_in_flight must be a positive integer")
+        # #197: a read that never answers would hold its slot for ever. Async query handlers get a deadline
+        # below the client's 30 s timeout; commands get none (a cut-off approve or cancel could leave a
+        # half-run saga), and thread handlers keep their slot until the thread ends (it cannot be stopped).
+        self.handler_timeout = (handler_timeout if handler_timeout is not None
+                                else _query_handler_timeout() if socket_role == "query" else None)
         self.ctx: Optional[zmq.asyncio.Context] = zmq.asyncio.Context()
         self.socket: Optional[zmq.asyncio.Socket] = None
         self._serve_task: Optional[asyncio.Task] = None
@@ -987,7 +1004,7 @@ class TypedRpcServer:
                 else:
                     result = registration.handler(*handler_args)
                 if inspect.isawaitable(result):
-                    result = await result
+                    result = await self._within_deadline(result, request.method)
 
                 try:
                     body = _coerce_response_value(result, registration.response_model)
@@ -1021,6 +1038,17 @@ class TypedRpcServer:
 
         if not self._closing:
             await self._reply(client_id, request_id, digest, ok, body if ok else None, problem)
+
+    async def _within_deadline(self, awaitable, method: str):
+        if self.handler_timeout is None:
+            return await awaitable
+        try:
+            return await asyncio.wait_for(awaitable, self.handler_timeout)
+        except asyncio.TimeoutError:
+            logging.error("TypedRpcServer[%s] %s did not answer within %ss; its slot is freed",
+                          self.socket_role, method, self.handler_timeout)
+            raise _DispatchProblem(
+                "HANDLER_TIMEOUT", f"{method} did not answer within {self.handler_timeout:g} s") from None
 
     async def _reply(
         self,

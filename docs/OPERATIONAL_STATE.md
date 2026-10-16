@@ -233,6 +233,12 @@ orb_rio, orb_fmg, orb_csl, orb_gld (losing), orb_xlk (too much drawdown).
 
 - **ASX 1-min:** 53 universe symbols, ~1 year as of 2026-07-02.
 - **US 1-min:** deep history for the historically deployed names.
+- **IB Gateway connected but silent** (seen 2026-10-15 after ~20 h up): `mmr status` shows
+  `ib_responding: false` and `ib_upstream_connected: false` with "answered no request for N probes"; the
+  trader logs it CRITICAL once. The trader probes IB every 30 s (#198) and, while IB is silent, refuses
+  broker captures, entries and breaker resets; it recovers by itself when IB answers. Fix: `./docker.sh -r`
+  (gateway restart and re-login), then check `mmr status`. It does not trip the breaker (IB's nightly
+  restart would trip it every night).
 - DuckDB lives in named volume `mmr_db_data`. Backup: `./docker.sh -B` /
   `mmr data backup`. Nightly pycron `db_backup`.
 - The command journal (`journal_duckdb_path`, default `<duckdb_path>.journal`) is held open by

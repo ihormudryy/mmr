@@ -945,8 +945,13 @@ def _build_quote_authority(
     return FallbackQuoteAuthority(ib_quotes, iex, account_mode=account_mode), feeds
 
 
+def _ib_ready(trader: Any) -> bool:
+    """Connected and answering: a gateway that answers nothing is not a ready broker (#198)."""
+    return bool(trader.is_ib_connected()) and bool(getattr(trader, "ib_responding", True))
+
+
 def _broker_ready(trader: Any) -> bool:
-    if not trader.is_ib_connected():
+    if not _ib_ready(trader):
         return False
     return ingest_ready(trader.broker_ingest)
 
@@ -1549,7 +1554,7 @@ def build_command_stack(
         return not ledger.unresolved_for_account(trader.ib_account)
 
     semantic_readiness = SemanticReadiness(
-        ib_connected=lambda: bool(trader.is_ib_connected()),
+        ib_connected=lambda: _ib_ready(trader),
         account_pinned=lambda: bool(trader.ib_account),
         broker_current=resume_ready,
         journal_writable=journal_writable,
@@ -1566,7 +1571,7 @@ def build_command_stack(
         # that changes it. Reconciliation is checked by CircuitBreaker as a
         # separate, explicit precondition.
         return all((
-            bool(trader.is_ib_connected()), bool(trader.ib_account), resume_ready(),
+            _ib_ready(trader), bool(trader.ib_account), resume_ready(),
             journal_writable(), control_readable(), xnys_session_open(now()), quotes_ready(),
         ))
 

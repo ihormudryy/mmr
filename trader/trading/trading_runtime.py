@@ -75,6 +75,11 @@ async def _bounded_ib_request(awaitable, what: str):
                                f"check that the gateway responds (./docker.sh -r restarts it)") from None
 
 
+# #198: an IB Gateway can stay connected and answer nothing. A cheap request every 30 s tells the two apart.
+IB_PROBE_TIMEOUT_SECONDS = 10.0
+IB_PROBE_MISSES_BEFORE_SILENT = 2
+
+
 class AccountNotPinnedError(Exception):
     """The trader is not pinned to a valid, mode-matched IB account.
 
@@ -94,6 +99,11 @@ OCA_SIBLING_NOT_WORKING = 'OCA_SIBLING_NOT_WORKING'
 
 
 class Trader():
+    # #198: False after IB_PROBE_MISSES_BEFORE_SILENT missed probes; class defaults, set per instance by probe_ib.
+    _ib_responding: bool = True
+    _ib_probe_misses: int = 0
+    _ib_probe_error: str = ''
+
     def __init__(self,
                  ib_server_address: str,
                  ib_server_port: int,
@@ -2151,6 +2161,32 @@ class Trader():
     def is_ib_connected(self) -> bool:
         return self.client.ib.isConnected()
 
+    @property
+    def ib_responding(self) -> bool:
+        return self._ib_responding
+
+    async def probe_ib(self) -> bool:
+        """Ask IB for its time; after IB_PROBE_MISSES_BEFORE_SILENT misses in a row IB counts as not responding
+        (#198). Returns whether IB counts as responding. A disconnected client is not probed: 1100/1102 and the
+        reconnect path own that state."""
+        if not self.client.ib.isConnected():
+            return self._ib_responding
+        try:
+            await asyncio.wait_for(self.client.ib.reqCurrentTimeAsync(), IB_PROBE_TIMEOUT_SECONDS)
+        except Exception as ex:   # noqa: BLE001 - a probe that cannot complete is a miss, whatever the reason
+            self._ib_probe_misses += 1
+            if self._ib_probe_misses >= IB_PROBE_MISSES_BEFORE_SILENT and self._ib_responding:
+                self._ib_responding = False
+                self._ib_probe_error = (
+                    f'IB Gateway is connected but answered no request for {self._ib_probe_misses} probes '
+                    f'({type(ex).__name__}); restart it: ./docker.sh -r')
+                logging.critical(self._ib_probe_error)
+            return self._ib_responding
+        if not self._ib_responding:
+            logging.warning('IB Gateway answers again after %d missed probes', self._ib_probe_misses)
+        self._ib_responding, self._ib_probe_misses, self._ib_probe_error = True, 0, ''
+        return True
+
     @log_method
     def red_button(self):
         self.client.ib.reqGlobalCancel()
@@ -2170,11 +2206,14 @@ class Trader():
                 return cached
         status = {
             'ib_connected': self.client.ib.isConnected(),
-            'ib_upstream_connected': self._ib_upstream_connected,
+            'ib_upstream_connected': self._ib_upstream_connected and self._ib_responding,
+            'ib_responding': self._ib_responding,
             'storage_connected': self.data is not None,
         }
         if not self._ib_upstream_connected:
             status['ib_upstream_error'] = self._ib_upstream_error
+        elif not self._ib_responding:
+            status['ib_upstream_error'] = self._ib_probe_error
         self._status_cache = status
         self._status_cache_ts = now
         return status

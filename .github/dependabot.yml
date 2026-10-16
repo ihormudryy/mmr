@@ -8,6 +8,14 @@ updates:
       uv:
         patterns: ["*"]
     open-pull-requests-limit: 5
+  # The pinned base images in the Dockerfile (python, golang, uv), so they never fall behind (#206).
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      docker:
+        patterns: ["*"]
   - package-ecosystem: github-actions
     directory: /
     schedule:

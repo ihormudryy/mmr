@@ -1,21 +1,49 @@
+# Base images are pinned by digest in every FROM line; Dependabot (docker ecosystem) proposes updates as
+# tested PRs (#206). The Python stages run Debian 13 (trixie) with the same Python 3.12.13 as CI.
+
+# ---------------------------------------------------------------------------
+# `age-build` stage: age from its pinned release source with a patched Go and x/crypto (#208). The official
+# v1.3.2 binaries are built with Go 1.27.0 and x/crypto 0.55.0 (2 critical, 11 high CVEs).
+FROM golang:1.27.2-trixie@sha256:47667934874913a449b96faa7ef4777fa285d9ec29126ee80ed61c45b7cccf0e AS age-build
+ARG AGE_VERSION=1.3.2
+ARG AGE_SOURCE_SHA256=c160d6f907992561413a28818f7d7585b35977cdbc449f3e96c4f8c99d22d21e
+ARG X_CRYPTO_VERSION=v0.56.0
+ENV GOTOOLCHAIN=local CGO_ENABLED=0
+RUN curl -fsSL -o /tmp/age-src.tgz \
+       "https://github.com/FiloSottile/age/releases/download/v${AGE_VERSION}/age-v${AGE_VERSION}-source.tar.gz" \
+    && echo "${AGE_SOURCE_SHA256}  /tmp/age-src.tgz" | sha256sum -c - \
+    && mkdir /src && tar -xzf /tmp/age-src.tgz -C /src --strip-components=1
+WORKDIR /src
+# go get checks every module against sum.golang.org; the version string comes from cmd/age/version.go.
+RUN go get golang.org/x/crypto@${X_CRYPTO_VERSION} && go mod tidy && go mod vendor \
+    && go build -trimpath -o /out/ ./cmd/age ./cmd/age-keygen \
+    && /out/age --version
+
 # ---------------------------------------------------------------------------
 # `build` stage: compilers and headers for Python packages with C extensions stay here and never reach the
 # runtime image (#206). The runtime stage copies only the finished virtualenv (same base, same paths).
-FROM python:3.12.13-slim-bookworm AS build
+# The virtualenv is installed from uv.lock, the exact versions CI tests; never newest-at-build-time.
+FROM python:3.12.13-slim-trixie@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36 AS build
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends build-essential libssl-dev libffi-dev \
     && rm -rf /var/lib/apt/lists/*
+COPY --from=ghcr.io/astral-sh/uv:0.11.18@sha256:78bc42400d77b0678ba95765305c826652ed5431f399257271dda681d0318f03 /uv /usr/local/bin/uv
 RUN groupadd -g 1000 trader && useradd -u 1000 -g 1000 -m -d /home/trader -s /bin/bash trader
 USER trader
-ENV HOME=/home/trader
-RUN python3 -m venv $HOME/.venv
-COPY --chown=trader:trader requirements.txt /home/trader/requirements.txt
-RUN --mount=type=cache,target=/home/trader/.cache/pip \
-    $HOME/.venv/bin/pip3 install -r /home/trader/requirements.txt
+ENV HOME=/home/trader \
+    UV_PROJECT_ENVIRONMENT=/home/trader/.venv UV_PYTHON=/usr/local/bin/python3 UV_PYTHON_DOWNLOADS=never \
+    UV_LINK_MODE=copy UV_COMPILE_BYTECODE=1
+WORKDIR /home/trader/mmr
+# No pip in the venv: its vendored urllib3, msgpack and setuptools carried 5 high CVEs (#206). uv installs
+# everything, and is only mounted for the install steps, never copied into the runtime image.
+RUN uv venv $HOME/.venv
+COPY --chown=trader:trader pyproject.toml uv.lock /home/trader/mmr/
+RUN --mount=type=cache,target=/home/trader/.cache/uv,uid=1000,gid=1000 \
+    uv sync --frozen --no-install-project
 
 # ---------------------------------------------------------------------------
-FROM python:3.12.13-slim-bookworm AS runtime
+FROM python:3.12.13-slim-trixie@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36 AS runtime
 WORKDIR /home/trader/mmr
 ENV container=docker
 ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -52,21 +80,8 @@ RUN apt-get update && apt-get upgrade -y \
     ca-certificates git dpkg curl locales-all unzip iproute2 jq \
     && rm -rf /var/lib/apt/lists/*
 
-# age: encrypted RPC key backups (`./docker.sh -k --backup`, SP1 Plan 2). The official release, not Debian's
-# 1.1.1 built with Go 1.19.8 (7 critical, 43 high CVEs, #206). The sums are GitHub's release asset digests.
-ARG AGE_VERSION=1.3.2
-ARG TARGETARCH
-RUN case "${TARGETARCH}" in \
-      amd64) sum=cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10 ;; \
-      arm64) sum=6b8dc4333c53a5a57c9e5834e3a48f92605d7154014cd07269ff3327db5d37f4 ;; \
-      *) echo "no pinned age build for architecture '${TARGETARCH}'" >&2; exit 1 ;; \
-    esac \
-    && curl -fsSL -o /tmp/age.tgz \
-       "https://github.com/FiloSottile/age/releases/download/v${AGE_VERSION}/age-v${AGE_VERSION}-linux-${TARGETARCH}.tar.gz" \
-    && echo "${sum}  /tmp/age.tgz" | sha256sum -c - \
-    && tar -xzf /tmp/age.tgz -C /tmp \
-    && install -m 0755 /tmp/age/age /tmp/age/age-keygen /usr/local/bin/ \
-    && rm -rf /tmp/age /tmp/age.tgz
+# age: encrypted RPC key backups (`./docker.sh -k --backup`, SP1 Plan 2), built in the age-build stage (#208).
+COPY --from=age-build /out/age /out/age-keygen /usr/local/bin/
 
 # set to New York timezone, can override with docker run -e TZ=Europe/London etc.
 ENV TZ=America/New_York
@@ -94,7 +109,7 @@ ENV PATH=$HOME/.venv/bin:$HOME/.local/bin:$PATH
 
 WORKDIR /home/trader/mmr
 
-# The virtualenv built in the `build` stage (cached unless requirements.txt changes).
+# The virtualenv built in the `build` stage from uv.lock (cached unless pyproject.toml or uv.lock change).
 COPY --from=build --chown=trader:trader /home/trader/.venv /home/trader/.venv
 
 # NOW copy the rest of the source (this layer busts on every code change,
@@ -103,9 +118,10 @@ USER root
 COPY --chown=trader:trader ./ /home/trader/mmr/
 
 # Register the mmr package + console entry points (mmr, trader-service, ...)
-# defined in pyproject.toml. --no-deps because requirements.txt covered them.
+# defined in pyproject.toml. --no-deps because uv.lock covered them.
 USER trader
-RUN pip install --no-deps -e /home/trader/mmr
+RUN --mount=from=ghcr.io/astral-sh/uv:0.11.18@sha256:78bc42400d77b0678ba95765305c826652ed5431f399257271dda681d0318f03,source=/uv,target=/usr/local/bin/uv \
+    UV_NO_CACHE=1 uv pip install --python /home/trader/.venv/bin/python --no-deps -e /home/trader/mmr
 
 USER root
 # .bash_profile sets env for interactive exec-ins. Services are launched
@@ -136,7 +152,7 @@ RUN chmod +x /home/trader/mmr/scripts/docker-entrypoint.sh
 
 # Build identity baked at image build time (SP3 Plan 2 ruling 1). docker.sh passes
 # MMR_BUILD_ID; a plain `docker build` leaves it "unset" and the sandbox refuses to start.
-# Declared here, after the apt, venv and pip layers, so a new build id does not rebuild them.
+# Declared here, after the apt and venv layers, so a new build id does not rebuild them.
 ARG MMR_BUILD_ID=unset
 RUN printf '%s\n' "${MMR_BUILD_ID}" > /etc/mmr-build-id && chmod 0444 /etc/mmr-build-id
 LABEL mmr.build_id="${MMR_BUILD_ID}"
@@ -163,6 +179,6 @@ ENTRYPOINT ["/home/trader/mmr/scripts/docker-entrypoint.sh"]
 # these -- they'd otherwise ship in every real deployment for no reason.
 FROM runtime AS test
 USER root
-RUN --mount=type=cache,target=/home/trader/.cache/pip \
-    pip3 install "pytest>=8.0" "pytest-timeout>=2.3" "docker>=7.0"
+RUN --mount=from=ghcr.io/astral-sh/uv:0.11.18@sha256:78bc42400d77b0678ba95765305c826652ed5431f399257271dda681d0318f03,source=/uv,target=/usr/local/bin/uv \
+    UV_NO_CACHE=1 uv pip install --python /home/trader/.venv/bin/python "pytest>=8.0" "pytest-timeout>=2.3" "docker>=7.0"
 USER trader

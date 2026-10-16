@@ -9,7 +9,7 @@ DOCKERFILE = (ROOT / "Dockerfile").read_text()
 
 
 def _stage(name: str) -> str:
-    match = re.search(rf"^FROM \S+ AS {name}\n(.*?)(?=^FROM |\Z)", DOCKERFILE, re.S | re.M)
+    match = re.search(rf"^FROM \S+ AS {re.escape(name)}\n(.*?)(?=^FROM |\Z)", DOCKERFILE, re.S | re.M)
     assert match, f"no {name} stage"
     return match.group(1)
 
@@ -37,8 +37,29 @@ def test_both_stages_apply_debian_security_updates():
         assert "apt-get upgrade -y" in _stage(name), name
 
 
-def test_age_is_the_pinned_official_release_checked_by_sha256_for_both_architectures():
+def test_age_is_built_from_its_checked_release_source_with_patched_go_and_crypto():
+    """#208: the official binaries were built with Go 1.27.0 and x/crypto 0.55.0."""
+    age = _stage("age-build")
+    assert re.search(r"^ARG AGE_SOURCE_SHA256=[0-9a-f]{64}$", age, re.M) and "sha256sum -c -" in age
+    assert "go get golang.org/x/crypto@${X_CRYPTO_VERSION}" in age and "GOTOOLCHAIN=local" in age
+    assert "COPY --from=age-build /out/age /out/age-keygen /usr/local/bin/" in _stage("runtime")
+
+
+def test_the_runtime_image_carries_neither_pip_nor_uv():
+    """pip's vendored packages carried CVEs; uv is mounted for the install steps only."""
     runtime = _stage("runtime")
-    assert "github.com/FiloSottile/age/releases/download/v${AGE_VERSION}" in runtime
-    assert re.search(r"amd64\) sum=[0-9a-f]{64}", runtime) and re.search(r"arm64\) sum=[0-9a-f]{64}", runtime)
-    assert "sha256sum -c -" in runtime
+    assert "pip install" not in runtime.replace("uv pip install", "")
+    assert "COPY --from=ghcr.io/astral-sh/uv" not in runtime
+
+
+def test_every_base_image_is_pinned_by_digest():
+    for line in re.findall(r"^FROM (\S+)", DOCKERFILE, re.M):
+        assert line == "runtime" or "@sha256:" in line, line
+
+
+def test_the_virtualenv_is_installed_from_uv_lock_not_loose_requirements():
+    """CI tests uv.lock; requirements.txt has only minimum versions, so the image ran untested ones."""
+    build = _stage("build")
+    assert "uv sync --frozen --no-install-project" in build and "--seed" not in build
+    assert "COPY --chown=trader:trader pyproject.toml uv.lock /home/trader/mmr/" in build
+    assert "requirements.txt" not in build

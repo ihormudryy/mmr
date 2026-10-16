@@ -22,7 +22,7 @@ class TestErrorClassificationConstants:
     """Verify the error code sets contain the expected codes."""
 
     def test_info_codes(self):
-        assert IB_INFO_CODES == {2104, 2106, 2107, 2158}
+        assert IB_INFO_CODES == {2104, 2106, 2107, 2108, 2158}
 
     def test_connectivity_codes(self):
         assert IB_CONNECTIVITY_CODES == {1100, 1101, 1102, 504}
@@ -95,6 +95,13 @@ class TestHandleError:
         worker = self._make_worker()
         worker._IBHistoryWorker__handle_error(-1, 2158, 'Sec-def farm OK', None)
         assert worker.error_code == 0
+
+    def test_info_code_2108_farm_inactive_clears_error(self):
+        """Issue #225: 'farm inactive but available on demand' failed the strategy warm-up fetch."""
+        worker = self._make_worker()
+        worker._IBHistoryWorker__handle_error(
+            -1, 2108, 'Market data farm connection is inactive but should be available upon demand.usfarm', None)
+        assert worker.error_code == 0 and worker.connected is True
 
     def test_info_code_2106_clears_error(self):
         worker = self._make_worker()

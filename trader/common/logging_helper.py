@@ -11,6 +11,7 @@ import inspect
 import logging
 import logging.config
 import os
+import re
 import warnings
 import yaml
 
@@ -52,6 +53,33 @@ class LogLevels(IntEnum):
 
 
 global_loggers: Dict[str, Logger] = {}
+
+
+_TELEGRAM_BOT_URL = re.compile(r"(api\.telegram\.org/bot)[^/\s'\"]+")
+
+
+class RedactTelegramToken(logging.Filter):
+    """Blank the token in a Telegram Bot API URL, whatever logger wrote it (#204)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if "api.telegram.org/bot" in message:
+            record.msg, record.args = _TELEGRAM_BOT_URL.sub(r"\1<redacted>", message), ()
+        return True
+
+
+def harden_secret_logging() -> None:
+    """The Telegram Bot API puts the bot token in the URL, and httpx/httpcore log every request URL (#204).
+
+    Their loggers stay at WARNING, and every configured handler redacts a bot URL as a second line of defence."""
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+    loggers = [logging.getLogger()] + [logger for logger in logging.root.manager.loggerDict.values()
+                                       if isinstance(logger, logging.Logger)]
+    for logger in loggers:
+        for handler in logger.handlers:
+            if not any(isinstance(f, RedactTelegramToken) for f in handler.filters):
+                handler.addFilter(RedactTelegramToken())
 
 
 def setup_logging(default_path='',
@@ -108,6 +136,7 @@ def setup_logging(default_path='',
     # ewm) into multi-minute console spam and blows pytest's 30s budget on CI.
     for _noisy in ('numba', 'numba.core', 'numba.core.ssa', 'llvmlite'):
         logging.getLogger(_noisy).setLevel(logging.WARNING)
+    harden_secret_logging()
 
     global_loggers[module_name] = logging.getLogger(module_name)
     return global_loggers[module_name]

@@ -16,6 +16,11 @@ updates:
     groups:
       docker:
         patterns: ["*"]
+    ignore:
+      # Python minor and major moves (3.12 -> 3.13+) are a planned step, not a base bump: CI and
+      # .python-version pin 3.12.13 and the image must run what CI tests (#212). Patch updates still come.
+      - dependency-name: "python"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
   - package-ecosystem: github-actions
     directory: /
     schedule:

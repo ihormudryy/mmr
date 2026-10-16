@@ -2728,3 +2728,23 @@ def test_only_an_account_flatten_can_be_routine(tmp_path):
     s = _stack(tmp_path, [_snapshot(1, [_position()])])
     with pytest.raises(ValueError, match="routine"):
         s.service.start(ACCOUNT, "close-1", DEADLINE, scope="conid", conid=1, routine=True)
+
+
+def test_a_routine_flatten_that_briefly_loses_broker_evidence_then_reaches_flat_never_trips(tmp_path):
+    """2026-10-15 15:45: the session flatten saw BROKER_UNAVAILABLE for one tick, then reached FLAT 4 s later.
+    OUTCOME_UNKNOWN is a passing state, not the end of the run (#193 follow-up)."""
+    s = _stack(tmp_path, [RuntimeError("BROKER_UNAVAILABLE"), _snapshot(1, []), _snapshot(2, []), _snapshot(3, [])])
+    assert s.service.start(ACCOUNT, "session-1", DEADLINE, routine=True).state == "OUTCOME_UNKNOWN"
+    receipt = s.service.rescan()
+    for _ in range(3):
+        if receipt.state == "FLAT":
+            break
+        receipt = s.service.rescan()
+    assert receipt.state == "FLAT"
+    assert s.breaker.calls == []
+
+
+def test_a_routine_flatten_without_broker_evidence_until_its_deadline_trips(tmp_path):
+    s = _stack(tmp_path, [RuntimeError("BROKER_UNAVAILABLE")])
+    assert s.service.start(ACCOUNT, "session-1", NOW, routine=True).state == "FAILED_SAFE"
+    assert s.breaker.calls and s.breaker.calls[0][0] == "session-1"

@@ -1344,7 +1344,9 @@ class LiquidationService:
 
     def _trips_breaker(self, receipt, state: str) -> bool:
         if receipt.scope == "account" and receipt.routine:
-            return state in ("FAILED_SAFE", "OUTCOME_UNKNOWN")
+            # Only the end of the run: OUTCOME_UNKNOWN is a passing state (one tick without broker evidence)
+            # that a later tick resolves, and a run that never gets evidence ends FAILED_SAFE at its deadline.
+            return state == "FAILED_SAFE"
         if receipt.scope == "account":
             return state != "FLAT"
         return state == "FAILED_SAFE"

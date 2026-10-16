@@ -2854,7 +2854,7 @@ class MMR:
         return consume(self._data_rpc.rpc(return_type=dict).status())
 
     def history_list(self, symbol: Optional[str] = None, bar_size: Optional[str] = None) -> pd.DataFrame:
-        """List downloaded history in DuckDB, grouped by symbol and bar_size.
+        """List downloaded history in the history DuckDB, grouped by symbol and bar_size.
 
         Returns a DataFrame with columns: symbol, name, bar_size, start, end, rows.
         Resolves conIds to ticker names via local universes (no service needed).
@@ -2863,15 +2863,12 @@ class MMR:
         from trader.data.universe import UniverseAccessor
 
         cfg = self._container.config()
-        db_path = cfg.get('duckdb_path', '')
-        store = DuckDBDataStore(db_path)
+        trading_db_path = cfg.get('duckdb_path', '')
+        store = DuckDBDataStore(cfg.get('history_duckdb_path', '') or trading_db_path)
 
-        # Build the query with optional filters
+        # A symbol can be a ticker or a conId, so it is filtered after the names are resolved.
         conditions = []
         params: list = []
-        if symbol:
-            # Could be a ticker name or conId — we'll filter after resolving
-            pass
         if bar_size:
             conditions.append("bar_size = ?")
             params.append(bar_size)
@@ -2894,14 +2891,14 @@ class MMR:
 
         # Build a conId → ticker name mapping from universes
         universe_lib = cfg.get('universe_library', 'Universes')
-        accessor = UniverseAccessor(db_path, universe_lib)
+        accessor = UniverseAccessor(trading_db_path, universe_lib)
         conid_map: Dict[str, str] = {}
         try:
             for u in accessor.get_all():
                 for d in u.security_definitions:
                     conid_map[str(d.conId)] = d.symbol
-        except Exception:
-            pass
+        except Exception as ex:
+            logger.warning('history list: cannot read universes for ticker names, showing conIds only: %s', ex)
 
         df['name'] = df['symbol'].map(lambda s: conid_map.get(s, ''))
 

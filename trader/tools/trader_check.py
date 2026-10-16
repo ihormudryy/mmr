@@ -1,7 +1,9 @@
+import subprocess
+import sys
 import warnings
 
 
-from trader.common.logging_helper import setup_logging, suppress_all, verbose
+from trader.common.logging_helper import setup_logging
 from trader.container import Container
 from trader.data.data_access import TickStorage
 from trader.listeners.ibreactive import IBAIORx
@@ -16,6 +18,7 @@ logging = setup_logging(module_name='trader_check')
 
 
 _LOOKUP_TIMEOUT_SECONDS = 20
+HEALTH_CHECK_TIMEOUT_SECONDS = 60
 
 
 def test_platform(ib_server_address: str,
@@ -58,19 +61,17 @@ def test_platform_config(config_file) -> bool:
     return result
 
 
-async def test_platform_config_async(config_file) -> bool:
-    return test_platform_config(config_file)
-
-
 def health_check(config_file) -> bool:
-    suppress_all()
-    result = test_platform_config(config_file)
-    if not result:
-        verbose()
-        test_platform_config(config_file)
+    """Run the platform check in a child process.
+
+    pycron calls this from its running event loop, where IB's blocking connect() cannot run (#224). The child has
+    its own loop, and its IB session closes when it exits or is killed on timeout."""
+    command = [sys.executable, '-m', 'trader.tools.trader_check', '--config', config_file]
+    try:
+        return subprocess.run(command, timeout=HEALTH_CHECK_TIMEOUT_SECONDS).returncode == 0
+    except subprocess.TimeoutExpired:
+        logging.error('health check did not finish within {}s'.format(HEALTH_CHECK_TIMEOUT_SECONDS))
         return False
-    else:
-        return True
 
 
 @click.command()
@@ -96,6 +97,7 @@ def main(config: str,
             duckdb_path,
         )
     print(result)
+    sys.exit(0 if result else 1)
 
 
 if __name__ == '__main__':

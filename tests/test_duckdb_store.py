@@ -129,8 +129,8 @@ def _sample_df_with_bar_size(n=10, start="2024-01-02 09:30", bar_size="1 day"):
     }, index=dates)
 
 
-def _make_mmr_for_history(tmp_duckdb_path) -> MMR:
-    """Create an MMR with a mock container pointing to the temp DuckDB."""
+def _make_mmr_for_history(tmp_duckdb_path, history_duckdb_path=None) -> MMR:
+    """Create an MMR with a mock container pointing to the temp DuckDB (and, if given, a separate history DB)."""
     mmr = MMR.__new__(MMR)
     mmr._client = None
     mmr._data_client = None
@@ -140,6 +140,7 @@ def _make_mmr_for_history(tmp_duckdb_path) -> MMR:
     mock_container = MagicMock()
     mock_container.config.return_value = {
         'duckdb_path': tmp_duckdb_path,
+        'history_duckdb_path': history_duckdb_path or '',
         'universe_library': 'Universes',
     }
     mmr._container = mock_container
@@ -255,6 +256,48 @@ class TestHistoryList:
         mmr = _make_mmr_for_history(tmp_duckdb_path)
         df = mmr.history_list()
         assert df.iloc[0]['rows'] == 25
+
+
+class TestHistoryListReadsTheHistoryDb:
+    """Issue #219: bars live in history_duckdb_path; universes stay in duckdb_path."""
+
+    def test_lists_bars_from_the_history_db_with_names_from_the_trading_db(self, tmp_path):
+        from trader.data.universe import Universe
+        trading_path, history_path = str(tmp_path / "mmr.duckdb"), str(tmp_path / "mmr_history.duckdb")
+        DuckDBDataStore(trading_path)                                      # empty tick_data in the trading DB
+        DuckDBDataStore(history_path).write("4391", _sample_df_with_bar_size(n=7, bar_size="1 day"))
+        DuckDBObjectStore(trading_path).write("stocks", Universe("stocks", [_amd_definition()]))
+
+        df = _make_mmr_for_history(trading_path, history_path).history_list()
+
+        assert df[['symbol', 'name', 'rows']].to_dict('records') == [{'symbol': '4391', 'name': 'AMD', 'rows': 7}]
+
+    def test_a_failed_name_lookup_is_logged_not_swallowed(self, tmp_duckdb_path, caplog):
+        DuckDBDataStore(tmp_duckdb_path).write("4391", _sample_df_with_bar_size(bar_size="1 day"))
+        mmr = _make_mmr_for_history(tmp_duckdb_path)
+
+        with patch("trader.data.universe.UniverseAccessor.get_all", side_effect=RuntimeError("universe table broken")):
+            df = mmr.history_list()
+
+        assert df.iloc[0]['name'] == ''
+        assert "universe table broken" in caplog.text
+
+
+def _amd_definition():
+    from trader.data.data_access import SecurityDefinition
+    return SecurityDefinition(
+        symbol='AMD', exchange='SMART', conId=4391, secType='STK',
+        primaryExchange='NASDAQ', currency='USD', tradingClass='AMD',
+        includeExpired=False, secIdType='', secId='', description='',
+        minTick=0.01, orderTypes='', validExchanges='', priceMagnifier=1.0,
+        longName='Advanced Micro Devices', category='', subcategory='',
+        tradingHours='', timeZoneId='', liquidHours='', stockType='',
+        minSize=1.0, sizeIncrement=1.0, suggestedSizeIncrement=1.0,
+        bondType='', couponType='', callable=False, putable=False,
+        coupon=0.0, convertable=False, maturity='', issueDate='',
+        nextOptionDate='', nextOptionPartial=False, nextOptionType='',
+        marketRuleIds='',
+    )
 
 
 class TestConcurrentAccess:

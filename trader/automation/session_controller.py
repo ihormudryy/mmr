@@ -40,6 +40,7 @@ SESSION_STATES = frozenset({
 })
 
 _TERMINAL = frozenset({"FLAT", "INCIDENT"})
+LATE_FLATTEN_WINDOW = dt.timedelta(minutes=10)   # as long as the 15:45 -> 15:55 window an on-time flatten has
 
 
 def apply_session_controller_migration(migrator: SchemaMigrator) -> bool:
@@ -78,6 +79,15 @@ def _as_utc(value: dt.datetime) -> dt.datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=dt.timezone.utc)
     return value.astimezone(dt.timezone.utc)
+
+
+def _kept_flat_deadline(schedule: SessionSchedule, existing: "SessionControllerState") -> Optional[dt.datetime]:
+    """A late flatten's fresh window (#193) survives a restart; otherwise the calendar decides."""
+    moved = existing.flat_deadline_utc
+    scheduled = schedule.flat_deadline_utc
+    if existing.flatten_issued and moved is not None and scheduled is not None and moved > scheduled:
+        return moved
+    return scheduled
 
 
 def _iso(value: Optional[dt.datetime]) -> Optional[str]:
@@ -439,7 +449,7 @@ class SessionController:
                 entry_cutoff_utc=schedule.entry_cutoff_utc,
                 cancel_entries_utc=schedule.cancel_entries_utc,
                 flatten_start_utc=schedule.flatten_start_utc,
-                flat_deadline_utc=schedule.flat_deadline_utc,
+                flat_deadline_utc=_kept_flat_deadline(schedule, existing),
                 entry_cutoff_reached=existing.entry_cutoff_reached,
                 flatten_command_id=existing.flatten_command_id,
                 flat_generation=existing.flat_generation,
@@ -733,7 +743,7 @@ class SessionController:
         self, state: SessionControllerState, now_utc: dt.datetime,
     ) -> SessionControllerState:
         cause = self.flatten_command_id(self._account_id, state.session_date)
-        deadline = state.flat_deadline_utc or (now_utc + dt.timedelta(minutes=10))
+        deadline = self._flatten_deadline(state, now_utc)
         root = self._start_account_flatten(cause, deadline, routine=True)
         state = self._evolve(
             state,
@@ -742,9 +752,25 @@ class SessionController:
             flatten_issued=True,
             cancel_issued=True,
             entry_cutoff_reached=True,
+            flat_deadline_utc=deadline,
         )
         self._persist(state, now_utc)
         return state
+
+    def _flatten_deadline(self, state: SessionControllerState, now_utc: dt.datetime) -> dt.datetime:
+        """The session flat deadline, or a fresh window when the trader was down until after it (#193).
+
+        A flatten first issued after the deadline would fail safe before it reads the broker and trip the
+        breaker on a flat account. It gets the window an on-time flatten has; missing that still trips."""
+        scheduled = state.flat_deadline_utc
+        if scheduled is not None and now_utc < scheduled:
+            return scheduled
+        fresh = now_utc + LATE_FLATTEN_WINDOW
+        if scheduled is not None:
+            logging.getLogger(__name__).warning(
+                "session flatten first issued at %s, after the flat deadline %s (trader down?); "
+                "new flat deadline %s", _iso(now_utc), _iso(scheduled), _iso(fresh))
+        return fresh
 
     def flatten_account_now(self, cause_command_id: str, deadline: dt.datetime) -> str:
         """Start (or join) an account flatten now and return the root to poll.

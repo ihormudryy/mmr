@@ -541,7 +541,8 @@ def test_busy_liquidation_lock_still_reaches_incident_after_flat_deadline(tmp_pa
     assert any(s.kind == "MISSED_FLAT_DEADLINE" for s in breaker.signals)
 
 
-def test_recover_past_flat_deadline_with_busy_lock_records_incident(tmp_path):
+def test_recover_past_flat_deadline_with_busy_lock_records_incident_when_the_late_window_ends(tmp_path):
+    """#193: a flatten first issued after the flat deadline gets a fresh window; a busy lock still ends in INCIDENT."""
     broker = FakeBroker([_snapshot(1, positions=[_position()])])
     controller, _b, _c, liquidation, breaker, _t, _j, _db, clock = _build_controller(
         tmp_path, broker=broker, liquidation=_LockAlwaysBusy(),
@@ -549,8 +550,68 @@ def test_recover_past_flat_deadline_with_busy_lock_records_incident(tmp_path):
     clock[0] = _utc(15, 55)
     state = controller.recover(clock[0])
     assert liquidation.starts
+    assert state.state != "INCIDENT"
+
+    clock[0] = _utc(16, 5)
+    state = controller.run_due(clock[0])
     assert state.state == "INCIDENT"
     assert any(s.kind == "MISSED_FLAT_DEADLINE" for s in breaker.signals)
+
+
+# ---------------------------------------------------------------------------
+# #193: the trader was down for the whole flatten window
+# ---------------------------------------------------------------------------
+
+def test_a_flatten_first_issued_after_the_flat_deadline_gets_a_fresh_window_and_ends_flat(tmp_path):
+    """2026-10-16: Docker was down 15:25-16:01 ET; on restart the flatten got the past 15:55 deadline,
+    failed safe before it read the broker, and tripped the breaker on a flat account."""
+    controller, broker, _c, liquidation, breaker, _t, _j, _db, clock = _build_controller(tmp_path)
+    clock[0] = _utc(16, 1)
+    state = controller.recover(clock[0])
+
+    assert liquidation.starts[0][2] == _utc(16, 11)
+    assert state.flat_deadline_utc == _utc(16, 11)
+    assert state.state != "INCIDENT" and breaker.signals == []
+
+    liquidation.mark_flat(generation_id=2)
+    broker.push(_snapshot(2))
+    clock[0] = _utc(16, 2)
+    state = controller.run_due(clock[0])
+    assert state.state == "FLAT" and breaker.signals == []
+
+
+def test_the_late_flatten_window_survives_a_restart(tmp_path):
+    controller, *_rest, clock = _build_controller(tmp_path)
+    clock[0] = _utc(16, 1)
+    controller.recover(clock[0])
+
+    restarted, _b, _c, liquidation, breaker, _t, _j, _db, clock2 = _build_controller(tmp_path)
+    clock2[0] = _utc(16, 3)
+    state = restarted.recover(clock2[0])
+    assert state.flat_deadline_utc == _utc(16, 11)
+    assert state.state != "INCIDENT" and breaker.signals == []
+
+
+def test_a_late_flatten_that_is_not_flat_by_its_new_deadline_still_trips(tmp_path):
+    broker = FakeBroker([_snapshot(1, positions=[_position()])])
+    controller, _b, _c, liquidation, breaker, _t, _j, _db, clock = _build_controller(tmp_path, broker=broker)
+    clock[0] = _utc(16, 1)
+    controller.recover(clock[0])
+    clock[0] = _utc(16, 10)
+    assert controller.run_due(clock[0]).state != "INCIDENT"
+
+    clock[0] = _utc(16, 11)
+    state = controller.run_due(clock[0])
+    assert state.state == "INCIDENT"
+    assert any(s.kind == "MISSED_FLAT_DEADLINE" for s in breaker.signals)
+
+
+def test_an_on_time_flatten_keeps_the_session_flat_deadline(tmp_path):
+    controller, _b, _c, liquidation, _br, _t, _j, _db, clock = _build_controller(tmp_path)
+    clock[0] = _utc(15, 45)
+    state = controller.recover(clock[0])
+    assert liquidation.starts[0][2] == _utc(15, 55)
+    assert state.flat_deadline_utc == _utc(15, 55)
 
 
 def test_external_position_is_included_in_flatten(tmp_path):

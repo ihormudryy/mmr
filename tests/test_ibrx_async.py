@@ -254,6 +254,7 @@ class TestSnapshotAsync:
             (2103, 'Market data farm connection is broken:usfarm'),
             (2105, 'HMDS data farm connection is broken:ushmds'),
             (2119, 'Market data farm is connecting:usfarm'),
+            (2108, 'Market data farm connection is inactive but should be available upon demand.usfarm'),
             (2104, 'Market data farm connection is OK:usfarm'),
         ):
             ibrx.error_subject.reset_mock()

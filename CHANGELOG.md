@@ -4,6 +4,30 @@ All notable changes to MMR are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Until 1.0, minor versions may contain breaking changes.
 
+## [1.0.1] - 2026-10-16
+
+Fixes from the first days of the paper deploy, and a hardened service image. Still paper only.
+
+### Fixed
+
+- **The daily 15:45 session flatten no longer trips the circuit breaker** on a passing `OUTCOME_UNKNOWN` (one tick without broker evidence); only a flatten that ends `FAILED_SAFE` trips it. (#201)
+- **An IB Gateway that stays connected but answers nothing is detected**: the trader probes IB every 30 s, reports `ib_responding: false` with the fix in `mmr status`, and refuses entries, broker captures and breaker resets until IB answers again. (#200)
+- **A read that never answers no longer blocks every other read**: IB contract lookups give up after 15 s, and async query handlers have a 25 s deadline (`HANDLER_TIMEOUT`), so a silent IB can no longer fill all 32 query slots (`SERVER_BUSY`). (#199)
+- **The trader's `_instruments` cache is read again**, so known conIds no longer go to IB on every strategy reconcile. (#203)
+- **The Telegram bot token never reaches a log**: `httpx`/`httpcore` stay at WARNING, and every handler redacts a Bot API URL. (#205)
+
+### Security
+
+- **Service image: 0 critical and 1 high CVE**, from 12 critical and 87 high (Docker Scout):
+  - compilers only in a build stage, and no pip, uv, rsync, vim or other unused tools at runtime;
+  - `age` built from its checked release source with Go 1.27.2 and `x/crypto` 0.56.0;
+  - Debian security updates applied in every build. (#209, #210)
+- **The image installs exactly `uv.lock`** (`uv sync --frozen`), the versions CI tests, instead of the newest packages at build time. Base images move to Debian 13 (`python:3.12.13-slim-trixie`, same Python) and are pinned by digest; Dependabot now proposes Docker base updates. (#210)
+
+### Changed
+
+- The README is a short landing page that links to the docs; setup details moved to `docs/SETUP.md`. (#211)
+
 ## [1.0.0] - 2026-10-15
 
 The AI paper bot: an autonomous decision loop (SP2a+b), a backtest judge for strategies (SP2c) and AI-written strategies in a sandbox (SP3). Paper only: live trading stays off (`automation.live_enabled: false`, live approvals need a human).

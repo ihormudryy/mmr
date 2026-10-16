@@ -272,6 +272,16 @@ class TestHistoryListReadsTheHistoryDb:
 
         assert df[['symbol', 'name', 'rows']].to_dict('records') == [{'symbol': '4391', 'name': 'AMD', 'rows': 7}]
 
+    def test_names_come_from_hidden_universes_too(self, tmp_duckdb_path):
+        """Issue #222: the trader's hidden _instruments cache is often the only universe that knows a conId."""
+        from trader.data.universe import Universe
+        DuckDBDataStore(tmp_duckdb_path).write("4391", _sample_df_with_bar_size(bar_size="1 day"))
+        DuckDBObjectStore(tmp_duckdb_path).write("_instruments", Universe("_instruments", [_amd_definition()]))
+
+        df = _make_mmr_for_history(tmp_duckdb_path).history_list(symbol="amd")
+
+        assert df[['symbol', 'name']].to_dict('records') == [{'symbol': '4391', 'name': 'AMD'}]
+
     def test_a_failed_name_lookup_is_logged_not_swallowed(self, tmp_duckdb_path, caplog):
         DuckDBDataStore(tmp_duckdb_path).write("4391", _sample_df_with_bar_size(bar_size="1 day"))
         mmr = _make_mmr_for_history(tmp_duckdb_path)

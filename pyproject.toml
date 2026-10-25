@@ -24,11 +24,11 @@ classifiers = [
 ]
 dependencies = [
     "backoff>=2.2",
-    "fastapi>=0.143.2",
+    "fastapi>=0.161.0",
     "uvicorn>=0.54.0",
     "jinja2>=3.1",
     "python-multipart>=0.0.9",
-    "markdown>=3.11.1",
+    "markdown>=3.11.2",
     "pymdown-extensions>=12.3",
     "nh3>=0.3.7",
     "beautifulsoup4>=4.15.0",
@@ -37,7 +37,7 @@ dependencies = [
     "crontab>=1.0",
     "dateparser>=1.4.3",
     "dill>=0.4",
-    "duckdb>=1.5.6",
+    "duckdb>=2.0.0",
     "durations>=0.3",
     "eventkit>=1.0.0",
     "exchange-calendars>=4.13.2",
@@ -47,7 +47,7 @@ dependencies = [
     "matplotlib>=3.11.2",
     "msgpack>=1.2.3",
     "numpy>=2.5.4",
-    "pandas>=3.0.6",
+    "pandas>=3.1.0",
     "plotext>=6.1.0",
     "plotille>=6.0",
     "plotly>=7.1.0",
@@ -59,17 +59,17 @@ dependencies = [
     "pytz>=2026.5",
     "pyyaml>=6.0",
     "pyzmq>=27.2.0",
-    "reactivex>=5.1.0",
+    "reactivex>=6.0.0",
     "requests>=2.34.2",
-    "boto3>=1.43.114",
+    "boto3>=1.43.118",
     "httpx>=0.27",
     "rich>=15.0.0",
     "scikit-learn>=1.9.1",
     "scipy>=1.18.1",
-    "tornado>=6.5.10",
+    "tornado>=6.6",
     "uniplot>=0.23.2",
-    "vectorbt>=1.1.2",
-    "massive>=2.8.0",
+    "vectorbt>=1.2.0",
+    "massive>=2.9.0",
     "twelvedata[pandas]>=1.4.0",
     "sse-starlette==3.5.0",
     "cryptography>=50.0.2",
@@ -83,9 +83,9 @@ dev = [
 test = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
-    "pytest-mock>=3.16.0",
+    "pytest-mock>=3.17.0",
     "pytest-timeout>=2.3",
-    "hypothesis>=6.170.0",
+    "hypothesis>=6.170.6",
     "pytest-cov>=6.0",
     "pytest-xdist>=3.6",
 ]
@@ -93,7 +93,7 @@ streaming = [
     "websocket-client>=1.9.2",
 ]
 browser-test = [
-    "playwright==1.64.0",
+    "playwright==1.64.1",
 ]
 
 [project.urls]
@@ -109,7 +109,7 @@ data-service = "trader.data_service:main"
 mmr = "trader.mmr_cli:main"
 
 [build-system]
-requires = ["setuptools>=84.0.0"]
+requires = ["setuptools>=84.2.1"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

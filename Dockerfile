@@ -23,7 +23,7 @@ RUN go get golang.org/x/crypto@${X_CRYPTO_VERSION} && go mod tidy && go mod vend
 # `build` stage: compilers and headers for Python packages with C extensions stay here and never reach the
 # runtime image (#206). The runtime stage copies only the finished virtualenv (same base, same paths).
 # The virtualenv is installed from uv.lock, the exact versions CI tests; never newest-at-build-time.
-FROM python:3.12.15-slim-trixie@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1 AS build
+FROM python:3.12.15-slim-trixie@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973e89e19dfb86704 AS build
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends build-essential libssl-dev libffi-dev \
@@ -43,7 +43,7 @@ RUN --mount=type=cache,target=/home/trader/.cache/uv,uid=1000,gid=1000 \
     uv sync --frozen --no-install-project
 
 # ---------------------------------------------------------------------------
-FROM python:3.12.15-slim-trixie@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1 AS runtime
+FROM python:3.12.15-slim-trixie@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973e89e19dfb86704 AS runtime
 WORKDIR /home/trader/mmr
 ENV container=docker
 ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
